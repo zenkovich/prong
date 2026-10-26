@@ -1,0 +1,1179 @@
+import { appendFileSync, createWriteStream, existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { homedir, tmpdir } from 'node:os';
+import path from 'node:path';
+import type { Commit, FileChange, Hunk, RepoSnapshot, Sha, Stash } from '../types.js';
+import { hunkPatch, kindOf, LOG_FORMAT, parseDiff, parseLog, parseNumstat, parseRaw, parseRefs, parseRemotes, parseStashList, parseStatus, REC, REF_FORMAT, STASH_FORMAT } from './parse.js';
+import { GIT_BIN, progressOf, runGit, runGitLines, RunOptions } from './run.js';
+import type { NetAuth } from '../auth.js';
+import { spawn } from 'node:child_process';
+
+export type Progress = (line: string, progress: number | null) => void;
+
+export interface RebaseTodoItem {
+  sha: Sha;
+  action: 'pick' | 'reword' | 'edit' | 'squash' | 'fixup' | 'drop';
+  message?: string;
+}
+
+export interface OpState {
+  kind: 'none' | 'merge' | 'rebase' | 'cherry-pick' | 'revert';
+  /** branch being rebased, when known */
+  detail?: string;
+}
+
+const LARGE_DIFF_LINES = 4000;
+/** a commit with more files than this is listed first; each file's diff is read when it is selected */
+export const COMMIT_PATCH_FILES = 300;
+/** a commit (or stash) patch bigger than this is not sent at once either */
+export const COMMIT_PATCH_BYTES = 8 * 1024 * 1024;
+/** one file's diff is read up to this size */
+export const FILE_DIFF_BYTES = 24 * 1024 * 1024;
+/** revision name for the working copy in mediaSides / blobInfo / the blob endpoint */
+export const WORKTREE = 'WORKTREE';
+export interface BlobSide {
+  rev: string;
+  file: string;
+  bytes: number;
+  /** changes whenever the content does: object id, or mtime+size for the working copy (cache-busting) */
+  version: string;
+  oid?: string;
+}
+const MIME: Record<string, string> = {
+  svg: 'image/svg+xml', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif', webp: 'image/webp', bmp: 'image/bmp', ico: 'image/x-icon', avif: 'image/avif', heic: 'image/heic', png: 'image/png',
+  mp3: 'audio/mpeg', wav: 'audio/wav', ogg: 'audio/ogg', oga: 'audio/ogg', opus: 'audio/ogg', m4a: 'audio/mp4', aac: 'audio/aac', flac: 'audio/flac', aif: 'audio/aiff', aiff: 'audio/aiff', caf: 'audio/x-caf', weba: 'audio/webm',
+  mp4: 'video/mp4', m4v: 'video/mp4', mov: 'video/quicktime', webm: 'video/webm', ogv: 'video/ogg', mkv: 'video/x-matroska', avi: 'video/x-msvideo', mpg: 'video/mpeg', mpeg: 'video/mpeg', '3gp': 'video/3gpp', wmv: 'video/x-ms-wmv', flv: 'video/x-flv',
+  pdf: 'application/pdf', json: 'application/json', txt: 'text/plain; charset=utf-8',
+};
+export function mimeOf(file: string) {
+  return MIME[path.extname(file).slice(1).toLowerCase()] ?? 'application/octet-stream';
+}
+/** a repository-relative path that cannot escape the repository */
+export function safeRelPath(file: string) {
+  if (!file || path.isAbsolute(file) || file.includes('\0')) return false;
+  const norm = path.posix.normalize(file.replace(/\\/g, '/'));
+  return norm !== '..' && !norm.startsWith('../') && !norm.startsWith('/');
+}
+const stateDir = () => process.env.PRONG_STATE_DIR ?? path.join(homedir(), '.prong');
+export function humanBytes(n: number) {
+  return n < 1024 ? `${n} B` : n < 1024 * 1024 ? `${(n / 1024).toFixed(1)} KB` : `${(n / 1024 / 1024).toFixed(1)} MB`;
+}
+const CACHE_DIR = path.join(process.env.PRONG_STATE_DIR ?? path.join(homedir(), '.prong'), 'cache');
+const perfConfigured = new Set<string>();
+const logCache = new Map<string, { sig: string; limit: number; commits: Commit[] }>();
+const snapCache = new Map<string, unknown>();
+
+export interface Submodule {
+  path: string;
+  name: string;
+  url: string;
+  sha: string;
+  /** ' ' in sync, '-' not initialized, '+' checked-out commit differs from index, 'U' conflicts */
+  state: 'ok' | 'uninitialized' | 'modified' | 'conflict';
+  describe?: string;
+}
+
+/** what a batch operation did: names done, and each failure with git's reason */
+export interface BatchResult {
+  done: string[];
+  failed: { name: string; error: string }[];
+}
+
+/**
+ * `git push --porcelain` lines ("<flag>\t<from>:<to>\t<summary>") → status per destination ref.
+ * Flags: " " fast-forward, "+" forced, "-" deleted, "*" new, "=" up to date, "!" rejected.
+ */
+export function parsePushPorcelain(out: string): Map<string, { ok: boolean; summary: string }> {
+  const m = new Map<string, { ok: boolean; summary: string }>();
+  for (const line of out.split('\n')) {
+    const p = line.split('\t');
+    if (p.length < 3 || p[0].length !== 1) continue;
+    const to = p[1].slice(p[1].indexOf(':') + 1);
+    m.set(to, { ok: p[0] !== '!', summary: p[2].trim() });
+  }
+  return m;
+}
+
+/** All git operations for one working copy. Stateless: every call shells out to git. */
+export class Repo {
+  constructor(public readonly dir: string) {}
+
+  static isRepo(dir: string): boolean {
+    try {
+      return statSync(dir).isDirectory() && existsSync(path.join(dir, '.git'));
+    } catch {
+      return false;
+    }
+  }
+
+  git(args: string[], opts: Partial<RunOptions> = {}) {
+    return runGit(args, { cwd: this.dir, ...opts });
+  }
+
+  /**
+   * How network commands of a folder sign in (set by the API from the repository settings; null: git's defaults).
+   * Submodule commands started by git (submodule update) inherit it through the environment and `-c` settings.
+   */
+  static auth: ((dir: string) => Promise<NetAuth | null>) | null = null;
+  /** a command that talks to a remote: with the repository's SSH key or account */
+  async net(args: string[], opts: Partial<RunOptions> = {}, override?: NetAuth | null) {
+    const a = override !== undefined ? override : Repo.auth ? await Repo.auth(this.dir) : null;
+    const cfg = (a?.config ?? []).flatMap((c) => ['-c', c]);
+    return this.git([...cfg, ...args], { ...opts, env: { ...(opts.env ?? {}), ...(a?.env ?? {}) } });
+  }
+  /** can the remote be reached with these credentials? (`git ls-remote <remote> HEAD`, read-only) */
+  async testConnection(remote: string, auth?: NetAuth | null) {
+    const r = await this.net(['ls-remote', remote, 'HEAD'], { allowFail: true, timeoutMs: 30000 }, auth);
+    return { ok: r.code === 0, output: (r.stderr || r.stdout).trim() };
+  }
+
+  // ---------- reading ----------
+
+  /** --date-order keeps parents after children (graph-safe) while showing recent work first, so HEAD lands on the first page. */
+  async log(limit = 500, revs: string[] = ['--all']): Promise<Commit[]> {
+    const r = await this.git(['log', `--format=${LOG_FORMAT}`, '--date-order', `-n${limit}`, ...revs, '--']);
+    return parseLog(r.stdout);
+  }
+
+  async head(): Promise<Sha> {
+    const r = await this.git(['rev-parse', 'HEAD'], { allowFail: true });
+    return r.code === 0 ? r.stdout.trim() : '';
+  }
+
+  async refs() {
+    const r = await this.git(['for-each-ref', `--format=${REF_FORMAT}`, 'refs/heads', 'refs/remotes', 'refs/tags']);
+    const refs = parseRefs(r.stdout);
+    // on a case-insensitive disk a branch made as `Tmp/x` next to an existing `tmp/` folder is stored (and listed)
+    // as `tmp/x` while HEAD still says `Tmp/x`: git marks no branch current, so the one HEAD names in another case is
+    if (!refs.some((x) => x.kind === 'branch' && x.current)) {
+      const head = (await this.git(['symbolic-ref', '-q', 'HEAD'], { allowFail: true })).stdout.trim();
+      const name = head.startsWith('refs/heads/') ? head.slice('refs/heads/'.length).toLowerCase() : '';
+      const same = name ? refs.find((x) => x.kind === 'branch' && x.name.toLowerCase() === name) : undefined;
+      if (same) same.current = true;
+    }
+    return refs;
+  }
+  /**
+   * A new branch name as the disk will keep it: with core.ignorecase (macOS) a branch is a file under refs/heads, so
+   * `Tmp/x` next to an existing `tmp/` folder lands in that folder and is listed as `tmp/x` — while HEAD and the
+   * reflog say `Tmp/x`. Folders that already exist keep their spelling.
+   */
+  async storedBranchName(name: string): Promise<string> {
+    if (!name.includes('/')) return name;
+    const ic = (await this.git(['config', '--bool', 'core.ignorecase'], { allowFail: true })).stdout.trim() === 'true';
+    if (!ic) return name;
+    const names = (await this.git(['for-each-ref', '--format=%(refname:short)', 'refs/heads'])).stdout.split('\n').filter(Boolean);
+    const parts = name.split('/');
+    for (let i = 0; i < parts.length - 1; i++) {
+      const prefix = parts.slice(0, i + 1).join('/').toLowerCase() + '/';
+      const existing = names.find((n) => n.toLowerCase().startsWith(prefix));
+      if (existing) parts.splice(0, i + 1, ...existing.split('/').slice(0, i + 1));
+    }
+    return parts.join('/');
+  }
+
+  async remotes() {
+    const [r, specs] = await Promise.all([this.git(['remote', '-v']), this.git(['config', '--get-regexp', '^remote\\..*\\.fetch$'], { allowFail: true })]);
+    // which remotes fetch every branch (a wildcard refspec): a --single-branch or narrowed clone follows only some,
+    // so most of origin's branches never appear in the sidebar until the fetch list is widened
+    const wild = new Set(
+      specs.stdout
+        .split('\n')
+        .map((l) => l.match(/^remote\.(.+)\.fetch\s+\+?([^:\s]+)/))
+        .filter((m): m is RegExpMatchArray => !!m && m[2] === 'refs/heads/*')
+        .map((m) => m[1]),
+    );
+    return parseRemotes(r.stdout).map((rm) => (wild.has(rm.name) ? rm : { ...rm, narrow: true }));
+  }
+
+  async stashes(): Promise<Stash[]> {
+    const r = await this.git(['stash', 'list', `--format=${STASH_FORMAT}`]);
+    return parseStashList(r.stdout);
+  }
+
+  async status() {
+    // untracked dirs collapsed and submodule worktrees not scanned: on huge trees this is the difference between 17s and 0.25s
+    const r = await this.git(['status', '--porcelain=v2', '-z', '--branch', '--untracked-files=normal', '--ignore-submodules=dirty', '--no-renames']);
+    const st = parseStatus(r.stdout);
+    if (st.unstaged.length + st.staged.length === 0) return st;
+    // +/- counts without loading hunks; sequential so the two processes do not fight over the index
+    const [un, idx] = await Promise.all([
+      st.unstaged.length ? this.git(['diff', '--numstat', '-z', '--ignore-submodules=dirty', '--'], { allowFail: true }) : Promise.resolve({ code: 0, stdout: '', stderr: '' }),
+      st.staged.length ? this.git(['diff', '--cached', '--numstat', '-z', '--ignore-submodules=dirty', '--'], { allowFail: true }) : Promise.resolve({ code: 0, stdout: '', stderr: '' }),
+    ]);
+    const unMap = parseNumstat(un.stdout);
+    const idxMap = parseNumstat(idx.stdout);
+    for (const f of st.unstaged) Object.assign(f, unMap.get(f.path) ?? {});
+    for (const f of st.staged) Object.assign(f, idxMap.get(f.path) ?? {});
+    return st;
+  }
+
+  /** a clone whose history is cut off (`clone --depth`, `.git/shallow`) */
+  async isShallow() {
+    const r = await this.git(['rev-parse', '--is-shallow-repository'], { allowFail: true });
+    return r.stdout.trim() === 'true';
+  }
+
+  async opState(): Promise<OpState> {
+    const g = path.join(this.dir, '.git');
+    if (existsSync(path.join(g, 'rebase-merge')) || existsSync(path.join(g, 'rebase-apply'))) return { kind: 'rebase' };
+    if (existsSync(path.join(g, 'MERGE_HEAD'))) return { kind: 'merge' };
+    if (existsSync(path.join(g, 'CHERRY_PICK_HEAD'))) return { kind: 'cherry-pick' };
+    if (existsSync(path.join(g, 'REVERT_HEAD'))) return { kind: 'revert' };
+    return { kind: 'none' };
+  }
+
+  /** One-time per-session performance settings: fsmonitor daemon + untracked cache make status O(changes). */
+  async ensurePerfConfig() {
+    if (perfConfigured.has(this.dir)) return;
+    perfConfigured.add(this.dir);
+    for (const [k, v] of [['core.fsmonitor', 'true'], ['core.untrackedCache', 'true']]) {
+      const cur = await this.config(k);
+      if (cur === null) await this.git(['config', k, v], { allowFail: true });
+    }
+  }
+
+  private refsSig(refs: { name: string; sha: string }[], head: Sha, limit: number) {
+    const h = createHash('sha1');
+    h.update(head + '|' + limit + '|');
+    for (const r of refs) h.update(r.name + '=' + r.sha + ';');
+    return h.digest('hex');
+  }
+
+  /** Log with an in-memory + on-disk cache keyed by the ref tips: reopening a huge repo is instant. */
+  async cachedLog(limit: number, refs: { name: string; sha: string }[], head: Sha): Promise<Commit[]> {
+    const sig = this.refsSig(refs, head, limit);
+    const mem = logCache.get(this.dir);
+    if (mem && mem.sig === sig) return mem.commits;
+    const file = path.join(CACHE_DIR, createHash('sha1').update(this.dir).digest('hex') + '.json');
+    try {
+      const disk = JSON.parse(readFileSync(file, 'utf8')) as { sig: string; commits: Commit[] };
+      if (disk.sig === sig) {
+        logCache.set(this.dir, { sig, limit, commits: disk.commits });
+        return disk.commits;
+      }
+    } catch {
+      /* no disk cache */
+    }
+    const commits = await this.log(limit);
+    logCache.set(this.dir, { sig, limit, commits });
+    try {
+      mkdirSync(CACHE_DIR, { recursive: true });
+      writeFileSync(file, JSON.stringify({ sig, commits }));
+    } catch {
+      /* cache is best-effort */
+    }
+    return commits;
+  }
+
+  async snapshot(limit = 300): Promise<RepoSnapshot & { op: OpState; timings: Record<string, number> }> {
+    await this.ensurePerfConfig();
+    const t0 = Date.now();
+    const timed = async <T>(k: string, p: Promise<T>) => {
+      const v = await p;
+      timings[k] = Date.now() - t0;
+      return v;
+    };
+    const timings: Record<string, number> = {};
+    const [refs, head] = await Promise.all([timed('refs', this.refs()), this.head()]);
+    const [commits, remotes, stashes, op, shallow] = await Promise.all([timed('log', this.cachedLog(limit, refs, head)), this.remotes(), this.stashes(), this.opState(), this.isShallow()]);
+    const st = await timed('status', this.status());
+    timings.total = Date.now() - t0;
+    const snap = { commits, refs, remotes, stashes, unstaged: st.unstaged, staged: st.staged, head, op, shallow, timings };
+    snapCache.set(this.dir, snap);
+    try {
+      mkdirSync(CACHE_DIR, { recursive: true });
+      writeFileSync(path.join(CACHE_DIR, 'snap-' + createHash('sha1').update(this.dir).digest('hex') + '.json'), JSON.stringify(snap));
+    } catch {
+      /* best effort */
+    }
+    return snap;
+  }
+
+  /** Last known snapshot (memory, then disk) so the UI can paint before git answers; null when unknown. */
+  cachedSnapshot(): (RepoSnapshot & { op: OpState; timings: Record<string, number>; stale: true }) | null {
+    const mem = snapCache.get(this.dir) as any;
+    if (mem) return { ...mem, stale: true };
+    try {
+      const disk = JSON.parse(readFileSync(path.join(CACHE_DIR, 'snap-' + createHash('sha1').update(this.dir).digest('hex') + '.json'), 'utf8'));
+      snapCache.set(this.dir, disk);
+      return { ...disk, stale: true };
+    } catch {
+      return null;
+    }
+  }
+
+  /** Next page of history (topo order), for infinite scroll. */
+  async logPage(skip: number, limit: number, revs: string[] = ['--all']): Promise<Commit[]> {
+    const r = await this.git(['log', `--format=${LOG_FORMAT}`, '--date-order', `--skip=${skip}`, `-n${limit}`, ...revs, '--']);
+    return parseLog(r.stdout);
+  }
+
+  /**
+   * Position of a commit in the date-ordered log of `revs` (what the history list shows), or -1 when it is not
+   * among the first `max`. Streams `git rev-list` and stops at the commit, so a near one costs little.
+   */
+  async logPosition(sha: Sha, revs: string[] = ['--all'], max = 200000): Promise<number> {
+    let i = 0;
+    let found = -1;
+    await runGitLines(['rev-list', '--date-order', `-n${max}`, ...revs, '--'], { cwd: this.dir }, (line) => {
+      if (line === sha) {
+        found = i;
+        return false;
+      }
+      i++;
+    });
+    return found;
+  }
+
+  /**
+   * The log of `revs` from position `skip` down to commit `sha` and `after` commits past it, in one streamed pass
+   * (a branch click deep in the history). `index` is the commit's position, -1 when it is not among the first `max`.
+   */
+  async logUntil(sha: Sha, skip: number, after = 200, revs: string[] = ['--all'], max = 200000): Promise<{ index: number; commits: Commit[] }> {
+    const records: string[] = [];
+    let at = -1;
+    const n = Math.max(0, max - skip);
+    if (n > 0)
+      await runGitLines(
+        ['log', `--format=${LOG_FORMAT}`, '--date-order', `--skip=${skip}`, `-n${n}`, ...revs, '--'],
+        { cwd: this.dir },
+        (rec) => {
+          records.push(rec);
+          if (at < 0 && rec.replace(/^\n/, '').startsWith(sha)) at = records.length - 1;
+          if (at >= 0 && records.length - 1 - at >= after) return false;
+        },
+        REC,
+      );
+    if (at < 0) return { index: -1, commits: [] };
+    return { index: skip + at, commits: parseLog(records.join(REC)) };
+  }
+
+  /**
+   * History of one path, following renames. `git log --follow` cannot use the commit-graph's path filters and
+   * walks the whole history (9 s for a file in a 480 000-commit project); instead the plain log is read (fast),
+   * and when its oldest commit created the file by renaming another, the old name is read from that commit's
+   * parent on, and so on.
+   */
+  async logFile(file: string, limit = 200, start = 'HEAD'): Promise<Commit[]> {
+    const out: Commit[] = [];
+    const seen = new Set<Sha>();
+    let name = file;
+    let from = start;
+    for (let hop = 0; hop < 20 && out.length < limit; hop++) {
+      const r = await this.git(['log', `--format=${LOG_FORMAT}`, `-n${limit - out.length}`, from, '--', name]);
+      const page = parseLog(r.stdout).filter((c) => !seen.has(c.sha));
+      for (const c of page) seen.add(c.sha);
+      out.push(...page);
+      const oldest = page[page.length - 1];
+      if (!oldest || !oldest.parents[0] || out.length >= limit) break;
+      const d = await this.git(['diff', '--name-status', '-M', oldest.parents[0], oldest.sha], { allowFail: true, maxBytes: 32 * 1024 * 1024 });
+      const renamed = d.stdout
+        .split('\n')
+        .map((l) => l.split('\t'))
+        .find((p) => p[0]?.startsWith('R') && p[2] === name);
+      if (!renamed) break;
+      name = renamed[1];
+      from = oldest.parents[0];
+    }
+    return out;
+  }
+
+  async fileAt(rev: string, file: string): Promise<string | null> {
+    const r = await this.git(['show', `${rev}:${file}`], { allowFail: true });
+    return r.code === 0 ? r.stdout : null;
+  }
+
+  // ---------- submodules ----------
+
+  async submodules(): Promise<Submodule[]> {
+    const gm = path.join(this.dir, '.gitmodules');
+    if (!existsSync(gm)) return [];
+    const cfg = await this.git(['config', '-f', '.gitmodules', '--list'], { allowFail: true });
+    const byName = new Map<string, { path?: string; url?: string }>();
+    for (const line of cfg.stdout.split('\n')) {
+      const m = line.match(/^submodule\.(.+)\.(path|url)=(.*)$/);
+      if (!m) continue;
+      const e = byName.get(m[1]) ?? {};
+      (e as any)[m[2]] = m[3];
+      byName.set(m[1], e);
+    }
+    // `git submodule status` describes the submodules one after another (1.3 s for 20 in a big project);
+    // the index gives the recorded commits and each checkout is asked in parallel instead
+    const paths = [...byName.values()].map((e) => e.path).filter((p): p is string => !!p);
+    const idx = paths.length ? await this.git(['ls-files', '-s', '--', ...paths], { allowFail: true }) : { stdout: '' };
+    const recorded = new Map<string, { sha: string; conflict: boolean }>();
+    for (const line of idx.stdout.split('\n')) {
+      const m = line.match(/^160000 ([0-9a-f]{40,64}) (\d)\t(.*)$/);
+      if (m) recorded.set(m[3], { sha: m[1], conflict: m[2] !== '0' || !!recorded.get(m[3])?.conflict });
+    }
+    const states = new Map<string, { sha: string; state: Submodule['state']; describe?: string }>();
+    const probe = async (p: string) => {
+      const rec = recorded.get(p);
+      const sub = path.join(this.dir, p);
+      if (!existsSync(path.join(sub, '.git'))) {
+        states.set(p, { sha: rec?.sha ?? '', state: rec?.conflict ? 'conflict' : 'uninitialized' });
+        return;
+      }
+      const [head, desc] = await Promise.all([runGit(['rev-parse', 'HEAD'], { cwd: sub, allowFail: true }), runGit(['describe', '--all', '--always', 'HEAD'], { cwd: sub, allowFail: true })]);
+      const sha = head.code === 0 ? head.stdout.trim() : '';
+      const state: Submodule['state'] = rec?.conflict ? 'conflict' : sha && rec && sha !== rec.sha ? 'modified' : 'ok';
+      states.set(p, { sha: sha || rec?.sha || '', state, describe: desc.code === 0 ? desc.stdout.trim() || undefined : undefined });
+    };
+    for (let i = 0; i < paths.length; i += 8) await Promise.all(paths.slice(i, i + 8).map(probe));
+    const out: Submodule[] = [];
+    for (const [name, e] of byName) {
+      if (!e.path) continue;
+      const s = states.get(e.path);
+      out.push({ path: e.path, name, url: e.url ?? '', sha: s?.sha ?? '', state: s?.state ?? 'uninitialized', describe: s?.describe });
+    }
+    return out.sort((a, b) => a.path.localeCompare(b.path));
+  }
+
+  async submoduleUpdate(paths: string[] | undefined, recursive: boolean, onProgress?: Progress) {
+    const args = ['submodule', 'update', '--init', '--progress', ...(recursive ? ['--recursive'] : []), '--', ...(paths ?? [])];
+    await this.net(args, { onLine: (l) => onProgress?.(l, progressOf(l)) });
+  }
+  async submoduleSync() {
+    await this.git(['submodule', 'sync', '--recursive']);
+  }
+  /** Subjects for the before/after commits of a submodule change (empty when the object is missing). */
+  /**
+   * What a submodule pointer change brought: the submodule's commits from `before` to `after` (`added`), and when
+   * the pointer moved back or sideways, the ones it left (`removed`). `missing` lists pointers the submodule's clone
+   * does not have (not fetched yet); `uninitialized` when the submodule is not checked out at all.
+   */
+  async submoduleRange(subPath: string, before: string, after: string, limit = 100): Promise<{ added: Commit[]; removed: Commit[]; missing: string[]; uninitialized: boolean; more: boolean }> {
+    const dir = path.join(this.dir, subPath);
+    if (!existsSync(path.join(dir, '.git'))) return { added: [], removed: [], missing: [], uninitialized: true, more: false };
+    const sub = new Repo(dir);
+    const has = async (sha: string) => !!sha && (await sub.git(['cat-file', '-e', `${sha}^{commit}`], { allowFail: true })).code === 0;
+    const missing = [before, after].filter(Boolean);
+    const [hb, ha] = await Promise.all([has(before), has(after)]);
+    const gone = missing.filter((s) => (s === before ? !hb : !ha));
+    const log = async (range: string[]) => parseLog((await sub.git(['log', `--format=${LOG_FORMAT}`, `-n${limit + 1}`, ...range, '--'], { allowFail: true })).stdout);
+    let added: Commit[] = [];
+    let removed: Commit[] = [];
+    if (ha && hb) [added, removed] = await Promise.all([log([`${before}..${after}`]), log([`${after}..${before}`])]);
+    else if (ha && !before) added = await log([after]);
+    const more = added.length > limit || removed.length > limit;
+    return { added: added.slice(0, limit), removed: removed.slice(0, limit), missing: gone, uninitialized: false, more };
+  }
+
+  async submoduleCommits(subPath: string, shas: string[]): Promise<Record<string, string>> {
+    const sub = new Repo(path.join(this.dir, subPath));
+    const out: Record<string, string> = {};
+    for (const sha of shas) {
+      if (!sha) continue;
+      const r = await sub.git(['log', '-1', '--format=%s', sha], { allowFail: true });
+      if (r.code === 0) out[sha] = r.stdout.trim();
+    }
+    return out;
+  }
+
+  // ---------- remotes & misc ----------
+
+  async addRemote(name: string, url: string) {
+    await this.git(['remote', 'add', name, url]);
+  }
+  async setRemoteUrl(name: string, url: string) {
+    await this.git(['remote', 'set-url', name, url]);
+  }
+  async removeRemote(name: string) {
+    await this.git(['remote', 'remove', name]);
+  }
+  async pruneRemote(name: string) {
+    const r = await this.net(['remote', 'prune', name]);
+    return { output: r.stdout.trim() };
+  }
+  async pushTag(remote: string, tag: string) {
+    await this.net(['push', remote, `refs/tags/${tag}`]);
+  }
+  async checkoutDetached(sha: string) {
+    await this.git(['checkout', '--detach', sha]);
+  }
+  async appendIgnore(pattern: string) {
+    appendFileSync(path.join(this.dir, '.gitignore'), (existsSync(path.join(this.dir, '.gitignore')) && !readFileSync(path.join(this.dir, '.gitignore'), 'utf8').endsWith('\n') ? '\n' : '') + pattern + '\n');
+  }
+  async globalConfig(key: string): Promise<string | null> {
+    const r = await this.git(['config', '--global', '--get', key], { allowFail: true });
+    return r.code === 0 ? r.stdout.trim() : null;
+  }
+  async setGlobalConfig(key: string, value: string) {
+    await this.git(['config', '--global', key, value]);
+  }
+
+  /** Files touched by a commit, with hunks. */
+  /**
+   * Files of a commit. Small commits come with their diffs; a commit with hundreds of files, or a patch of
+   * many megabytes (a merge of two long-lived branches can touch 50 000 files and produce a gigabyte), comes as
+   * a list (`lazy` files) and each diff is read by `commitFileDiff` when the file is selected.
+   */
+  async commitFiles(sha: Sha): Promise<FileChange[]> {
+    const raw = await this.git(['show', '--format=', '--raw', '--no-abbrev', '--find-renames', '-m', '--first-parent', sha, '--'], { maxBytes: 256 * 1024 * 1024 });
+    const listed = parseRaw(raw.stdout);
+    if (listed.length > COMMIT_PATCH_FILES) return listed;
+    const r = await this.git(['show', '--format=', '--no-color', '-U3', '--find-renames', '-m', '--first-parent', sha, '--'], { maxBytes: COMMIT_PATCH_BYTES });
+    if (r.truncated) return listed;
+    return parseDiff(r.stdout, { largeThreshold: LARGE_DIFF_LINES });
+  }
+
+  /** One file of a commit (or of a stash: `rev` = "stash@{n}"); `force` reads a large diff in full. */
+  async commitFileDiff(rev: string, file: string, oldPath?: string, force = false): Promise<FileChange | null> {
+    const paths = oldPath && oldPath !== file ? [oldPath, file] : [file];
+    const r = await this.git(['show', '--format=', '--no-color', '-U3', '--find-renames', '-m', '--first-parent', rev, '--', ...paths], { maxBytes: FILE_DIFF_BYTES });
+    const files = parseDiff(r.stdout, { largeThreshold: force ? undefined : LARGE_DIFF_LINES });
+    const f = files.find((x) => x.path === file) ?? files[0] ?? null;
+    if (f && r.truncated) f.truncated = true;
+    return f;
+  }
+
+  async stashFiles(index: number): Promise<FileChange[]> {
+    const r = await this.git(['stash', 'show', '-p', '--no-color', '--include-untracked', `stash@{${index}}`], { maxBytes: COMMIT_PATCH_BYTES });
+    if (!r.truncated) return parseDiff(r.stdout, { largeThreshold: LARGE_DIFF_LINES });
+    const raw = await this.git(['stash', 'show', '--raw', '--no-abbrev', '--include-untracked', `stash@{${index}}`], { maxBytes: 256 * 1024 * 1024 });
+    return parseRaw(raw.stdout);
+  }
+
+  /** Diff of one working-copy file: unstaged (worktree vs index) or staged (index vs HEAD). */
+  async fileDiff(file: string, area: 'unstaged' | 'staged', force = false): Promise<FileChange | null> {
+    const args = area === 'staged' ? ['diff', '--cached'] : ['diff'];
+    let r = await this.git([...args, '--no-color', '-U3', '--find-renames', '--', file]);
+    if (!r.stdout.trim() && area === 'unstaged') {
+      // untracked file: show it as an addition
+      const st = await this.git(['status', '--porcelain', '--', file]);
+      if (st.stdout.startsWith('??')) {
+        r = await this.git(['diff', '--no-color', '-U3', '--no-index', '--', '/dev/null', file], { allowFail: true });
+        const [f] = parseDiff(r.stdout.replace(/^diff --git a\/.* b\/(.*)$/m, (_, p) => `diff --git a/${p} b/${p}`), { largeThreshold: force ? undefined : LARGE_DIFF_LINES });
+        if (f) {
+          f.status = '?';
+          f.path = file;
+          return f;
+        }
+        return null;
+      }
+    }
+    const [f] = parseDiff(r.stdout, { largeThreshold: force ? undefined : LARGE_DIFF_LINES });
+    if (!f) return null;
+    return f;
+  }
+
+  /**
+   * Where both sides of a working-copy, commit or stash change live, without reading their content.
+   * `area`: 'unstaged' (index → worktree), 'staged' (HEAD → index), a commit (first parent → commit) or a
+   * stash ref (base → stash; untracked files of a stash live in its third parent). A side is absent when the
+   * file does not exist there: added files have no `before`, deleted files no `after`.
+   */
+  async mediaSides(file: string, area: string, oldPath?: string): Promise<{ before?: BlobSide; after?: BlobSide }> {
+    const prev = oldPath ?? file;
+    let before: BlobSide | null;
+    let after: BlobSide | null;
+    if (area === 'unstaged') {
+      before = await this.blobInfo(':0', prev);
+      after = await this.blobInfo(WORKTREE, file);
+    } else if (area === 'staged') {
+      before = await this.blobInfo('HEAD', prev);
+      after = await this.blobInfo(':0', file);
+    } else {
+      before = await this.blobInfo(`${area}^`, prev);
+      after = await this.blobInfo(area, file);
+      if (!after && /^stash@\{\d+\}$/.test(area)) after = await this.blobInfo(`${area}^3`, file);
+    }
+    return { ...(before ? { before } : {}), ...(after ? { after } : {}) };
+  }
+
+  /** Size and identity of a file at a revision (`WORKTREE`, `:0` = index, or any revision); null when absent. */
+  async blobInfo(rev: string, file: string): Promise<BlobSide | null> {
+    if (!safeRelPath(file)) return null;
+    if (rev === WORKTREE) {
+      try {
+        const st = statSync(path.join(this.dir, file));
+        return st.isFile() ? { rev, file, bytes: st.size, version: `w${Math.round(st.mtimeMs)}-${st.size}` } : null;
+      } catch {
+        return null;
+      }
+    }
+    const spec = rev === ':0' ? `:0:${file}` : `${rev}:${file}`;
+    const r = await this.git(['cat-file', '--batch-check'], { input: `${spec}\n`, allowFail: true });
+    const m = r.stdout.trim().match(/^([0-9a-f]{40,64}) blob (\d+)$/);
+    return m ? { rev, file, bytes: parseInt(m[2], 10), version: m[1], oid: m[1] } : null;
+  }
+
+  /**
+   * A file on disk with the content of `file` at `rev`: the working copy itself, or the blob extracted once into
+   * the content-addressed cache (named by object id, keeping the extension so other apps recognise the type).
+   * Streams through git, so large videos never sit in memory.
+   */
+  async materializeBlob(rev: string, file: string): Promise<{ path: string; bytes: number } | null> {
+    const info = await this.blobInfo(rev, file);
+    if (!info) return null;
+    if (rev === WORKTREE) return { path: path.join(this.dir, file), bytes: info.bytes };
+    const dir = path.join(stateDir(), 'cache', 'blobs');
+    const out = path.join(dir, `${info.oid}${path.extname(file).toLowerCase()}`);
+    if (existsSync(out) && statSync(out).size === info.bytes) return { path: out, bytes: info.bytes };
+    mkdirSync(dir, { recursive: true });
+    const tmp = `${out}.${process.pid}.${Date.now()}.part`;
+    await new Promise<void>((resolve, reject) => {
+      const child = spawn(GIT_BIN, ['cat-file', 'blob', info.oid!], { cwd: this.dir, stdio: ['ignore', 'pipe', 'pipe'] });
+      const sink = createWriteStream(tmp);
+      child.stdout.pipe(sink);
+      let err = '';
+      let exit: number | null | undefined;
+      let written = false;
+      // done only when git has exited and the file is flushed
+      const settle = () => {
+        if (exit === undefined || !written) return;
+        if (exit === 0) resolve();
+        else reject(new Error(err.trim() || `git cat-file failed (${exit})`));
+      };
+      child.stderr.on('data', (b: Buffer) => (err += b.toString()));
+      child.on('error', reject);
+      sink.on('error', reject);
+      sink.on('finish', () => {
+        written = true;
+        settle();
+      });
+      child.on('close', (code) => {
+        exit = code;
+        settle();
+      });
+    }).catch((e) => {
+      rmSync(tmp, { force: true });
+      throw e;
+    });
+    renameSync(tmp, out);
+    return { path: out, bytes: info.bytes };
+  }
+
+  /** blame of the working copy, or of the file as it is in commit `rev` */
+  async blame(file: string, rev?: string): Promise<{ sha: string; author: string; date: number; line: string }[]> {
+    const r = await this.git(['blame', '--line-porcelain', ...(rev ? [rev] : []), '--', file], { maxBytes: 64 * 1024 * 1024 });
+    const out: { sha: string; author: string; date: number; line: string }[] = [];
+    let cur: any = null;
+    for (const l of r.stdout.split('\n')) {
+      if (/^[0-9a-f]{40} \d+ \d+/.test(l)) cur = { sha: l.slice(0, 40), author: '', date: 0, line: '' };
+      else if (l.startsWith('author ')) cur.author = l.slice(7);
+      else if (l.startsWith('author-time ')) cur.date = parseInt(l.slice(12), 10) * 1000;
+      else if (l.startsWith('\t')) {
+        cur.line = l.slice(1);
+        out.push(cur);
+      }
+    }
+    return out;
+  }
+
+  // ---------- staging ----------
+
+  async stage(paths: string[]) {
+    if (paths.length) await this.git(['add', '-A', '--', ...paths]);
+  }
+  async stageAll() {
+    await this.git(['add', '-A']);
+  }
+  async unstage(paths: string[]) {
+    if (paths.length) await this.git(['restore', '--staged', '--', ...paths]);
+  }
+  async unstageAll() {
+    await this.git(['reset', '-q']);
+  }
+  async discard(paths: string[]) {
+    const tracked: string[] = [];
+    for (const p of paths) {
+      const st = await this.git(['status', '--porcelain', '--', p]);
+      if (st.stdout.startsWith('??')) rmSync(path.join(this.dir, p), { recursive: true, force: true });
+      else tracked.push(p);
+    }
+    if (tracked.length) await this.git(['checkout', '--', ...tracked]);
+  }
+  async discardAll() {
+    await this.git(['checkout', '--', '.']);
+    await this.git(['clean', '-fd']);
+  }
+
+  async stageHunk(file: FileChange, hunk: Hunk) {
+    await this.git(['apply', '--cached', '--unidiff-zero', '-'], { input: hunkPatch(file, hunk) });
+  }
+  async unstageHunk(file: FileChange, hunk: Hunk) {
+    await this.git(['apply', '--cached', '--reverse', '--unidiff-zero', '-'], { input: hunkPatch(file, hunk) });
+  }
+  async discardHunk(file: FileChange, hunk: Hunk) {
+    await this.git(['apply', '--reverse', '--unidiff-zero', '-'], { input: hunkPatch(file, hunk) });
+  }
+
+  async resolveConflict(file: string, take: 'ours' | 'theirs') {
+    await this.git(['checkout', `--${take}`, '--', file]);
+    await this.git(['add', '--', file]);
+  }
+
+  // ---------- commits ----------
+
+  async commit(message: string, opts: { amend?: boolean; allowEmpty?: boolean } = {}): Promise<Sha> {
+    const args = ['commit', '-m', message];
+    if (opts.amend) args.push('--amend');
+    if (opts.allowEmpty) args.push('--allow-empty');
+    await this.git(args);
+    return this.head();
+  }
+
+  // ---------- remote ----------
+
+  /**
+   * `tags`: every tag of the remote, not only those on fetched commits (`--tags`; git never prunes tags fetched that
+   * way, so local-only tags stay even with `prune`).
+   */
+  async fetch(remote = '--all', prune = true, onProgress?: Progress, opts: { tags?: boolean } = {}) {
+    const args = ['fetch', '--progress', ...(prune ? ['--prune'] : []), ...(opts.tags ? ['--tags'] : []), ...(remote === '--all' ? ['--all'] : [remote])];
+    await this.withoutGoneBranches(() => this.net(args, { onLine: (l) => onProgress?.(l, progressOf(l)) }), onProgress);
+  }
+  /**
+   * Into the current branch: its upstream, or `branch` of `remote` (as Fork's Pull picks them). `autostash`: local
+   * changes are stashed before and put back after (`--autostash`); `tags`: every tag of the remote too.
+   */
+  async pull(strategy: 'merge' | 'rebase' | 'ff' = 'merge', onProgress?: Progress, opts: { remote?: string; branch?: string; autostash?: boolean; tags?: boolean } = {}) {
+    const flag = strategy === 'rebase' ? '--rebase' : strategy === 'ff' ? '--ff-only' : '--no-rebase';
+    const args = ['pull', '--progress', flag, ...(opts.autostash ? ['--autostash'] : []), ...(opts.tags ? ['--tags'] : []), ...(opts.remote ? [opts.remote, ...(opts.branch ? [opts.branch] : [])] : [])];
+    await this.withoutGoneBranches(() => this.net(args, { onLine: (l) => onProgress?.(l, progressOf(l)) }), onProgress);
+  }
+  /**
+   * Completes a shallow clone: `git fetch --unshallow` brings the history `clone --depth` left out, so blame,
+   * `log` of old files and rebases onto old commits work again. Such a clone also follows a single branch (git
+   * implies --single-branch with --depth), so `allBranches` widens the remote's fetch list first; without that the
+   * full history would arrive for one branch only.
+   */
+  async unshallow(remote?: string, allBranches = true, onProgress?: Progress) {
+    if (!(await this.isShallow())) throw new Error('This repository is not a shallow clone: its history is already complete.');
+    const names = (await this.git(['remote'])).stdout.split('\n').filter(Boolean);
+    const name = remote ?? (names.includes('origin') ? 'origin' : names[0]);
+    if (!name) throw new Error('No remote to fetch the missing history from.');
+    if (!names.includes(name)) throw new Error(`No remote named ${name}.`);
+    if (allBranches && !(await this.fetchesAllBranches(name))) {
+      await this.git(['remote', 'set-branches', name, '*']);
+      onProgress?.(`${name} follows every branch from now on`, null);
+    }
+    await this.net(['fetch', '--unshallow', '--tags', '--progress', name], { onLine: (l) => onProgress?.(l, progressOf(l)) });
+  }
+  /**
+   * Widens a narrow clone: `git remote set-branches <remote> '*'` puts the wildcard refspec back and fetches, so every
+   * branch of the remote arrives. A `--single-branch` clone (also what `--depth` leaves behind) follows one branch
+   * only, which is why origin shows a single branch however often it is fetched; the history stays as deep as it is.
+   */
+  async followAllBranches(remote?: string, onProgress?: Progress) {
+    const names = (await this.git(['remote'])).stdout.split('\n').filter(Boolean);
+    const name = remote ?? (names.includes('origin') ? 'origin' : names[0]);
+    if (!name) throw new Error('No remote to fetch the branches from.');
+    if (!names.includes(name)) throw new Error(`No remote named ${name}.`);
+    if (await this.fetchesAllBranches(name)) throw new Error(`${name} already follows every branch: a plain fetch brings them all.`);
+    await this.git(['remote', 'set-branches', name, '*']);
+    onProgress?.(`${name} follows every branch from now on`, null);
+    await this.net(['fetch', '--tags', '--progress', name], { onLine: (l) => onProgress?.(l, progressOf(l)) });
+  }
+  /** does the remote's fetch list cover every branch (a wildcard refspec), or only the cloned one? */
+  async fetchesAllBranches(remote: string) {
+    const specs = (await this.git(['config', '--get-all', `remote.${remote}.fetch`], { allowFail: true })).stdout.split('\n').filter(Boolean);
+    return specs.some((s) => s.replace(/^\+/, '').split(':')[0] === 'refs/heads/*');
+  }
+  /**
+   * A single-branch clone fetches its extra branches by name (Prong adds one when a branch is published from such a
+   * clone). Once the remote deletes one of them, git fails every fetch and pull with "couldn't find remote ref". Such
+   * a branch leaves the remote's fetch list and its stale remote copy goes (what --prune does for the rest), and the
+   * command runs again; its log says which.
+   */
+  private async withoutGoneBranches(run: () => Promise<unknown>, onProgress?: Progress) {
+    try {
+      await run();
+    } catch (e) {
+      const dropped = await this.dropGoneBranches(String((e as Error)?.message ?? e));
+      if (!dropped.length) throw e;
+      await run();
+      onProgress?.(`Deleted on the remote, no longer fetched: ${dropped.join(', ')}`, null);
+    }
+  }
+  /** the named fetch refspecs whose branch the remote no longer has (checked with ls-remote); what was dropped */
+  async dropGoneBranches(message: string): Promise<string[]> {
+    const gone = new Set([...message.matchAll(/couldn't find remote ref (refs\/heads\/\S+)/g)].map((m) => m[1]));
+    if (!gone.size) return [];
+    const dropped: string[] = [];
+    for (const remote of (await this.git(['remote'])).stdout.split('\n').filter(Boolean)) {
+      const specs = (await this.git(['config', '--get-all', `remote.${remote}.fetch`], { allowFail: true })).stdout.split('\n').filter(Boolean);
+      for (const spec of specs) {
+        const [src, dst] = spec.replace(/^\+/, '').split(':');
+        // a remote whose only refspec is that branch is left alone: without one it would fetch nothing
+        if (!gone.has(src) || specs.length < 2) continue;
+        // another remote may still have a branch of that name: only the one that lost it
+        const there = await this.net(['ls-remote', '--exit-code', remote, src], { allowFail: true, timeoutMs: 30000 });
+        if (there.code !== 2) continue;
+        await this.git(['config', '--fixed-value', '--unset', `remote.${remote}.fetch`, spec]);
+        if (dst?.startsWith('refs/remotes/')) await this.git(['update-ref', '-d', dst], { allowFail: true });
+        dropped.push(`${remote}/${src.slice('refs/heads/'.length)}`);
+      }
+    }
+    return dropped;
+  }
+  /**
+   * `branch` (any local branch, not only the current one) to `remoteBranch` of `remote` — the same name unless given,
+   * as in Fork's Push. `setUpstream`: the local branch tracks it afterwards; `tags`: every tag goes along.
+   */
+  async push(opts: { remote?: string; branch?: string; remoteBranch?: string; force?: boolean; tags?: boolean; setUpstream?: boolean } = {}, onProgress?: Progress) {
+    const args = ['push', '--progress'];
+    if (opts.force) args.push('--force-with-lease');
+    if (opts.tags) args.push('--tags');
+    if (opts.setUpstream) args.push('-u');
+    const target = opts.remoteBranch || opts.branch;
+    if (opts.remote) {
+      args.push(opts.remote);
+      if (opts.branch) args.push(target && target !== opts.branch ? `${opts.branch}:refs/heads/${target}` : opts.branch);
+    }
+    // a branch published with -u must be one the clone fetches, or git keeps no origin/<branch> and the upstream
+    // never resolves (single-branch and narrow clones fetch only master)
+    const tracked = opts.setUpstream && opts.remote && target ? await this.fetchesBranch(opts.remote, target) : true;
+    if (!tracked) await this.git(['remote', 'set-branches', '--add', opts.remote!, target!]);
+    await this.net(args, { onLine: (l) => onProgress?.(l, progressOf(l)) });
+    if (opts.setUpstream && opts.remote && target) {
+      // pushed before the branch was fetched (nothing new to send this time): read its remote copy once
+      const has = await this.git(['rev-parse', '--verify', '-q', `refs/remotes/${opts.remote}/${target}`], { allowFail: true });
+      if (has.code !== 0) await this.net(['fetch', opts.remote, target], { allowFail: true });
+    }
+  }
+  /** does `git fetch <remote>` bring refs/heads/<branch>? (its fetch refspecs, wildcards included) */
+  async fetchesBranch(remote: string, branch: string) {
+    const specs = (await this.git(['config', '--get-all', `remote.${remote}.fetch`], { allowFail: true })).stdout.split('\n').filter(Boolean);
+    const ref = `refs/heads/${branch}`;
+    return specs.some((s) => {
+      const src = s.replace(/^\+/, '').split(':')[0];
+      if (!src.includes('*')) return src === ref;
+      const [pre, post] = src.split('*');
+      return ref.startsWith(pre) && ref.endsWith(post) && ref.length >= pre.length + post.length;
+    });
+  }
+
+  // ---------- branches / tags ----------
+
+  async checkout(ref: string) {
+    await this.git(['switch', ref], { allowFail: false }).catch(() => this.git(['checkout', ref]));
+  }
+  /**
+   * Fork's "stash and reapply": local changes that would be overwritten are stashed, the branch is checked out,
+   * the changes come back. If they do not apply cleanly the stash stays (nothing is lost) and that is reported.
+   * `start`: `ref` is a new branch from there (a remote branch's local branch, tracking it).
+   */
+  async checkoutWithStash(ref: string, start?: string): Promise<{ stashed: boolean; reapplied: boolean; output: string }> {
+    const s = await this.git(['stash', 'push', '--include-untracked', '-m', `Prong: before switching to ${ref}`]);
+    const stashed = !/No local changes to save/.test(s.stdout + s.stderr);
+    try {
+      await (start ? this.createBranch(ref, start, true) : this.checkout(ref));
+    } catch (e) {
+      if (stashed) await this.git(['stash', 'pop'], { allowFail: true });
+      throw e;
+    }
+    if (!stashed) return { stashed, reapplied: false, output: '' };
+    const p = await this.git(['stash', 'pop'], { allowFail: true });
+    return { stashed, reapplied: p.code === 0, output: (p.stdout + p.stderr).trim() };
+  }
+  /** the name it got (see storedBranchName) */
+  async createBranch(name: string, start: string, checkout: boolean): Promise<{ name: string }> {
+    const stored = await this.storedBranchName(name);
+    if (checkout) await this.git(['switch', '-c', stored, start]);
+    else await this.git(['branch', stored, start]);
+    return { name: stored };
+  }
+  /** a local branch; with `remote`, also the branch it tracks there (or the same-named one) */
+  async deleteBranch(name: string, force = false, remote?: string) {
+    const upstream = remote ? (await this.git(['rev-parse', '--abbrev-ref', `${name}@{upstream}`], { allowFail: true })).stdout.trim() : '';
+    await this.git(['branch', force ? '-D' : '-d', name]);
+    if (remote) await this.deleteRemoteBranch(remote, upstream.startsWith(remote + '/') ? upstream.slice(remote.length + 1) : name);
+  }
+  /** a branch on a remote; when the remote no longer has it, the stale remote-tracking ref is dropped */
+  async deleteRemoteBranch(remote: string, branch: string) {
+    const r = await this.net(['push', remote, '--delete', branch], { allowFail: true });
+    if (r.code === 0) return;
+    if (/remote ref does not exist|unable to delete/i.test(r.stderr)) {
+      await this.git(['branch', '-d', '-r', `${remote}/${branch}`], { allowFail: true });
+      return;
+    }
+    throw new Error(r.stderr.trim().split('\n').slice(-2).join(' ') || `git push ${remote} --delete ${branch} failed`);
+  }
+  /**
+   * Several local branches at once. With `withRemote`, the remote branches they track go too (one push per
+   * remote), but only for the branches that were deleted here. Each failure is reported, the rest go through.
+   */
+  async deleteBranches(names: string[], force: boolean, withRemote: boolean): Promise<BatchResult> {
+    const ups = new Map<string, string>();
+    if (withRemote)
+      for (const n of names) {
+        const u = await this.git(['rev-parse', '--abbrev-ref', `${n}@{upstream}`], { allowFail: true });
+        if (u.code === 0 && u.stdout.trim()) ups.set(n, u.stdout.trim());
+      }
+    const out: BatchResult = { done: [], failed: [] };
+    for (const n of names) {
+      const r = await this.git(['branch', force ? '-D' : '-d', n], { allowFail: true });
+      if (r.code === 0) out.done.push(n);
+      else out.failed.push({ name: n, error: (r.stderr || r.stdout).trim() });
+    }
+    const twins = out.done.map((n) => ups.get(n)).filter((u): u is string => !!u);
+    if (twins.length) {
+      const rr = await this.deleteRemoteBranches(twins);
+      out.done.push(...rr.done);
+      out.failed.push(...rr.failed);
+    }
+    return out;
+  }
+
+  /** the remote a "origin/x" style name belongs to, and the branch on it */
+  private async splitRemoteRef(full: string, remotes?: string[]) {
+    const names = remotes ?? (await this.git(['remote'], { allowFail: true })).stdout.split('\n').filter(Boolean);
+    const remote = names.filter((r) => full.startsWith(r + '/')).sort((a, b) => b.length - a.length)[0];
+    return remote ? { remote, branch: full.slice(remote.length + 1) } : null;
+  }
+
+  /**
+   * Remote branches ("origin/x") at once: one `git push <remote> --delete …` per remote. A branch the remote no
+   * longer has only loses its stale remote-tracking ref.
+   */
+  async deleteRemoteBranches(refs: string[]): Promise<BatchResult> {
+    const remotes = (await this.git(['remote'], { allowFail: true })).stdout.split('\n').filter(Boolean);
+    const byRemote = new Map<string, string[]>();
+    const out: BatchResult = { done: [], failed: [] };
+    for (const full of refs) {
+      const s = await this.splitRemoteRef(full, remotes);
+      if (!s) {
+        out.failed.push({ name: full, error: 'not a remote branch' });
+        continue;
+      }
+      byRemote.set(s.remote, [...(byRemote.get(s.remote) ?? []), s.branch]);
+    }
+    for (const [remote, branches] of byRemote) {
+      let r = await this.net(['push', '--porcelain', remote, '--delete', ...branches], { allowFail: true });
+      // git refuses the whole push when one of them is already gone there: those only lose their stale
+      // remote-tracking ref, the rest are sent again
+      const gone = new Set([...r.stderr.matchAll(/unable to delete '([^']+)': remote ref does not exist/g)].map((m) => m[1]));
+      for (const b of gone) {
+        await this.git(['branch', '-d', '-r', `${remote}/${b}`], { allowFail: true });
+        out.done.push(`${remote}/${b}`);
+      }
+      const rest = branches.filter((b) => !gone.has(b));
+      if (gone.size && rest.length) r = await this.net(['push', '--porcelain', remote, '--delete', ...rest], { allowFail: true });
+      const status = parsePushPorcelain(r.stdout);
+      for (const b of rest) {
+        const st = status.get(`refs/heads/${b}`);
+        if (st?.ok) out.done.push(`${remote}/${b}`);
+        else out.failed.push({ name: `${remote}/${b}`, error: st?.summary || r.stderr.trim() || 'not deleted' });
+      }
+    }
+    return out;
+  }
+
+  /** several local branches to a remote in one push; each gets it as its upstream and is tracked (see push) */
+  async pushBranches(names: string[], remote: string, onProgress?: Progress): Promise<BatchResult> {
+    for (const n of names) if (!(await this.fetchesBranch(remote, n))) await this.git(['remote', 'set-branches', '--add', remote, n]);
+    const r = await this.net(['push', '--porcelain', '--progress', '-u', remote, ...names], { allowFail: true, onLine: (l) => onProgress?.(l, progressOf(l)) });
+    const status = parsePushPorcelain(r.stdout);
+    const out: BatchResult = { done: [], failed: [] };
+    for (const n of names) {
+      const st = status.get(`refs/heads/${n}`);
+      if (st?.ok) out.done.push(n);
+      else out.failed.push({ name: n, error: st?.summary || r.stderr.trim() || 'not pushed' });
+    }
+    if (out.done.length) await this.net(['fetch', remote, ...out.done], { allowFail: true });
+    return out;
+  }
+
+  async renameBranch(oldName: string, newName: string): Promise<{ name: string }> {
+    // only the case changes: on a case-insensitive disk git takes the new name for the old one ("already exists"),
+    // so through a temporary name
+    if (oldName !== newName && oldName.toLowerCase() === newName.toLowerCase()) {
+      const tmp = `${newName}-prong-rename-${Date.now().toString(36)}`;
+      await this.git(['branch', '-m', oldName, tmp]);
+      await this.git(['branch', '-m', tmp, newName]);
+      return { name: newName };
+    }
+    const stored = await this.storedBranchName(newName);
+    await this.git(['branch', '-m', oldName, stored]);
+    return { name: stored };
+  }
+  async setUpstream(branch: string, upstream: string) {
+    await this.git(['branch', `--set-upstream-to=${upstream}`, branch]);
+  }
+  async createTag(name: string, sha: string, message?: string) {
+    if (message) await this.git(['tag', '-a', name, '-m', message, sha]);
+    else await this.git(['tag', name, sha]);
+  }
+  /** the tag's object (an annotated tag's too), for Undo */
+  async deleteTag(name: string): Promise<{ sha: string }> {
+    const sha = (await this.git(['rev-parse', `refs/tags/${name}`])).stdout.trim();
+    await this.git(['tag', '-d', name]);
+    return { sha };
+  }
+
+  // ---------- integration ----------
+
+  async merge(source: string, opts: { noFf?: boolean; squash?: boolean } = {}) {
+    const args = ['merge', '--no-edit'];
+    if (opts.noFf) args.push('--no-ff');
+    if (opts.squash) args.push('--squash');
+    args.push(source);
+    const r = await this.git(args, { allowFail: true });
+    if (r.code !== 0 && !/CONFLICT/.test(r.stdout + r.stderr)) throw new Error(r.stderr || r.stdout);
+    return { conflicts: /CONFLICT/.test(r.stdout + r.stderr) };
+  }
+
+  /** Non-interactive rebase of the current branch onto `onto`; returns whether conflicts stopped it. */
+  async rebase(onto: string, opts: { preserveMerges?: boolean; autostash?: boolean } = {}) {
+    const args = ['rebase'];
+    if (opts.preserveMerges) args.push('--rebase-merges');
+    if (opts.autostash) args.push('--autostash');
+    args.push(onto);
+    const r = await this.git(args, { allowFail: true });
+    if (r.code !== 0 && !/CONFLICT/.test(r.stdout + r.stderr)) throw new Error(r.stderr || r.stdout);
+    return { conflicts: /CONFLICT/.test(r.stdout + r.stderr) };
+  }
+
+  /**
+   * Interactive rebase driven by a todo list built in the UI. `reword` becomes pick + an exec that
+   * amends the message, so no editor is ever opened.
+   */
+  async rebaseInteractive(onto: string, todo: RebaseTodoItem[]) {
+    const lines: string[] = [];
+    for (const t of todo) {
+      if (t.action === 'drop') continue;
+      if (t.action === 'reword') {
+        lines.push(`pick ${t.sha}`);
+        lines.push(`exec git commit --amend --no-edit -m ${shellQuote(t.message ?? '')}`);
+      } else lines.push(`${t.action} ${t.sha}`);
+    }
+    const tmp = mkdtempSync(path.join(tmpdir(), 'prong-rebase-'));
+    const todoPath = path.join(tmp, 'todo');
+    writeFileSync(todoPath, lines.join('\n') + '\n');
+    try {
+      const r = await this.git(['rebase', '-i', onto], { env: { GIT_SEQUENCE_EDITOR: `cp ${shellQuote(todoPath)}`, GIT_EDITOR: 'true' }, allowFail: true });
+      if (r.code !== 0 && !/CONFLICT/.test(r.stdout + r.stderr)) throw new Error(r.stderr || r.stdout);
+      return { conflicts: /CONFLICT/.test(r.stdout + r.stderr) };
+    } finally {
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  }
+  async rebaseContinue() {
+    await this.git(['rebase', '--continue'], { env: { GIT_EDITOR: 'true' } });
+  }
+  async rebaseAbort() {
+    await this.git(['rebase', '--abort']);
+  }
+  async mergeAbort() {
+    await this.git(['merge', '--abort']);
+  }
+
+  async cherryPick(sha: string) {
+    const r = await this.git(['cherry-pick', sha], { allowFail: true });
+    if (r.code !== 0 && !/CONFLICT/.test(r.stdout + r.stderr)) throw new Error(r.stderr || r.stdout);
+    return { conflicts: /CONFLICT/.test(r.stdout + r.stderr) };
+  }
+  async revert(sha: string) {
+    const r = await this.git(['revert', '--no-edit', sha], { allowFail: true });
+    if (r.code !== 0 && !/CONFLICT/.test(r.stdout + r.stderr)) throw new Error(r.stderr || r.stdout);
+    return { conflicts: /CONFLICT/.test(r.stdout + r.stderr) };
+  }
+  /** `keep`: moves the branch back and keeps local changes, refusing when one would be lost (what Undo uses) */
+  async reset(sha: string, mode: 'soft' | 'mixed' | 'hard' | 'keep') {
+    await this.git(['reset', `--${mode}`, sha]);
+  }
+  /** the index as a tree (Undo of staging puts it back with readTree); null while files are in conflict */
+  async writeTree(): Promise<string | null> {
+    const r = await this.git(['write-tree'], { allowFail: true });
+    return r.code === 0 ? r.stdout.trim() : null;
+  }
+  async readTree(tree: string) {
+    await this.git(['read-tree', tree]);
+  }
+  /** a deleted branch or tag back where it was (only when nothing of that name exists meanwhile) */
+  async restoreRef(ref: string, sha: string) {
+    await this.git(['update-ref', ref, sha, '']);
+  }
+  /** a branch or tag removed only while it still points at `sha` (Undo never deletes one that moved on) */
+  async deleteRefAt(ref: string, sha: string) {
+    await this.git(['update-ref', '-d', ref, sha]);
+  }
+  /**
+   * The submodules whose recorded commit differs between two commits of this repository, and whether each is
+   * checked out and still at the commit `from` recorded — only those may be moved for the user: a submodule they
+   * moved themselves, or never initialized, is left alone.
+   */
+  async changedSubmodules(from: string, to: string): Promise<{ path: string; from: string; to: string; initialized: boolean; inSync: boolean }[]> {
+    const listed = await this.git(['config', '-f', '.gitmodules', '--get-regexp', '^submodule\\..*\\.path$'], { allowFail: true });
+    const paths = listed.stdout.split('\n').map((l) => l.slice(l.indexOf(' ') + 1).trim()).filter(Boolean);
+    if (!paths.length || from === to) return [];
+    const d = await this.git(['diff', '--raw', '--no-abbrev', '-z', from, to, '--', ...paths], { allowFail: true });
+    const out: { path: string; from: string; to: string; initialized: boolean; inSync: boolean }[] = [];
+    const parts = d.stdout.split('\0');
+    for (let i = 0; i + 1 < parts.length; i += 2) {
+      const m = /^:(\d{6}) (\d{6}) ([0-9a-f]+) ([0-9a-f]+) (\w)/.exec(parts[i]);
+      if (!m || m[2] !== '160000' || m[1] !== '160000') continue;
+      const p = parts[i + 1];
+      const dir = path.join(this.dir, p);
+      const initialized = existsSync(path.join(dir, '.git'));
+      const head = initialized ? (await runGit(['rev-parse', 'HEAD'], { cwd: dir, allowFail: true })).stdout.trim() : '';
+      out.push({ path: p, from: m[3], to: m[4], initialized, inSync: initialized && head === m[3] });
+    }
+    return out;
+  }
+
+  // ---------- stash ----------
+
+  /** the new stash's commit (null when there was nothing to stash): Undo pops exactly that one */
+  async stashPush(message: string, keepIndex: boolean, includeUntracked: boolean): Promise<{ sha: string | null }> {
+    const top = async () => (await this.git(['rev-parse', '-q', '--verify', 'refs/stash'], { allowFail: true })).stdout.trim();
+    const before = await top();
+    const args = ['stash', 'push'];
+    if (keepIndex) args.push('--keep-index');
+    if (includeUntracked) args.push('-u');
+    if (message) args.push('-m', message);
+    await this.git(args);
+    const after = await top();
+    return { sha: after && after !== before ? after : null };
+  }
+  /** pops the stash with that commit, wherever it is in the list now */
+  async stashPopCommit(sha: string) {
+    const list = (await this.git(['stash', 'list', '--format=%H'])).stdout.split('\n').filter(Boolean);
+    const i = list.indexOf(sha);
+    if (i < 0) throw new Error('That stash is no longer in the list.');
+    await this.git(['stash', 'pop', `stash@{${i}}`]);
+  }
+  /** a dropped stash back into the list (its commit is kept by git for a while) */
+  async stashStore(sha: string, message: string) {
+    await this.git(['stash', 'store', '-m', message || 'Restored by Prong', sha]);
+  }
+  async stashApply(index: number, pop: boolean) {
+    await this.git(['stash', pop ? 'pop' : 'apply', `stash@{${index}}`]);
+  }
+  /** what was dropped (its commit and message), for Undo */
+  async stashDrop(index: number): Promise<{ sha: string; message: string }> {
+    const sha = (await this.git(['rev-parse', `stash@{${index}}`])).stdout.trim();
+    const message = (await this.git(['log', '-1', '--format=%gs', '-g', `stash@{${index}}`], { allowFail: true })).stdout.trim();
+    await this.git(['stash', 'drop', `stash@{${index}}`]);
+    return { sha, message };
+  }
+
+  // ---------- repository lifecycle ----------
+
+  static async clone(url: string, dest: string, recursive: boolean, onProgress?: Progress) {
+    const args = ['clone', '--progress', ...(recursive ? ['--recurse-submodules'] : []), url, dest];
+    await runGit(args, { cwd: path.dirname(dest), onLine: (l) => onProgress?.(l, progressOf(l)) });
+    return new Repo(dest);
+  }
+  static async init(dir: string, initialBranch = 'main') {
+    await runGit(['init', '-b', initialBranch, dir], { cwd: path.dirname(dir) });
+    return new Repo(dir);
+  }
+
+  async config(key: string): Promise<string | null> {
+    const r = await this.git(['config', '--get', key], { allowFail: true });
+    return r.code === 0 ? r.stdout.trim() : null;
+  }
+  async setConfig(key: string, value: string) {
+    await this.git(['config', key, value]);
+  }
+}
+
+function shellQuote(s: string) {
+  return `'${s.replace(/'/g, `'\\''`)}'`;
+}
+
+export { kindOf };

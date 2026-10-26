@@ -1,0 +1,47 @@
+const { chromium } = require('playwright');
+const fs = require('fs');
+const exe = process.env.CHROME;
+(async () => {
+  const browser = await chromium.launch({ executablePath: exe, headless: true });
+  const page = await browser.newPage({ viewport: { width: 1440, height: 900 }, deviceScaleFactor: 1 });
+  const errors = [];
+  page.on('console', (m) => { if (m.type() === 'error' || m.type() === 'warning') errors.push(m.type() + ': ' + m.text().slice(0, 300)); });
+  page.on('pageerror', (e) => errors.push('pageerror: ' + e.message));
+  await page.goto('http://localhost:8099/', { waitUntil: 'load', timeout: 120000 });
+  await page.waitForSelector('text=Repositories', { timeout: 120000 });
+  await page.waitForTimeout(800);
+  await page.screenshot({ path: '01-welcome.png' });
+  await page.click('text=~/work/zenkovich.space/prong');
+  await page.waitForTimeout(900);
+  await page.screenshot({ path: '02-commits.png' });
+  await page.click('text=/^Changes$/');
+  await page.waitForTimeout(900);
+  await page.screenshot({ path: '03-changes.png' });
+  await page.click('text=logo.png');
+  await page.waitForTimeout(500);
+  await page.screenshot({ path: '04-image.png' });
+  await page.click('text=MergeBar.tsx');
+  await page.waitForTimeout(500);
+  await page.screenshot({ path: '05-conflict.png' });
+  await page.click('text=/^Rebase$/');
+  await page.waitForTimeout(600);
+  await page.click('text=Interactive (edit, squash, reorder)');
+  await page.waitForTimeout(600);
+  await page.screenshot({ path: '06-rebase.png' });
+  await page.keyboard.press('Escape');
+  await page.waitForTimeout(300);
+  await page.click('text=All Commits');
+  await page.waitForTimeout(500);
+  // right click on a commit row
+  await page.click('text=Rebase dialog: onto picker with branch search', { button: 'right' });
+  await page.waitForTimeout(400);
+  await page.screenshot({ path: '07-context.png' });
+  await page.keyboard.press('Escape');
+  // theme toggle: find sun icon button via title overlay
+  await page.click('[aria-label="Toggle theme"]');
+  await page.waitForTimeout(500);
+  await page.screenshot({ path: '08-light.png' });
+  fs.writeFileSync('errors.txt', errors.join('\n'));
+  console.log('errors:', errors.length);
+  await browser.close();
+})().catch((e) => { console.error(e); process.exit(1); });

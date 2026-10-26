@@ -1,0 +1,27 @@
+const { chromium } = require('playwright');
+(async () => {
+  const browser = await chromium.launch({ executablePath: process.env.CHROME, headless: true });
+  const page = await browser.newPage({ viewport: { width: 1440, height: 900 } });
+  const errors = []; page.on('pageerror', (e) => errors.push(e.message)); page.on('console', (m) => m.type() === 'error' && errors.push(m.text().slice(0, 200)));
+  await page.goto('http://localhost:8099/', { waitUntil: 'load', timeout: 120000 });
+  await page.waitForSelector('text=Repositories', { timeout: 120000 });
+  await page.click('[aria-label="Colour scheme"]'); await page.waitForTimeout(400);
+  await page.screenshot({ path: 'sc1-scheme-menu-home.png' });
+  await page.keyboard.press('Escape');
+  await page.click('[aria-label="Preferences (⌘,)"]'); await page.waitForTimeout(400);
+  await page.click('text=150%'); await page.waitForTimeout(500);
+  await page.keyboard.press('Escape'); await page.waitForTimeout(300);
+  await page.click('text=~/work/zenkovich.space/prong'); await page.waitForTimeout(700);
+  await page.screenshot({ path: 'sc2-150.png' });
+  await page.setViewportSize({ width: 1000, height: 640 }); await page.waitForTimeout(600);
+  await page.screenshot({ path: 'sc3-150-small.png' });
+  await page.click('text=/^More$/'); await page.waitForTimeout(400);
+  await page.screenshot({ path: 'sc4-more-menu.png' });
+  await page.keyboard.press('Escape');
+  await page.click('text=/^Changes$/'); await page.waitForTimeout(500);
+  await page.screenshot({ path: 'sc5-changes-150.png' });
+  await page.click('text=/^Rebase$/'); await page.waitForTimeout(400);
+  await page.screenshot({ path: 'sc6-dialog-150.png' });
+  console.log('errors:', errors.length, errors.join(' | '));
+  await browser.close();
+})().catch((e) => { console.error(e.message); process.exit(1); });

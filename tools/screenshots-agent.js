@@ -1,0 +1,25 @@
+const { chromium } = require('playwright');
+(async () => {
+  const browser = await chromium.launch({ executablePath: process.env.CHROME, headless: true });
+  const page = await browser.newPage({ viewport: { width: 1440, height: 900 } });
+  const errors = []; page.on('pageerror', (e) => errors.push(e.message)); page.on('console', (m) => m.type() === 'error' && errors.push(m.text().slice(0, 200)));
+  await page.goto('http://localhost:8099/', { waitUntil: 'load', timeout: 120000 });
+  await page.waitForSelector('text=Repositories', { timeout: 120000 });
+  await page.click('text=~/work/zenkovich.space/prong'); await page.waitForTimeout(600);
+  await page.click('[aria-label="Agent (⌘J)"]'); await page.waitForTimeout(500);
+  await page.screenshot({ path: 'a1-panel.png' });
+  const type = async (s) => { await page.fill('input[placeholder*="команда"]', s); await page.keyboard.press('Enter'); await page.waitForTimeout(1900); };
+  await type('скрой колонку автора');
+  await type('компактный тулбар');
+  await type('добавь кнопку Terminal');
+  await type('создай ветку feature/agent-panel');
+  await page.screenshot({ path: 'a2-after.png' });
+  await page.click('text=/^Changes 3$/'); await page.waitForTimeout(400);
+  await page.screenshot({ path: 'a3-changes.png' });
+  await page.click('text=Compact toolbar: icons only'); await page.waitForTimeout(400);
+  await page.screenshot({ path: 'a4-details.png' });
+  await page.click('text=/^Settings$/'); await page.waitForTimeout(400);
+  await page.screenshot({ path: 'a5-settings.png' });
+  console.log('errors:', errors.length, errors.join(' | '));
+  await browser.close();
+})().catch((e) => { console.error(e.message); process.exit(1); });
