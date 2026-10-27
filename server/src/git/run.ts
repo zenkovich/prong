@@ -1,4 +1,19 @@
 import { spawn } from 'node:child_process';
+import { AsyncLocalStorage } from 'node:async_hooks';
+
+/**
+ * The stop signal of the long operation (fetch, pull, push, clone, submodule update…) whose work is running: every
+ * git it starts is killed when the user stops it. Set by the API around the operation's work (`withStop`), so the
+ * repository methods need no parameter for it.
+ */
+const stopSignal = new AsyncLocalStorage<AbortSignal>();
+export const withStop = <T>(signal: AbortSignal, fn: () => Promise<T>): Promise<T> => stopSignal.run(signal, fn);
+/** what a stopped git rejects with */
+export class StoppedError extends Error {
+  constructor() {
+    super('Stopped');
+  }
+}
 
 export interface RunOptions {
   cwd: string;
@@ -16,6 +31,8 @@ export interface RunOptions {
    * (a merge can produce a patch of a gigabyte, more than a JS string can hold).
    */
   maxBytes?: number;
+  /** git is killed when this aborts (default: the running long operation's stop signal, see withStop) */
+  signal?: AbortSignal;
 }
 
 export interface RunResult {
@@ -27,6 +44,15 @@ export interface RunResult {
   truncated?: boolean;
 }
 
+/** git's progress lines ("Receiving objects:  38% (700/1842)"), redrawn hundreds of times: they bury the error */
+const PROGRESS_LINE = /\b\d{1,3}% \(\d+\/\d+\)/;
+export function withoutProgress(text: string): string {
+  return text
+    .split(/\r\n|\r|\n/)
+    .filter((l) => l.trim() && !PROGRESS_LINE.test(l))
+    .join('\n');
+}
+
 export class GitError extends Error {
   constructor(
     public readonly args: string[],
@@ -34,11 +60,37 @@ export class GitError extends Error {
     public readonly stderr: string,
     public readonly stdout: string,
   ) {
-    super(`git ${args.join(' ')} failed (${code}): ${stderr.trim() || stdout.trim()}`);
+    // what git said on both streams: a failed pull or merge reports its conflicts on stdout, while stderr is mostly
+    // progress (which used to be the whole message — the conflict itself was left out)
+    const err = withoutProgress(stderr).trim();
+    const out = stdout.trim();
+    super(`git ${args.join(' ')} failed (${code}): ${[err, out.length > 4000 ? `${out.slice(0, 4000)}…` : out].filter(Boolean).join('\n')}`);
   }
 }
 
 export const GIT_BIN = process.env.PRONG_GIT ?? 'git';
+
+/**
+ * Paths in runs that each fit one command line: a folder picked in Changes can hold thousands of files, and
+ * macOS refuses a command over about 1 MB (the environment included).
+ */
+export function inRuns(paths: string[], budget = 96 * 1024): string[][] {
+  const out: string[][] = [];
+  let run: string[] = [];
+  let bytes = 0;
+  for (const p of paths) {
+    const n = Buffer.byteLength(p) + 1;
+    if (run.length && bytes + n > budget) {
+      out.push(run);
+      run = [];
+      bytes = 0;
+    }
+    run.push(p);
+    bytes += n;
+  }
+  if (run.length) out.push(run);
+  return out;
+}
 
 /** Non-interactive git environment: no editors, no prompts, English output, progress on stderr. */
 function baseEnv(extra?: Record<string, string>): NodeJS.ProcessEnv {
@@ -54,9 +106,29 @@ function baseEnv(extra?: Record<string, string>): NodeJS.ProcessEnv {
   };
 }
 
+/**
+ * Paths as they are: by default git writes a name with non-ASCII letters ("файл.txt", "фото.png") in quotes with octal
+ * escapes in diffs and --raw lists, which the parsers do not read (a Cyrillic file came out as `"a/\321\204…"`,
+ * an image as a binary). Errors still name the command as it was asked.
+ */
+const PLAIN_PATHS = ['-c', 'core.quotepath=false'];
+
 export function runGit(args: string[], opts: RunOptions): Promise<RunResult> {
+  const signal = opts.signal ?? stopSignal.getStore();
+  if (signal?.aborted) return Promise.reject(new StoppedError());
   return new Promise((resolve, reject) => {
-    const child = spawn(GIT_BIN, args, { cwd: opts.cwd, env: baseEnv(opts.env), stdio: ['pipe', 'pipe', 'pipe'] });
+    const child = spawn(GIT_BIN, [...PLAIN_PATHS, ...args], { cwd: opts.cwd, env: baseEnv(opts.env), stdio: ['pipe', 'pipe', 'pipe'] });
+    // stopped by the user: git goes at once, and so does the wait for it (a helper it started, such as ssh or
+    // upload-pack, may hold the pipes a while longer)
+    let stopped = false;
+    const onStop = () => {
+      stopped = true;
+      child.kill('SIGTERM');
+    };
+    signal?.addEventListener('abort', onStop, { once: true });
+    child.on('exit', () => {
+      if (stopped) reject(new StoppedError());
+    });
     const out: Buffer[] = [];
     const err: Buffer[] = [];
     let pending = '';
@@ -86,10 +158,13 @@ export function runGit(args: string[], opts: RunOptions): Promise<RunResult> {
     });
     child.on('error', (e) => {
       if (timer) clearTimeout(timer);
+      signal?.removeEventListener('abort', onStop);
       reject(e);
     });
     child.on('close', (code) => {
       if (timer) clearTimeout(timer);
+      signal?.removeEventListener('abort', onStop);
+      if (stopped) return reject(new StoppedError());
       if (opts.onLine && pending.trim()) opts.onLine(pending);
       const raw = Buffer.concat(out);
       const result: RunResult = { code: code ?? -1, stdout: opts.binary ? '' : raw.toString('utf8'), stderr: Buffer.concat(err).toString('utf8') };
@@ -113,7 +188,7 @@ export function runGit(args: string[], opts: RunOptions): Promise<RunResult> {
  */
 export function runGitLines(args: string[], opts: Pick<RunOptions, 'cwd' | 'env'>, onLine: (line: string) => boolean | void, sep = '\n'): Promise<number> {
   return new Promise((resolve, reject) => {
-    const child = spawn(GIT_BIN, args, { cwd: opts.cwd, env: baseEnv(opts.env), stdio: ['ignore', 'pipe', 'pipe'] });
+    const child = spawn(GIT_BIN, [...PLAIN_PATHS, ...args], { cwd: opts.cwd, env: baseEnv(opts.env), stdio: ['ignore', 'pipe', 'pipe'] });
     let pending = '';
     let count = 0;
     let stopped = false;

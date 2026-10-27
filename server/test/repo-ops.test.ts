@@ -25,6 +25,20 @@ describe('Repo operations', () => {
     expect((await fx.repo.remotes()).map((r) => r.name)).toEqual(['origin']);
   });
 
+  it('renames a remote: its remote branches and the upstreams that point there follow', async () => {
+    await fx.repo.createBranch('renamed-up', 'HEAD', true);
+    await fx.repo.push({ remote: 'origin', branch: 'renamed-up', setUpstream: true });
+    await fx.repo.renameRemote('origin', 'upstream');
+    expect((await fx.repo.remotes()).map((r) => r.name)).toEqual(['upstream']);
+    const refs = await fx.repo.refs();
+    expect(refs.some((r) => r.kind === 'remote' && r.name === 'upstream/renamed-up')).toBe(true);
+    expect(refs.some((r) => r.kind === 'remote' && r.name.startsWith('origin/'))).toBe(false);
+    expect(refs.find((r) => r.kind === 'branch' && r.name === 'renamed-up')?.upstream).toBe('upstream/renamed-up');
+    await fx.repo.renameRemote('upstream', 'origin');
+    await fx.repo.checkout('main');
+    await fx.repo.deleteBranch('renamed-up', true, 'origin');
+  });
+
   it('sets an upstream and reports it on the branch', async () => {
     await fx.repo.createBranch('tracked', 'HEAD', true);
     await fx.repo.push({ remote: 'origin', branch: 'tracked' });

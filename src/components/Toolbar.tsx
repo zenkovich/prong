@@ -1,5 +1,5 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
-import { Pressable, ScrollView, StyleSheet, View } from 'react-native';
+import { Platform, Pressable, ScrollView, StyleSheet, View } from 'react-native';
 import { AgentBar } from './AgentBar';
 import { fitWidths, groupTabs, naturalTabWidth, TabOut } from './tabLayout';
 import { activateTab, closeTab, fetch, followAllBranches, goWelcome, openDialog, openRepoPicker, pull, push, setState, showContextMenu, switchWorkspace, toast, toggleTabGroup, unshallow, useMods, useRepo, useStore } from '../state/store';
@@ -7,7 +7,7 @@ import { FONT, TABS_H, TOOLBAR_H, useTheme } from '../theme';
 import { desktop, openInTerminal, revealInFinder } from '../desktop';
 import * as live from '../state/live';
 import { Icon } from '../ui/Icon';
-import { Divider, Glass, IconButton, PressScale, Row, ToolButton, Txt, useKeyboard, useViewport } from '../ui/primitives';
+import { Divider, Glass, HoverReveal, IconButton, PressScale, revealIn, Row, ToolButton, Txt, useKeyboard, useViewport } from '../ui/primitives';
 import { StatusPanel } from './StatusPanel';
 
 export function RepoTabs() {
@@ -46,6 +46,11 @@ const PLUS_W = 30;
 /** frame borders, inner padding and the fold toggle of a tab group */
 const GROUP_CHROME = 30;
 const MAX_TAB = 240;
+/** the gap after each tab (styles.tab marginRight): part of what the bar has to hold */
+const TAB_GAP = 2;
+
+/** the scrollable DOM node of a ScrollView (web) */
+const scrollNode = (sv: any): HTMLElement | null => (Platform.OS === 'web' ? (sv?.getScrollableNode?.() ?? null) : null);
 
 /**
  * Open repositories as tabs. Submodules (any open repository inside another open one) are grouped right after
@@ -70,14 +75,27 @@ function TabStrip() {
   const natural = visible.map((g) => Math.min(MAX_TAB, naturalTabWidth(g.label, { charW: g.parent ? CHAR_W_NESTED : CHAR_W, nested: !!g.parent, active: g.id === active, badge: isGroup(g) && folded[g.id] ? g.children.filter((c) => c !== active).length : 0 })));
   // minimums keep ~7 characters readable; the active tab keeps its whole name up to 160 px
   const mins = visible.map((g, i) => (g.id === active ? Math.min(natural[i], 160) : g.parent ? 84 : 96));
-  const chrome = visible.filter(isGroup).length * GROUP_CHROME;
-  const { widths, overflow } = fitWidths(natural, Math.max(0, avail - PLUS_W - chrome), mins);
-  // keep the active tab in view when the bar scrolls
-  const activeIdx = visible.findIndex((g) => g.id === active);
-  const activeLeft = activeIdx < 0 ? -1 : widths.slice(0, activeIdx).reduce((a, b) => a + b + 2, 0);
+  // the gaps after the tabs count too: without them the tabs overflowed the bar while it thought they fitted (and
+  // did not scroll), cutting the active tab off
+  const chrome = visible.filter(isGroup).length * GROUP_CHROME + visible.length * TAB_GAP;
+  const { widths } = fitWidths(natural, Math.max(0, avail - PLUS_W - chrome), mins);
+  // keep the active tab in view when the bar scrolls (measured: groups and gaps included)
+  const shownWidths = widths.join(',');
   useEffect(() => {
-    if (overflow && activeLeft >= 0) scroll.current?.scrollTo({ x: Math.max(0, activeLeft - 40), animated: true });
-  }, [overflow, activeLeft]);
+    revealIn(scrollNode(scroll.current), 'activetab', 'x', 40);
+  }, [active, shownWidths, avail, screen]);
+  // a mouse wheel scrolls the bar sideways (a plain wheel could not reach the tabs scrolled away)
+  useEffect(() => {
+    const node = scrollNode(scroll.current);
+    if (!node) return;
+    const onWheel = (e: WheelEvent) => {
+      if (Math.abs(e.deltaY) <= Math.abs(e.deltaX) || node.scrollWidth <= node.clientWidth) return;
+      node.scrollLeft += e.deltaY;
+      e.preventDefault();
+    };
+    node.addEventListener('wheel', onWheel, { passive: false });
+    return () => node.removeEventListener('wheel', onWheel);
+  }, []);
   const closeGroup = (id: string) => {
     for (const c of grouped.find((g) => g.id === id)?.children ?? []) closeTab(c);
     closeTab(id);
@@ -103,8 +121,8 @@ function TabStrip() {
     return <TabItem key={g.id} g={g} width={widths[i]} active={g.id === active && screen === 'repo'} changes={st ? st.unstaged.length + st.staged.length : 0} onMenu={(x, y) => menu(g, x, y)} />;
   };
   return (
-    <View style={{ flex: 1, minWidth: 0, alignSelf: 'stretch', justifyContent: 'flex-end' }} onLayout={(e) => setAvail(e.nativeEvent.layout.width)}>
-      <ScrollView ref={scroll} horizontal scrollEnabled={overflow} showsHorizontalScrollIndicator={false} contentContainerStyle={{ alignItems: 'flex-end' }}>
+    <View style={{ flex: 1, minWidth: 0, alignSelf: 'stretch', flexDirection: 'row', alignItems: 'flex-end' }} onLayout={(e) => setAvail(e.nativeEvent.layout.width)}>
+      <ScrollView ref={scroll} horizontal showsHorizontalScrollIndicator={false} style={{ flexGrow: 0, flexShrink: 1 }} contentContainerStyle={{ alignItems: 'flex-end' }}>
         {segments.map(({ root, kids }) => {
           if (!isGroup(root)) return tab(root);
           const isFolded = !!folded[root.id];
@@ -130,10 +148,11 @@ function TabStrip() {
             </View>
           );
         })}
-        <PressScale onPressAt={(a) => openRepoPicker(a.x, a.y + a.h + 4)} scaleTo={0.9} style={styles.homeBtn} hoverStyle={{ backgroundColor: t.hover }} label="Open a repository (⌘T)" testID="new-tab">
-          <Icon name="plus" size={14} />
-        </PressScale>
       </ScrollView>
+      {/* after the tabs, outside the scrolling part: with more tabs than fit it stays at hand (it used to scroll away) */}
+      <PressScale onPressAt={(a) => openRepoPicker(a.x, a.y + a.h + 4)} scaleTo={0.9} style={styles.homeBtn} hoverStyle={{ backgroundColor: t.hover }} label="Open a repository (⌘T)" testID="new-tab">
+        <Icon name="plus" size={14} />
+      </PressScale>
     </View>
   );
 }
@@ -164,23 +183,28 @@ function TabItem({ g, width, active, changes, onMenu }: { g: TabOut; width: numb
             </Txt>
           )}
           <View style={{ flex: 1, minWidth: 0, marginLeft: 5 }}>
-            <Txt size={nested ? FONT.xs : FONT.sm} weight={active ? '600' : '400'} muted={!active} numberOfLines={1}>
+            <Txt size={nested ? FONT.xs : FONT.sm} weight={active ? '600' : '400'} muted={!active} numberOfLines={1} testID={active ? 'active-tab-label' : undefined}>
               {g.label}
             </Txt>
           </View>
           {changes > 0 && <View style={{ width: 6, height: 6, backgroundColor: t.warn, marginLeft: 6 }} />}
-          {/* the active tab keeps room for its close button; others show it over the label end on hover */}
-          {(active || hovered) && (
-            <PressScale
-              onPress={() => closeTab(g.id)}
-              scaleTo={0.8}
-              style={active ? { marginLeft: 6, padding: 2 } : { position: 'absolute', right: 4, top: 0, bottom: 0, justifyContent: 'center', paddingHorizontal: 3, backgroundColor: t.hover }}
-              hoverStyle={{ backgroundColor: t.hover }}
-              label="Close"
-            >
+          {/* the active tab keeps room for its close button; the others show it over the label end on hover. It
+              stays mounted (HoverReveal): one that existed only while the tab was hovered vanished as the pointer
+              reached it, and it was drawn in a box of no size, so it never showed at all */}
+          {active ? (
+            <PressScale onPress={() => closeTab(g.id)} scaleTo={0.8} style={{ marginLeft: 6, padding: 2 }} hoverStyle={{ backgroundColor: t.hover }} label="Close" testID={`close-tab-${g.label}`}>
               <Icon name="x" size={11} />
             </PressScale>
+          ) : (
+            <View style={{ position: 'absolute', right: 3, top: 0, bottom: 0, justifyContent: 'center' }} pointerEvents="box-none">
+              <HoverReveal rowHovered={hovered}>
+                <PressScale onPress={() => closeTab(g.id)} scaleTo={0.8} style={{ paddingHorizontal: 3, paddingVertical: 2, backgroundColor: t.raised }} hoverStyle={{ backgroundColor: t.borderStrong }} label="Close" testID={`close-tab-${g.label}`}>
+                  <Icon name="x" size={11} />
+                </PressScale>
+              </HoverReveal>
+            </View>
           )}
+          {active ? <View {...({ dataSet: { activetab: '1' } } as any)} style={StyleSheet.absoluteFill} pointerEvents="none" /> : null}
         </>
       )}
     </PressScale>
@@ -267,7 +291,13 @@ export function Toolbar() {
   // a narrow window keeps the buttons as icons, so the status panel keeps its room
   const compact = mods.compactToolbar || vp.width < 1000;
   const current = repo.refs.find((r) => r.kind === 'branch' && r.current);
-  const changes = repo.unstaged.length + repo.staged.length;
+  // changed files: one staged and edited again is one (it used to count twice)
+  const changes = useMemo(() => new Set([...repo.unstaged.map((f) => f.path), ...repo.staged.map((f) => f.path)]).size, [repo.unstaged, repo.staged]);
+  const noRemote = repo.remotes.length === 0;
+  // a quick pull needs an upstream the remote still has (a gone one only fails with "no such ref was fetched")
+  const canPull = !!current?.upstream && !current.gone;
+  // known once the submodules are read: none means nothing to update
+  const noSubmodules = repo.submodules !== undefined && repo.submodules.length === 0;
   // the first remote that follows only some branches: what "Fetch every branch" would widen
   const narrowRemote = repo.remotes.find((r) => r.narrow)?.name;
   return (
@@ -282,9 +312,10 @@ export function Toolbar() {
           compact={compact}
           onPress={() => openDialog({ type: 'fetch' })}
           disabled={!!op}
+          testID="toolbar-fetch"
           menu={(a) =>
             showContextMenu(a.x, a.y + a.h + 2, [
-              { label: 'Fetch all remotes now', onPress: () => fetch({}) },
+              { label: noRemote ? 'Fetch now — no remotes' : 'Fetch all remotes now', disabled: noRemote, onPress: () => fetch({}) },
               ...repo.remotes.map((r) => ({ label: `Fetch ${r.name} now`, onPress: () => fetch({ remote: r.name }) })),
               { separator: true },
               { label: 'Fetch…', shortcut: '⌘⇧F', onPress: () => openDialog({ type: 'fetch' }) },
@@ -301,12 +332,14 @@ export function Toolbar() {
           badgeColor={t.warn}
           onPress={() => openDialog({ type: 'pull' })}
           disabled={!!op}
+          testID="toolbar-pull"
           menu={(a) =>
             showContextMenu(a.x, a.y + a.h + 2, [
-              { label: `Pull ${current?.upstream ?? ''} now (${pullMode === 'ff' ? 'fast-forward' : pullMode})`, disabled: !current?.upstream, onPress: () => pull({}) },
-              { label: 'Pull with merge', disabled: !current?.upstream, onPress: () => pull({ strategy: 'merge' }) },
-              { label: 'Pull with rebase', disabled: !current?.upstream, onPress: () => pull({ strategy: 'rebase' }) },
-              { label: 'Fast-forward only', disabled: !current?.upstream, onPress: () => pull({ strategy: 'ff' }) },
+              // without an upstream it says why (it used to read "Pull  now")
+              { label: current?.upstream ? (current.gone ? `Pull now — ${current.upstream} is gone` : `Pull ${current.upstream} now (${pullMode === 'ff' ? 'fast-forward' : pullMode})`) : current ? `Pull now — ${current.name} tracks nothing` : 'Pull now — HEAD is detached', disabled: !canPull, onPress: () => pull({}) },
+              { label: 'Pull with merge', disabled: !canPull, onPress: () => pull({ strategy: 'merge' }) },
+              { label: 'Pull with rebase', disabled: !canPull, onPress: () => pull({ strategy: 'rebase' }) },
+              { label: 'Fast-forward only', disabled: !canPull, onPress: () => pull({ strategy: 'ff' }) },
               { separator: true },
               { label: 'Pull…', shortcut: '⌘⇧L', onPress: () => openDialog({ type: 'pull' }) },
             ])
@@ -321,10 +354,11 @@ export function Toolbar() {
           badge={current?.ahead || undefined}
           onPress={() => openDialog({ type: 'push' })}
           disabled={!!op}
+          testID="toolbar-push"
           menu={(a) =>
             showContextMenu(a.x, a.y + a.h + 2, [
-              { label: current ? `Push ${current.name} → ${current.upstream ?? `${repo.remotes[0]?.name ?? 'origin'}/${current.name}`} now` : 'Push now', disabled: !current, onPress: () => push({}) },
-              { label: 'Push with all tags', disabled: !current, onPress: () => push({ tags: true }) },
+              { label: noRemote ? 'Push now — no remotes' : current ? `Push ${current.name} → ${current.upstream ?? `${repo.remotes[0].name}/${current.name}`} now` : 'Push now — HEAD is detached', disabled: !current || noRemote, onPress: () => push({}) },
+              { label: 'Push with all tags', disabled: !current || noRemote, onPress: () => push({ tags: true }) },
               { separator: true },
               { label: 'Push…', shortcut: '⌘⇧P', onPress: () => openDialog({ type: 'push' }) },
             ])
@@ -334,10 +368,10 @@ export function Toolbar() {
       <View style={{ width: 6 }} />
       <Divider vertical />
       <View style={{ width: 6 }} />
-      {show('stash') && <ToolButton icon="stash" label="Stash" compact={compact} badge={changes || undefined} badgeColor={t.textFaint} onPress={() => openDialog({ type: 'stash' })} />}
-      {show('branch') && <ToolButton icon="branch" label="Branch" compact={compact} onPress={() => openDialog({ type: 'branch' })} />}
-      {show('merge') && <ToolButton icon="merge" label="Merge" compact={compact} onPress={() => openDialog({ type: 'merge' })} />}
-      {show('rebase') && <ToolButton icon="rebase" label="Rebase" compact={compact} onPress={() => openDialog({ type: 'rebase' })} />}
+      {show('stash') && <ToolButton icon="stash" label="Stash" compact={compact} badge={changes || undefined} badgeColor={t.textFaint} onPress={() => openDialog({ type: 'stash' })} testID="toolbar-stash" />}
+      {show('branch') && <ToolButton icon="branch" label="Branch" compact={compact} onPress={() => openDialog({ type: 'branch' })} testID="toolbar-branch" />}
+      {show('merge') && <ToolButton icon="merge" label="Merge" compact={compact} onPress={() => openDialog({ type: 'merge' })} testID="toolbar-merge" />}
+      {show('rebase') && <ToolButton icon="rebase" label="Rebase" compact={compact} onPress={() => openDialog({ type: 'rebase' })} testID="toolbar-rebase" />}
       {mods.extraToolbarButtons.map((k) => (
         <ToolButton
           key={k}
@@ -354,6 +388,7 @@ export function Toolbar() {
         icon="more"
         label="More"
         compact={compact}
+        testID="toolbar-more"
         onPressAt={(a) => {
           showContextMenu(a.x, a.y + a.h + 2, [
             { label: 'Open in Terminal', shortcut: '⌃⌥T', onPress: () => (repoPath && isLive ? live.openTerminalAt(repoPath) : desktop() && repoPath ? void openInTerminal(repoPath) : toast('Opened terminal at repository root (mock)', 'info')) },
@@ -361,17 +396,19 @@ export function Toolbar() {
             { label: 'Open in editor', onPress: () => (repoPath && isLive ? live.openInEditor(repoPath) : toast('Opened in editor (mock)', 'info')) },
             { separator: true },
             // a narrow clone (--single-branch) asks for one branch only: the rest of the remote appears once its fetch list is widened
-            { label: narrowRemote ? `Fetch every branch of ${narrowRemote}` : 'Fetch every branch — every remote already follows them all', disabled: !narrowRemote, onPress: () => followAllBranches(narrowRemote) },
-            { label: repo.shallow ? 'Fetch the full history (unshallow)…' : 'Fetch the full history — the history is already complete', disabled: !repo.shallow, onPress: () => openDialog({ type: 'fetch' }) },
+            // off, they say why in a few words (the long reasons were cut off at the menu's edge)
+            { label: narrowRemote ? `Fetch every branch of ${narrowRemote}` : 'Fetch every branch — all followed', disabled: !narrowRemote, onPress: () => followAllBranches(narrowRemote) },
+            { label: repo.shallow ? 'Fetch the full history (unshallow)…' : 'Fetch the full history — complete', disabled: !repo.shallow, onPress: () => openDialog({ type: 'fetch' }) },
             // the whole repository at once: every branch of every remote, no dialog
-            { label: repo.shallow ? 'Unshallow the whole repository' : 'Unshallow the whole repository — not a shallow clone', disabled: !repo.shallow, onPress: () => unshallow({ allBranches: true }) },
-            { label: 'Submodules → Update all', onPress: () => (isLive ? live.updateSubmodules(undefined, false) : toast('Submodules updated (mock)', 'success')) },
-            { label: 'Submodules → Update recursively', onPress: () => (isLive ? live.updateSubmodules(undefined, true) : toast('Submodules updated (mock)', 'success')) },
-            { label: 'Refresh', shortcut: '⌘R', onPress: () => (isLive ? void live.refresh() : toast('Refreshed (mock)', 'info')) },
+            { label: repo.shallow ? 'Unshallow the whole repository' : 'Unshallow — not a shallow clone', disabled: !repo.shallow, onPress: () => unshallow({ allBranches: true }) },
+            { label: noSubmodules ? 'Submodules → Update — none here' : 'Submodules → Update all', disabled: noSubmodules, onPress: () => (isLive ? live.updateSubmodules(undefined, false) : toast('Submodules updated (mock)', 'success')) },
+            { label: 'Submodules → Update recursively', disabled: noSubmodules, onPress: () => (isLive ? live.updateSubmodules(undefined, true) : toast('Submodules updated (mock)', 'success')) },
+            { label: 'Refresh', shortcut: '⌘R', onPress: () => (isLive ? void live.refreshNow() : toast('Refreshed (mock)', 'info')) },
             { label: undoTop ? `Undo ${undoTop.label}` : 'Undo — nothing to undo', shortcut: '⌘Z', disabled: !undoTop, onPress: () => live.undoLast() },
             { separator: true },
             { label: 'Connection (SSH key / account)…', disabled: !isLive, onPress: () => openDialog({ type: 'connection' }) },
-            { label: 'Repository settings…', onPress: () => openDialog({ type: 'accounts', tab: 'general' }) },
+            // what it opens: the app's preferences (it was called "Repository settings…")
+            { label: 'Preferences…', shortcut: '⌘,', onPress: () => openDialog({ type: 'accounts', tab: 'general' }) },
             { label: 'Keyboard shortcuts', shortcut: '⌘/', onPress: () => openDialog({ type: 'shortcuts' }) },
           ]);
         }}

@@ -217,7 +217,7 @@ async function metrics() {
 async function pageStats() {
   const s = await evalT(() => {
     const t = document.body.innerText;
-    const m = t.match(/(\d+) of (\d+) commits/);
+    const m = t.match(/(\d+) of (\d+)\+? commits/);
     return { dom: document.getElementsByTagName('*').length, svg: document.querySelectorAll('svg *').length, listed: m ? Number(m[2]) : null, heap: performance.memory ? Math.round(performance.memory.usedJSHeapSize / 1048576) : null };
   });
   return s === TIMEOUT || s?.__error ? {} : s;

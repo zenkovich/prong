@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { agentSend, agentStop, client, handleAgentEvent, handleEventForTest, persistUi, scanWorkspace } from './live';
-import { clearAgentChat, dismissAgentNotice, getState, inWorkspace, setState } from './store';
+import { agentSend as sendFromUi, clearAgentChat, dismissAgentNotice, finishAgentRun, getState, inWorkspace, setState } from './store';
 
 const known = (path: string, workspace: string, workspaces: string[] = [workspace], lastOpened = 0) => ({ path, name: path.split('/').pop()!, workspace, workspaces, lastOpened });
 const liveInfo = (path: string, workspace = 'work') => ({ id: `live:${path}`, name: path.split('/').pop()!, workspace, path, currentBranch: '', changes: 0, lastOpened: 0, live: true });
@@ -278,5 +278,55 @@ describe('live: agent routing', () => {
     // nothing was done: the user is told, not shown a success
     expect(getState().agent.notices[0]).toMatchObject({ ok: false, title: 'Failed' });
     expect(getState().agent.messages.at(-1)?.text).toMatch(/цели «app»/);
+  });
+});
+
+describe('store: agent requests without Claude Code, cards, clearing', () => {
+  beforeEach(() => {
+    setState({ engine: { online: true, git: 'git', version: '1' }, repos: [liveInfo('/w/a')], tabs: ['live:/w/a'], activeTab: 'live:/w/a', operation: null });
+    setState((s) => ({ agentAvailable: { ok: false, path: null, version: '' }, agent: { ...s.agent, busy: false, open: false, tab: 'chat', status: null, startedAt: null, notices: [], messages: [], session: null, target: 'auto', settings: { ...s.agent.settings, provider: 'anthropic-claude-code' } } }));
+  });
+  afterEach(() => vi.restoreAllMocks());
+
+  it('with the engine up but no Claude Code, a request says so and nothing runs (the demo agent ran its git in the repository)', () => {
+    const run = vi.spyOn(client, 'agentRun');
+    sendFromUi('создай ветку from-a-demo');
+    const a = getState().agent;
+    expect(run).not.toHaveBeenCalled();
+    expect(a.busy).toBe(false);
+    expect(a.messages.at(-1)).toMatchObject({ role: 'agent' });
+    expect(a.messages.at(-1)!.text).toMatch(/Claude Code не найден/);
+    expect(a.notices[0]).toMatchObject({ ok: false, title: 'No Claude Code' });
+    setState((s) => ({ agent: { ...s.agent, settings: { ...s.agent.settings, provider: 'anthropic-api' } } }));
+    sendFromUi('создай ветку from-another-provider');
+    expect(getState().agent.notices[0]).toMatchObject({ ok: false, title: 'No agent for this provider' });
+  });
+
+  it('cards that came back after an interface reload keep their own ids: a new card never shares one', () => {
+    setState((s) => ({ agent: { ...s.agent, notices: [{ id: 7, msgId: 1, ok: true, title: 'Interface updated', text: 'v1', actions: [], time: 1 }], messages: [{ id: 50, role: 'agent', text: 'a', time: 1 }, { id: 51, role: 'agent', text: 'b', time: 2 }] } }));
+    finishAgentRun(50, { ok: true });
+    finishAgentRun(51, { ok: true });
+    const ids = getState().agent.notices.map((n) => n.id);
+    expect(new Set(ids).size).toBe(3);
+    dismissAgentNotice(7);
+    expect(getState().agent.notices.map((n) => n.text)).toEqual(['b', 'a']);
+  });
+
+  it('a run that ends while the panel shows Changes or Settings still leaves a card; on the Chat tab it does not', () => {
+    setState((s) => ({ agent: { ...s.agent, open: true, tab: 'settings', messages: [{ id: 60, role: 'agent', text: 'done', time: 1 }] } }));
+    finishAgentRun(60, { ok: true });
+    expect(getState().agent.notices).toHaveLength(1);
+    setState((s) => ({ agent: { ...s.agent, tab: 'chat', notices: [] } }));
+    finishAgentRun(60, { ok: true });
+    expect(getState().agent.notices).toHaveLength(0);
+  });
+
+  it('the chat is not cleared while a run goes on (its answer had nowhere to go)', () => {
+    setState((s) => ({ agent: { ...s.agent, busy: true, messages: [{ id: 1, role: 'system', text: 'intro', time: 0 }, { id: 70, role: 'user', text: 'q', time: 1 }] } }));
+    clearAgentChat();
+    expect(getState().agent.messages).toHaveLength(2);
+    setState((s) => ({ agent: { ...s.agent, busy: false } }));
+    clearAgentChat();
+    expect(getState().agent.messages).toHaveLength(1);
   });
 });

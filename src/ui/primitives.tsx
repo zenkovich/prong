@@ -102,6 +102,41 @@ if (Platform.OS === 'web' && typeof window !== 'undefined')
 /** without a click count (touch, keyboard): two presses of one element within this many ms are a double click */
 export const DOUBLE_CLICK_MS = 450;
 
+/** set by HoverReveal: the pressables inside it say when they are hovered */
+const RevealHover = React.createContext<((hovered: boolean) => void) | null>(null);
+/**
+ * Set by every PressScale for the pressables inside it. RN-web ends a pressable's hover when the pointer moves onto
+ * one inside it (its "contain" lock): a row lost its highlight and its hover buttons under its own arrow or button,
+ * and where they took space the layout moved under the pointer and flickered (merge2core's → in Changes). Inner
+ * ones say when they are hovered, and the outer one stays hovered while one of them is.
+ */
+const HoverParent = React.createContext<((hovered: boolean) => void) | null>(null);
+
+/**
+ * What a row shows while it is hovered (its buttons), in place of what it shows otherwise (`rest`: counts, a
+ * status). Both stay mounted: a button that exists only while its row is hovered vanishes the moment the pointer
+ * moves onto it (a pressable inside a pressable ends the outer one's hover), so the buttons stay while the row or
+ * one of them is hovered.
+ */
+export function HoverReveal({ rowHovered, rest, children, idleOpacity }: {
+  rowHovered: boolean;
+  rest?: React.ReactNode;
+  children: React.ReactNode;
+  /** the buttons stay shown at this opacity while nothing is hovered (instead of hidden) */
+  idleOpacity?: number;
+}) {
+  const [over, setOver] = useState(false);
+  const on = rowHovered || over;
+  return (
+    <>
+      {rest != null && rest !== false ? <View style={on ? { display: 'none' } : undefined}>{rest}</View> : null}
+      <View style={[{ flexDirection: 'row', alignItems: 'center' }, !on && (idleOpacity != null ? { opacity: idleOpacity } : { display: 'none' })]}>
+        <RevealHover.Provider value={setOver}>{children}</RevealHover.Provider>
+      </View>
+    </>
+  );
+}
+
 export function PressScale({ children, onPress, onLongPress, style, disabled, scaleTo = 0.97, hoverStyle, onHover, onContextMenu, onDoublePress, testID, label, onPressAt, outerStyle, onPressMods }: {
   /** a press with ⌘/Ctrl or Shift held: return true when handled (the plain onPress is then skipped) */
   onPressMods?: (m: { meta: boolean; shift: boolean }) => boolean | void;
@@ -126,6 +161,42 @@ export function PressScale({ children, onPress, onLongPress, style, disabled, sc
   const t = useTheme();
   const scale = useState(() => new Animated.Value(1))[0];
   const [hovered, setHovered] = useState(false);
+  const reveal = React.useContext(RevealHover);
+  const parent = React.useContext(HoverParent);
+  // hovered: the pointer is on it, or on a pressable inside it. The lock that ends this one's hover and the inner
+  // one's start come in one pointer event, so React draws only the outcome (no frame without the hover)
+  const own = useRef(false);
+  const inner = useRef(0);
+  const sent = useRef(false);
+  const ups = useRef({ parent, reveal, onHover });
+  useLayoutEffect(() => {
+    ups.current = { parent, reveal, onHover };
+  });
+  const sync = useCallback(() => {
+    const h = own.current || inner.current > 0;
+    if (h === sent.current) return;
+    sent.current = h;
+    setHovered(h);
+    ups.current.onHover?.(h);
+    ups.current.parent?.(h);
+    ups.current.reveal?.(h);
+  }, []);
+  const fromInner = useCallback(
+    (h: boolean) => {
+      inner.current = Math.max(0, inner.current + (h ? 1 : -1));
+      sync();
+    },
+    [sync],
+  );
+  // gone while hovered (a button that hides on click): its parent is not left hovered for good
+  useEffect(
+    () => () => {
+      if (!sent.current) return;
+      ups.current.parent?.(false);
+      ups.current.reveal?.(false);
+    },
+    [],
+  );
   /** this element's identity for double-click detection */
   const me = useRef(0);
   const box = useRef<any>(null);
@@ -161,12 +232,12 @@ export function PressScale({ children, onPress, onLongPress, style, disabled, sc
       onPressIn={() => scaleTo !== 1 && animate(scaleTo)}
       onPressOut={() => scaleTo !== 1 && animate(1)}
       onHoverIn={() => {
-        setHovered(true);
-        onHover?.(true);
+        own.current = true;
+        sync();
       }}
       onHoverOut={() => {
-        setHovered(false);
-        onHover?.(false);
+        own.current = false;
+        sync();
       }}
       onPointerDown={(e: any) => {
         if (onContextMenu && e?.nativeEvent?.button === 2) {
@@ -178,7 +249,7 @@ export function PressScale({ children, onPress, onLongPress, style, disabled, sc
     >
       {({ pressed }) => (
         <Animated.View ref={box} style={[style, hovered && hoverStyle, { transform: [{ scale }] }, disabled && { opacity: 0.4 }]}>
-          {typeof children === 'function' ? children({ hovered, pressed }) : children}
+          <HoverParent.Provider value={fromInner}>{typeof children === 'function' ? children({ hovered, pressed }) : children}</HoverParent.Provider>
         </Animated.View>
       )}
     </Pressable>
@@ -250,9 +321,11 @@ export function IconButton({ icon, onPress, size = 15, color, title, active, dis
 
 // ---------- toolbar button: icon + uppercase label in one row (terminal density) ----------
 
-export function ToolButton({ icon, label, onPress, badge, badgeColor, disabled, menu, onPressAt, compact }: {
+export function ToolButton({ icon, label, onPress, badge, badgeColor, disabled, menu, onPressAt, compact, testID }: {
   icon: IconName;
   label: string;
+  /** the button's; its arrow gets `<testID>-menu` */
+  testID?: string;
   compact?: boolean;
   onPress?: () => void;
   onPressAt?: (a: Anchor) => void;
@@ -266,7 +339,7 @@ export function ToolButton({ icon, label, onPress, badge, badgeColor, disabled, 
   const hasBadge = badge !== undefined && badge !== 0 && badge !== '';
   return (
     <View style={{ flexDirection: 'row', alignItems: 'stretch' }}>
-      <PressScale label={compact ? label : undefined} onPress={onPress} onPressAt={onPressAt} disabled={disabled} scaleTo={0.96} style={[styles.toolButton, compact && { paddingHorizontal: 7 }]} hoverStyle={{ backgroundColor: t.hover }}>
+      <PressScale label={compact ? label : undefined} onPress={onPress} onPressAt={onPressAt} disabled={disabled} scaleTo={0.96} style={[styles.toolButton, compact && { paddingHorizontal: 7 }]} hoverStyle={{ backgroundColor: t.hover }} testID={testID}>
         {({ hovered }) => (
           <>
             <Icon name={icon} size={compact ? 15 : 13} color={hovered ? t.text : t.textMuted} />
@@ -286,7 +359,7 @@ export function ToolButton({ icon, label, onPress, badge, badgeColor, disabled, 
         )}
       </PressScale>
       {menu && (
-        <PressScale onPressAt={menu} disabled={disabled} style={styles.toolMenu} hoverStyle={{ backgroundColor: t.hover }} label={`${label}: quick actions`}>
+        <PressScale onPressAt={menu} disabled={disabled} style={styles.toolMenu} hoverStyle={{ backgroundColor: t.hover }} label={`${label}: quick actions`} testID={testID ? `${testID}-menu` : undefined}>
           <Icon name="chevronDown" size={10} />
         </PressScale>
       )}
@@ -345,9 +418,14 @@ export function Row({ children, selected, onPress, onDoublePress, onContextMenu,
 
 // ---------- inputs ----------
 
-export function Input({ value, onChange, placeholder, mono, multiline, style, autoFocus, onSubmit, icon, small, secure, slash, fill, testID }: {
+export function Input({ value, onChange, placeholder, mono, multiline, style, autoFocus, onSubmit, icon, small, secure, slash, fill, testID, enterSends }: {
   /** a multiline field that takes the whole height of its box */
   fill?: boolean;
+  /**
+   * a chat composer: several lines, Enter runs `onSubmit` and the cursor stays in the field, Shift+Enter breaks the
+   * line (a one-line field drops the line breaks of pasted text and loses the cursor after Enter)
+   */
+  enterSends?: boolean;
   testID?: string;
   value: string;
   onChange: (v: string) => void;
@@ -366,7 +444,7 @@ export function Input({ value, onChange, placeholder, mono, multiline, style, au
   const t = useTheme();
   const [focused, setFocused] = useState(false);
   return (
-    <View style={[styles.input, { backgroundColor: t.bg, borderColor: focused ? t.accent : t.border }, small && { minHeight: 24, paddingVertical: 0 }, multiline && { alignItems: 'flex-start' }, style]}>
+    <View style={[styles.input, { backgroundColor: t.bg, borderColor: focused ? t.accent : t.border }, small && { minHeight: 24, paddingVertical: 0 }, (multiline || enterSends) && { alignItems: 'flex-start' }, style]}>
       {slash ? (
         <Txt color={t.accent} weight="700" size={FONT.md} style={{ marginRight: 6 }}>
           /
@@ -381,12 +459,22 @@ export function Input({ value, onChange, placeholder, mono, multiline, style, au
         onChangeText={onChange}
         placeholder={placeholder}
         placeholderTextColor={t.textFaint}
-        multiline={multiline}
+        multiline={multiline || enterSends}
         autoFocus={autoFocus}
         secureTextEntry={secure}
         onFocus={() => setFocused(true)}
         onBlur={() => setFocused(false)}
-        onSubmitEditing={onSubmit}
+        onSubmitEditing={enterSends ? undefined : onSubmit}
+        onKeyPress={
+          enterSends
+            ? (e: any) => {
+                const k = e.nativeEvent ?? {};
+                if (k.key !== 'Enter' || k.shiftKey || k.isComposing) return;
+                e.preventDefault?.();
+                onSubmit?.();
+              }
+            : undefined
+        }
         // names, paths, commands: what is typed stays as typed (WebKit capitalized "tmp/x" into "Tmp/x");
         // spelling is only marked in longer text
         autoCapitalize="none"
@@ -395,7 +483,8 @@ export function Input({ value, onChange, placeholder, mono, multiline, style, au
         autoComplete="off"
         testID={testID}
         style={[
-          { flex: 1, color: t.text, fontFamily: t.fontFor('400'), fontSize: small ? FONT.sm : FONT.md, paddingVertical: multiline ? 4 : 0, minHeight: multiline ? (fill ? 24 : 64) : undefined },
+          // minWidth 0: an <input> is ~150px wide by itself and would stick out of a narrow box (the sidebar's filter)
+          { flex: 1, minWidth: 0, color: t.text, fontFamily: t.fontFor('400'), fontSize: small ? FONT.sm : FONT.md, paddingVertical: multiline || enterSends ? 4 : 0, minHeight: enterSends ? 40 : multiline ? (fill ? 24 : 64) : undefined },
           fill && { alignSelf: 'stretch' },
           Platform.OS === 'web' && ({ outlineStyle: 'none' } as any),
         ]}
@@ -416,10 +505,11 @@ export function Checkbox({ checked, onChange, label, disabled, testID }: { check
   );
 }
 
-export function Radio({ checked, onPress, label, hint }: { checked: boolean; onPress: () => void; label: string; hint?: string }) {
+/** `testID`: the chosen one's ends in "-on" */
+export function Radio({ checked, onPress, label, hint, testID }: { checked: boolean; onPress: () => void; label: string; hint?: string; testID?: string }) {
   const t = useTheme();
   return (
-    <PressScale onPress={onPress} scaleTo={0.98} style={{ flexDirection: 'row', alignItems: 'flex-start', paddingVertical: 4 }}>
+    <PressScale onPress={onPress} scaleTo={0.98} style={{ flexDirection: 'row', alignItems: 'flex-start', paddingVertical: 4 }} testID={testID ? `${testID}${checked ? '-on' : ''}` : undefined}>
       <View style={[styles.radio, { borderColor: checked ? t.accent : t.borderStrong }]}>{checked && <View style={{ width: 7, height: 7, backgroundColor: t.accent }} />}</View>
       <View style={{ marginLeft: 8, flex: 1 }}>
         <Txt>{label}</Txt>
@@ -489,11 +579,12 @@ export function SectionHeader({ title, right, count }: { title: string; right?: 
 
 // ---------- frosted glass surface for every popup ----------
 
-export function Glass({ children, style, pointerEvents }: { children: React.ReactNode; style?: StyleProp<ViewStyle>; pointerEvents?: 'auto' | 'none' | 'box-none' }) {
+export function Glass({ children, style, pointerEvents, testID }: { children: React.ReactNode; style?: StyleProp<ViewStyle>; pointerEvents?: 'auto' | 'none' | 'box-none'; testID?: string }) {
   const t = useTheme();
   return (
     <View
       pointerEvents={pointerEvents}
+      testID={testID}
       {...({ dataSet: { glass: '1' } } as any)}
       style={[
         { backgroundColor: t.glass },
@@ -504,6 +595,24 @@ export function Glass({ children, style, pointerEvents }: { children: React.Reac
       {children}
     </View>
   );
+}
+
+/**
+ * Scrolls `node` the least that brings the element marked `data-<mark>` inside it into view (as scrollIntoView
+ * "nearest", but only this scroller). Rects are measured in window px and the scroll is in the node's own px,
+ * which differ under the interface scale (CSS zoom).
+ */
+export function revealIn(node: HTMLElement | null, mark: string, axis: 'x' | 'y', pad = 8) {
+  const el = node?.querySelector(`[data-${mark}]`) as HTMLElement | null;
+  if (!node || !el) return;
+  const a = el.getBoundingClientRect();
+  const b = node.getBoundingClientRect();
+  const k = axis === 'x' ? (b.width ? node.clientWidth / b.width : 1) : b.height ? node.clientHeight / b.height : 1;
+  const [lo, hi, blo, bhi] = axis === 'x' ? [a.left, a.right, b.left, b.right] : [a.top, a.bottom, b.top, b.bottom];
+  const d = lo < blo ? lo - blo - pad : hi > bhi ? hi - bhi + pad : 0;
+  if (!d) return;
+  if (axis === 'x') node.scrollLeft += d * k;
+  else node.scrollTop += d * k;
 }
 
 // ---------- splitter ----------
@@ -551,6 +660,7 @@ export function ResizeGrip({ onDelta, onEnd, size = 16 }: { onDelta: (dx: number
   const [active, setActive] = useState(false);
   return (
     <View
+      testID="resize-grip"
       onStartShouldSetResponder={() => true}
       onMoveShouldSetResponder={() => true}
       onResponderTerminationRequest={() => false}
@@ -699,6 +809,10 @@ export interface KeyPress {
   meta: boolean;
   shift: boolean;
   ctrl: boolean;
+  /** ⌥ (Option): with it held macOS changes `key` (⌥T is "†"), so such shortcuts read `code` */
+  alt: boolean;
+  /** the physical key ("KeyT"), whatever the layout and modifiers make of it */
+  code: string;
   preventDefault: () => void;
   target: any;
   /** handled here: the handlers that run after this one see `consumed` */
@@ -720,6 +834,8 @@ export function useKeyboard(handler: (e: KeyPress) => void, opts: { errorLayer?:
         meta: e.metaKey || e.ctrlKey,
         shift: e.shiftKey,
         ctrl: e.ctrlKey,
+        alt: e.altKey,
+        code: e.code,
         preventDefault: () => e.preventDefault(),
         target: e.target,
         consume: () => consumedKeys.add(e),
@@ -727,6 +843,10 @@ export function useKeyboard(handler: (e: KeyPress) => void, opts: { errorLayer?:
           return consumedKeys.has(e);
         },
       });
+      // an Enter a window handler took (a dialog's default button, a list's pick) does not also press the focused
+      // button underneath: RN-web presses a focused pressable on Enter, so the toolbar button that opened the dialog
+      // (still focused) opened it again right after Enter had run it
+      if (e.key === 'Enter' && e.defaultPrevented) e.stopPropagation();
     };
     window.addEventListener('keydown', onKey, true);
     return () => window.removeEventListener('keydown', onKey, true);
@@ -805,7 +925,8 @@ const styles = StyleSheet.create({
   buttonSmall: { height: 22, paddingHorizontal: 7 },
   iconButton: { width: 24, height: 24, alignItems: 'center', justifyContent: 'center' },
   toolButton: { flexDirection: 'row', alignItems: 'center', justifyContent: 'center', paddingHorizontal: 9, height: 26 },
-  toolMenu: { justifyContent: 'center', paddingHorizontal: 3, marginLeft: -3 },
+  // as tall as its button: the arrow sits at the middle of the label, not at the top
+  toolMenu: { justifyContent: 'center', paddingHorizontal: 3, marginLeft: -3, height: 26 },
   badge: { paddingHorizontal: 4, minWidth: 16, height: 15, alignItems: 'center', justifyContent: 'center' },
   row: { flexDirection: 'row', alignItems: 'center', paddingRight: 8 },
   input: { flexDirection: 'row', alignItems: 'center', borderWidth: 1, paddingHorizontal: 8, minHeight: 26 },

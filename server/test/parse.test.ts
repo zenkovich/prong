@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { hunkPatch, parseDiff, parseLog, parseNumstat, parseRefs, parseRemotes, parseStashList, parseStatus, REC, SEP } from '../src/git/parse.js';
+import { hunkPatch, joinSubmoduleChanges, parseDiff, parseLog, parseNumstat, parseRefs, parseRemotes, parseStashList, parseStatus, REC, SEP, subprojectSha } from '../src/git/parse.js';
 import { progressOf } from '../src/git/run.js';
 
 describe('parseLog', () => {
@@ -158,7 +158,8 @@ describe('parseNumstat', () => {
   it('reads counts and binary markers', () => {
     const m = parseNumstat('3\t1\tsrc/a.ts\0-\t-\timg.png\0');
     expect(m.get('src/a.ts')).toEqual({ additions: 3, deletions: 1 });
-    expect(m.get('img.png')).toEqual({ additions: 0, deletions: 0 });
+    // "-\t-": binary, whatever the name says (the status shows no "+0 −0" for it)
+    expect(m.get('img.png')).toEqual({ additions: 0, deletions: 0, binary: true });
   });
 });
 
@@ -168,5 +169,45 @@ describe('progressOf', () => {
     expect(progressOf('Receiving objects:  38% (700/1842), 2.1 MiB | 4.2 MiB/s')).toBeCloseTo(0.3 + 0.38 * 0.5);
     expect(progressOf('Resolving deltas: 100% (10/10), done.')).toBeCloseTo(0.95);
     expect(progressOf('From github.com:x/y')).toBeNull();
+  });
+});
+
+describe('submodules with changes in their own files', () => {
+  const A = 'a'.repeat(40);
+  const B = 'b'.repeat(40);
+  it('a working-copy diff names the commit of a submodule with edited files as "<sha>-dirty": the sha is the commit', () => {
+    expect(subprojectSha(` ${A}-dirty \n`)).toBe(A);
+    const [f] = parseDiff(`diff --git a/libs/core b/libs/core\nindex ${A}..${B} 160000\n--- a/libs/core\n+++ b/libs/core\n@@ -1 +1 @@\n-Subproject commit ${A}\n+Subproject commit ${B}-dirty\n`);
+    expect(f.kind).toBe('submodule');
+    expect(f.submodule).toEqual({ before: A, after: B });
+    // the commit unchanged, only its files: both pointers the same commit
+    const [g] = parseDiff(`diff --git a/vso b/vso\n--- a/vso\n+++ b/vso\n@@ -1 +1 @@\n-Subproject commit ${A}\n+Subproject commit ${A}-dirty\n`);
+    expect(g.submodule).toEqual({ before: A, after: A });
+  });
+
+  const row = (path: string, extra: object = {}) => ({ path, status: 'M' as const, kind: 'text' as const, additions: 1, deletions: 0, ...extra });
+  const changes = (path: string, modified: number, untracked: number) => ({ path, modified, untracked, files: [{ path: 'x.txt', status: 'M' as const }] });
+
+  it('one at its recorded commit is listed for them alone, among the tracked entries in path order (new files stay last)', () => {
+    const list = [row('.vscode/ws'), row('android/report.html'), row('frameworks/merge2core', { kind: 'submodule' }), { ...row('new.txt'), status: '?' as const }];
+    const out = joinSubmoduleChanges(list, [changes('.claude', 1, 2), changes('vso-engine', 1, 0)]);
+    expect(out.map((f) => f.path)).toEqual(['.claude', '.vscode/ws', 'android/report.html', 'frameworks/merge2core', 'vso-engine', 'new.txt']);
+    expect(out[0]).toMatchObject({ status: 'M', kind: 'submodule', additions: 0, deletions: 0, inside: { modified: 1, untracked: 2, only: true } });
+    expect(out[4].inside).toMatchObject({ modified: 1, untracked: 0, only: true });
+  });
+
+  it('one whose commit moved keeps its row and gets them (not "only": its pointer is staged as before)', () => {
+    const out = joinSubmoduleChanges([row('libs/core', { kind: 'submodule' })], [changes('libs/core', 3, 1)]);
+    expect(out).toHaveLength(1);
+    expect(out[0].inside).toEqual({ modified: 3, untracked: 1, files: [{ path: 'x.txt', status: 'M' }] });
+  });
+
+  it('a path listed as something else (a conflict) stays as it is; empty reads and no reads change nothing', () => {
+    const conflict = { ...row('libs/core'), status: 'U' as const };
+    expect(joinSubmoduleChanges([conflict], [changes('libs/core', 1, 0)])).toEqual([conflict]);
+    const list = [row('a.txt')];
+    expect(joinSubmoduleChanges(list, [])).toBe(list);
+    expect(joinSubmoduleChanges(list, [changes('libs/x', 0, 0)])).toBe(list);
+    expect(joinSubmoduleChanges([], [changes('libs/x', 0, 1)]).map((f) => f.path)).toEqual(['libs/x']);
   });
 });

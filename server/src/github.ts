@@ -28,6 +28,12 @@ export async function validateToken(host: string, token: string) {
   return { login: user.login, name: user.name ?? user.login, avatar: user.avatar_url, orgs: orgs.map((o) => o.login) };
 }
 
+/** the installations of GitHub Apps this user token can see (where the app reaches private repositories) */
+export async function userInstallations(host: string, token: string) {
+  const r = await gh<{ installations: { account: { login: string }; app_slug: string; repository_selection: string }[] }>(host, token, '/user/installations?per_page=100');
+  return r.installations.map((i) => ({ account: i.account.login, slug: i.app_slug, selection: i.repository_selection }));
+}
+
 export async function listRepos(host: string, token: string, page = 1) {
   const repos = await gh<{ full_name: string; ssh_url: string; clone_url: string; private: boolean; pushed_at: string; description: string | null }[]>(host, token, `/user/repos?per_page=100&sort=pushed&page=${page}`);
   return repos.map((r) => ({ fullName: r.full_name, sshUrl: r.ssh_url, httpsUrl: r.clone_url, private: r.private, pushedAt: r.pushed_at, description: r.description ?? '' }));

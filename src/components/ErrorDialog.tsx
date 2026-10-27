@@ -1,6 +1,6 @@
 import React from 'react';
 import { ScrollView, View } from 'react-native';
-import { errorHint, isSignInError } from '../state/errorHints';
+import { errorHint, isAccountSignInError, isSignInError } from '../state/errorHints';
 import { clearErrors, closeErrors, fullDate, openDialog, showErrors, useStore } from '../state/store';
 import * as live from '../state/live';
 import { FONT, useTheme } from '../theme';
@@ -28,6 +28,8 @@ function ErrorDialog({ idx }: { idx: number }) {
   const hint = errorHint(e.title, e.detail);
   // a remote refused the credentials: the repository's SSH key / account is one click away
   const signIn = live.isLiveActive() && isSignInError(e.title, e.detail);
+  // a GitHub account whose sign-in no longer works: Accounts, where it is signed in again
+  const account = isAccountSignInError(e.title, e.detail);
   const newer = idx > 0 ? errors[idx - 1] : null;
   const older = idx < errors.length - 1 ? errors[idx + 1] : null;
   useKeyboard((k) => {
@@ -68,7 +70,21 @@ function ErrorDialog({ idx }: { idx: number }) {
               testID="error-action"
             />
           )}
-          {signIn && (
+          {account && (
+            <Button
+              small
+              primary
+              label="Sign in again…"
+              icon="github"
+              style={{ marginRight: 6 }}
+              onPress={() => {
+                closeErrors();
+                openDialog({ type: 'accounts', tab: 'github' });
+              }}
+              testID="error-accounts"
+            />
+          )}
+          {signIn && !account && (
             <Button
               small
               primary

@@ -1,9 +1,9 @@
-import React, { useState } from 'react';
-import { Pressable, ScrollView, StyleSheet, View } from 'react-native';
+import React, { useEffect, useRef, useState } from 'react';
+import { Platform, Pressable, ScrollView, StyleSheet, View } from 'react-native';
 import { closeRepoPicker, goWelcome, openDialog, openRepo, sortRepos, useStore, useWorkspaceRepos } from '../state/store';
 import { FONT, useTheme } from '../theme';
 import { Icon } from '../ui/Icon';
-import { Badge, Button, Glass, Input, PressScale, Txt, useKeyboard, useViewport } from '../ui/primitives';
+import { Badge, Button, Glass, Input, PressScale, revealIn, Txt, useKeyboard, useViewport } from '../ui/primitives';
 
 const W = 540;
 
@@ -31,13 +31,24 @@ function RepoPicker({ x, y }: { x: number; y: number }) {
     closeRepoPicker();
     openRepo(id);
   };
+  // the row the arrows reach stays in view (it used to go on below the list's edge); only for the keys: a row the
+  // pointer picks is in view already, and scrolling under a resting pointer would pick the next one
+  const scroll = useRef<any>(null);
+  const byKey = useRef(false);
+  useEffect(() => {
+    if (Platform.OS !== 'web' || !byKey.current) return;
+    byKey.current = false;
+    revealIn(scroll.current?.getScrollableNode?.() ?? null, 'pickercur', 'y', 4);
+  }, [cur]);
   useKeyboard((e) => {
     if (e.key === 'Escape') closeRepoPicker();
     else if (e.key === 'ArrowDown') {
       e.preventDefault();
+      byKey.current = true;
       setSel(Math.min(list.length - 1, cur + 1));
     } else if (e.key === 'ArrowUp') {
       e.preventDefault();
+      byKey.current = true;
       setSel(Math.max(0, cur - 1));
     } else if (e.key === 'Enter' && list[cur]) {
       e.preventDefault();
@@ -57,6 +68,8 @@ function RepoPicker({ x, y }: { x: number; y: number }) {
               onChange={(v) => {
                 setQ(v);
                 setSel(0);
+                // the first match, picked, is at the top
+                scroll.current?.scrollTo?.({ y: 0, animated: false });
               }}
               placeholder={`open a repository in @${wsName}`}
               slash
@@ -64,7 +77,7 @@ function RepoPicker({ x, y }: { x: number; y: number }) {
               autoFocus
             />
           </View>
-          <ScrollView style={{ flexShrink: 1 }} keyboardShouldPersistTaps="handled">
+          <ScrollView ref={scroll} style={{ flexShrink: 1 }} keyboardShouldPersistTaps="handled">
             {list.map((r, i) => {
               const active = i === cur;
               const inTab = tabs.includes(r.id);
@@ -78,6 +91,7 @@ function RepoPicker({ x, y }: { x: number; y: number }) {
                   label={`Open ${r.name}`}
                   testID={`picker-repo-${r.name}`}
                 >
+                  {active ? <View {...({ dataSet: { pickercur: '1' } } as any)} style={StyleSheet.absoluteFill} pointerEvents="none" /> : null}
                   <Icon name="folder" size={14} color={active ? t.accent : t.textMuted} />
                   <View style={{ flex: 1, marginLeft: 10, minWidth: 0 }}>
                     <View style={{ flexDirection: 'row', alignItems: 'center' }}>

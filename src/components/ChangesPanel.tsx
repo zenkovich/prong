@@ -6,6 +6,8 @@ import {
   discardAll,
   findHunk,
   selectFile,
+  clickFileSelection,
+  clickFolderSelection,
   setCommitAction,
   setCommitDescription,
   setCommitMessage,
@@ -33,6 +35,7 @@ export function ChangesPanel() {
   const filesW = useStore((s) => s.layout.files);
   const { file } = findHunk(repo);
   const conflicts = repo.unstaged.filter((f) => f.status === 'U').length;
+  const op = repo.opKind && repo.opKind !== 'none' ? repo.opKind : null;
   const descOpen = useStore((s) => s.commitDescOpen);
   const boxH = useStore((s) => s.layout.commitBox);
 
@@ -40,12 +43,13 @@ export function ChangesPanel() {
     <View style={{ flex: 1, flexDirection: 'row', backgroundColor: t.panel }}>
       <View style={{ width: filesW, borderRightWidth: 0 }}>
         {conflicts > 0 && (
-          <View style={[styles.conflictBar, { backgroundColor: t.warn + '22', borderColor: t.warn + '55' }]}>
+          <View style={[styles.conflictBar, { backgroundColor: t.warn + '22', borderColor: t.warn + '55' }]} testID="conflict-bar">
             <Icon name="warning" size={14} color={t.warn} />
-            <Txt size={FONT.sm} style={{ marginLeft: 8, flex: 1 }}>
+            <Txt size={FONT.sm} style={{ marginLeft: 8, flex: 1 }} numberOfLines={1}>
               {conflicts} conflicted file{conflicts > 1 ? 's' : ''}
             </Txt>
-            <Button small label={repo.opKind === 'rebase' ? 'Abort rebase' : 'Abort merge'} onPress={() => (repo.live ? (repo.opKind === 'rebase' ? live.rebaseAbort() : live.mergeAbort()) : toast('Merge aborted (mock)', 'info'))} />
+            {/* what stopped on the conflicts goes back; conflicts left by a stash apply have nothing to abort */}
+            {(op || !repo.live) && <Button small label={`Abort ${op ?? 'merge'}`} onPress={() => (repo.live ? (op === 'rebase' ? live.rebaseAbort() : live.mergeAbort()) : toast('Merge aborted (mock)', 'info'))} testID="conflict-abort" />}
           </View>
         )}
         <SectionHeader
@@ -61,11 +65,31 @@ export function ChangesPanel() {
           }
         />
         <View style={{ flex: Math.max(1, Math.min(4, repo.unstaged.length)) }}>
-          <FileList files={repo.unstaged} area="unstaged" selected={repo.selectedArea === 'unstaged' ? repo.selectedFile : null} onSelect={(p) => selectFile('unstaged', p)} filterable={false} compact />
+          <FileList
+            files={repo.unstaged}
+            area="unstaged"
+            selected={repo.selectedArea === 'unstaged' ? repo.selectedFile : null}
+            onSelect={(p) => selectFile('unstaged', p)}
+            filterable={false}
+            compact
+            picked={repo.selectedArea === 'unstaged' ? repo.fileSelection : undefined}
+            onPick={(p, m, order) => clickFileSelection('unstaged', p, m, order)}
+            onPickFolder={(inside, m, order) => clickFolderSelection('unstaged', inside, m, order)}
+          />
         </View>
         <SectionHeader title="Staged" count={repo.staged.length} right={<IconButton icon="minus" size={14} title="Unstage all" onPress={unstageAll} disabled={repo.staged.length === 0} />} />
         <View style={{ flex: Math.max(1, Math.min(4, repo.staged.length)) }}>
-          <FileList files={repo.staged} area="staged" selected={repo.selectedArea === 'staged' ? repo.selectedFile : null} onSelect={(p) => selectFile('staged', p)} filterable={false} compact />
+          <FileList
+            files={repo.staged}
+            area="staged"
+            selected={repo.selectedArea === 'staged' ? repo.selectedFile : null}
+            onSelect={(p) => selectFile('staged', p)}
+            filterable={false}
+            compact
+            picked={repo.selectedArea === 'staged' ? repo.fileSelection : undefined}
+            onPick={(p, m, order) => clickFileSelection('staged', p, m, order)}
+            onPickFolder={(inside, m, order) => clickFolderSelection('staged', inside, m, order)}
+          />
         </View>
       </View>
       <Splitter orientation="vertical" onDelta={(d) => setLayout({ files: Math.max(240, Math.min(600, filesW + d)) })} />
@@ -82,15 +106,41 @@ export function ChangesPanel() {
 function CommitBox() {
   const t = useTheme();
   const repo = useRepo();
-  const sign = useStore((s) => s.serverSettings?.signCommits ?? false);
+  // the repository's own commit.gpgsign (a global Prong setting used to show here while git signed per repository)
+  const mockSign = useStore((s) => s.serverSettings?.signCommits ?? false);
+  const [signed, setSigned] = useState<{ id: string; on: boolean } | null>(null);
+  useEffect(() => {
+    let gone = false;
+    if (repo.live) void live.readSignCommits().then((on) => !gone && setSigned({ id: repo.id, on }));
+    return () => {
+      gone = true;
+    };
+  }, [repo.live, repo.id]);
+  const sign = repo.live ? (signed?.id === repo.id ? signed.on : false) : mockSign;
+  const toggleSign = (v: boolean) => {
+    if (!repo.live) return toast('Signing uses the key from Preferences → SSH (mock)', 'info');
+    const id = repo.id;
+    setSigned({ id, on: v });
+    // not set (an error, said by the error dialog): the box shows what git has
+    void live.setSignCommits(v).then((ok) => {
+      if (!ok) void live.readSignCommits().then((on) => setSigned({ id, on }));
+    });
+  };
   const action = useStore((s) => s.commitAction);
   const current = repo.refs.find((r) => r.kind === 'branch' && r.current);
   const summaryLen = repo.commitMessage.length;
-  const canCommit = repo.commitMessage.trim().length > 0 && (repo.staged.length > 0 || repo.amend);
-  const [identity, setIdentity] = useState('');
+  // a merge whose conflicts all went to our side stages nothing, and still is committed (git makes the merge commit)
+  const canCommit = repo.commitMessage.trim().length > 0 && (repo.staged.length > 0 || repo.amend || repo.opKind === 'merge');
+  // the name git will put on the commit: the repository's own identity when it has one (it said the global name)
+  const [identity, setIdentity] = useState<{ id: string; name: string; email: string } | null>(null);
   useEffect(() => {
-    if (repo.live) void live.readGlobalIdentity().then((i) => setIdentity(i.name));
+    let gone = false;
+    if (repo.live) void live.readCommitIdentity().then((i) => !gone && setIdentity({ id: repo.id, ...i }));
+    return () => {
+      gone = true;
+    };
   }, [repo.live, repo.id]);
+  const as = identity?.id === repo.id ? identity : null;
   const push = action === 'commit-push';
   const label = `${repo.amend ? 'Amend' : 'Commit'}${push ? ' & Push' : ''}`;
   const descOpen = useStore((s) => s.commitDescOpen);
@@ -99,8 +149,8 @@ function CommitBox() {
     // with the description unfolded the box has the height the splitter above gives it; folded, it is compact
     <View style={[styles.commitBox, { borderColor: t.border, backgroundColor: t.panelAlt }, descOpen && { height: boxH }]} testID="commit-box">
       <View style={{ flexDirection: 'row', alignItems: 'center' }}>
-        <Input value={repo.commitMessage} onChange={setCommitMessage} placeholder="Commit summary" style={{ flex: 1 }} onSubmit={() => canCommit && commit(push)} />
-        <Txt size={FONT.xs} color={summaryLen > 72 ? t.del : summaryLen > 50 ? t.warn : t.textFaint} mono style={{ marginLeft: 8, width: 28, textAlign: 'right' }}>
+        <Input value={repo.commitMessage} onChange={setCommitMessage} placeholder="Commit summary" style={{ flex: 1 }} onSubmit={() => canCommit && commit(push)} testID="commit-summary" />
+        <Txt size={FONT.xs} color={summaryLen > 72 ? t.del : summaryLen > 50 ? t.warn : t.textFaint} mono style={{ marginLeft: 8, width: 28, textAlign: 'right' }} testID="commit-counter">
           {summaryLen}
         </Txt>
         <PressScale onPress={toggleCommitDesc} scaleTo={0.9} style={styles.fold} hoverStyle={{ backgroundColor: t.hover }} label={descOpen ? 'Hide the description' : 'Show the description'} testID="toggle-commit-desc">
@@ -115,12 +165,12 @@ function CommitBox() {
         </Txt>
       ) : null}
       <View style={{ flexDirection: 'row', alignItems: 'center', marginTop: 8, flexWrap: 'wrap' }}>
-        <Checkbox checked={repo.amend} onChange={toggleAmend} label="Amend" />
+        <Checkbox checked={repo.amend} onChange={toggleAmend} label="Amend" testID="commit-amend" />
         <View style={{ width: 14 }} />
-        <Checkbox checked={sign} onChange={(v) => (repo.live ? void live.setSignCommits(v) : toast('Signing uses the key from Preferences → SSH (mock)', 'info'))} label="Sign" />
-        <Txt size={FONT.xs} faint style={{ marginLeft: 14, flexShrink: 1 }} numberOfLines={1}>
+        <Checkbox checked={sign} onChange={toggleSign} label="Sign" testID="commit-sign" />
+        <Txt size={FONT.xs} faint style={{ marginLeft: 14, flexShrink: 1 }} numberOfLines={1} testID="commit-target">
           to <Txt size={FONT.xs} color={t.accent}>{current?.name ?? 'HEAD'}</Txt>
-          {identity ? ` as ${identity}` : ''} · ⌘⏎
+          {as?.name ? ` as ${as.name}` : ''} · ⌘⏎
         </Txt>
         <View style={{ flex: 1 }} />
         <Button label={label} primary disabled={!canCommit} onPress={() => commit(push)} icon={push ? 'push' : 'check'} testID="commit-button" />

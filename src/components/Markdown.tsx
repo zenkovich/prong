@@ -110,7 +110,17 @@ function Spans({ c }: { c: Inline[] }) {
             );
           case 'a':
             return (
-              <Text key={i} style={{ color: t.info, textDecorationLine: 'underline' }} onPress={() => void live.openUrl(x.href)} {...({ href: x.href } as any)}>
+              // the link opens in the browser; the <a>'s own navigation would replace Prong's window with the page
+              <Text
+                key={i}
+                style={{ color: t.info, textDecorationLine: 'underline' }}
+                onPress={(e: any) => {
+                  e?.preventDefault?.();
+                  void live.openUrl(x.href);
+                }}
+                {...({ href: x.href } as any)}
+                testID="md-link"
+              >
                 <Spans c={x.c} />
               </Text>
             );

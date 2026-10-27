@@ -1,10 +1,10 @@
-import { appendFileSync, createWriteStream, existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { appendFileSync, createWriteStream, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { homedir, tmpdir } from 'node:os';
 import path from 'node:path';
-import type { Commit, FileChange, Hunk, RepoSnapshot, Sha, Stash } from '../types.js';
-import { hunkPatch, kindOf, LOG_FORMAT, parseDiff, parseLog, parseNumstat, parseRaw, parseRefs, parseRemotes, parseStashList, parseStatus, REC, REF_FORMAT, STASH_FORMAT } from './parse.js';
-import { GIT_BIN, progressOf, runGit, runGitLines, RunOptions } from './run.js';
+import type { Commit, FileChange, FileStatus, Hunk, RepoSnapshot, Sha, Stash, SubmoduleChanges } from '../types.js';
+import { hunkPatch, joinSubmoduleChanges, kindOf, LOG_FORMAT, parseDiff, parseLog, parseNumstat, parseRaw, parseRefs, parseRemotes, parseStashList, parseStatus, REC, REF_FORMAT, STASH_FORMAT } from './parse.js';
+import { GIT_BIN, inRuns, progressOf, runGit, runGitLines, RunOptions } from './run.js';
 import type { NetAuth } from '../auth.js';
 import { spawn } from 'node:child_process';
 
@@ -20,9 +20,72 @@ export interface OpState {
   kind: 'none' | 'merge' | 'rebase' | 'cherry-pick' | 'revert';
   /** branch being rebased, when known */
   detail?: string;
+  /** the message git prepared for the commit that ends a merge, cherry-pick or revert (MERGE_MSG, comments left out) */
+  message?: string;
 }
 
 const LARGE_DIFF_LINES = 4000;
+
+/** files listed from wholly untracked folders, at most: past this a folder stays one row */
+export const UNTRACKED_LIST_MAX = 5000;
+
+/**
+ * The submodules' own changes (see submoduleChanges): a read this recent is reused; the list waits this long for a
+ * read under way before it goes with the last one known (not at all where the last read took longer: a big
+ * submodule's scan takes seconds); this many submodules are read at once; this many of a submodule's files are named.
+ */
+const INSIDE_FRESH_MS = 1500;
+export const INSIDE_WAIT_MS = { value: 400 };
+const INSIDE_JOBS = 4;
+export const INSIDE_FILES = 50;
+/** the last read of each repository's submodules (by folder), and the read under way */
+const insideCache = new Map<string, { at: number; list: SubmoduleChanges[]; took?: number; pending?: Promise<SubmoduleChanges[]> }>();
+/** a new file's lines are counted (its "+N") up to this size, and up to this much is read per status */
+const UNTRACKED_COUNT_FILE_BYTES = 4 * 1024 * 1024;
+const UNTRACKED_COUNT_TOTAL_BYTES = 48 * 1024 * 1024;
+/** counts by absolute path, kept while the file's mtime and size stay */
+const untrackedCounts = new Map<string, { stamp: string; lines: number; binary: boolean }>();
+
+/**
+ * The "+N" of new (untracked) files, which `git diff --numstat` does not cover: their lines, counted here; a file
+ * with a NUL byte is binary. Files too big for it keep 0 and are marked `large` (the diff says so, with "load anyway").
+ */
+function countUntrackedLines(dir: string, list: FileChange[]) {
+  let budget = UNTRACKED_COUNT_TOTAL_BYTES;
+  for (const f of list) {
+    if (f.status !== '?' || f.path.endsWith('/') || f.kind !== 'text') continue;
+    const abs = path.join(dir, f.path);
+    let st;
+    try {
+      st = statSync(abs);
+    } catch {
+      continue;
+    }
+    if (!st.isFile()) continue;
+    const stamp = `${st.mtimeMs}:${st.size}`;
+    let c = untrackedCounts.get(abs);
+    if (!c || c.stamp !== stamp) {
+      if (st.size > UNTRACKED_COUNT_FILE_BYTES || st.size > budget) {
+        if (st.size > UNTRACKED_COUNT_FILE_BYTES) f.kind = 'large';
+        continue;
+      }
+      budget -= st.size;
+      const buf = readFileSync(abs);
+      const binary = buf.subarray(0, 8000).includes(0);
+      let lines = 0;
+      if (!binary) {
+        for (let i = 0; i < buf.length; i++) if (buf[i] === 10) lines++;
+        if (buf.length && buf[buf.length - 1] !== 10) lines++;
+      }
+      c = { stamp, lines, binary };
+      if (untrackedCounts.size > 50_000) untrackedCounts.clear();
+      untrackedCounts.set(abs, c);
+    }
+    if (c.binary) f.kind = 'binary';
+    else f.additions = c.lines;
+  }
+}
+
 /** a commit with more files than this is listed first; each file's diff is read when it is selected */
 export const COMMIT_PATCH_FILES = 300;
 /** a commit (or stash) patch bigger than this is not sent at once either */
@@ -60,6 +123,8 @@ export function humanBytes(n: number) {
 }
 const CACHE_DIR = path.join(process.env.PRONG_STATE_DIR ?? path.join(homedir(), '.prong'), 'cache');
 const perfConfigured = new Set<string>();
+/** numbers the temporary files blobs are extracted into */
+let blobSeq = 0;
 const logCache = new Map<string, { sig: string; limit: number; commits: Commit[] }>();
 const snapCache = new Map<string, unknown>();
 
@@ -71,6 +136,8 @@ export interface Submodule {
   /** ' ' in sync, '-' not initialized, '+' checked-out commit differs from index, 'U' conflicts */
   state: 'ok' | 'uninitialized' | 'modified' | 'conflict';
   describe?: string;
+  /** changes in its own files, as last read (see submoduleChanges) */
+  inside?: { modified: number; untracked: number };
 }
 
 /** what a batch operation did: names done, and each failure with git's reason */
@@ -92,6 +159,14 @@ export function parsePushPorcelain(out: string): Map<string, { ok: boolean; summ
     m.set(to, { ok: p[0] !== '!', summary: p[2].trim() });
   }
   return m;
+}
+
+/**
+ * The revisions a history read walks: `--all` without the stash. `git log --all` also walks refs/stash, and each
+ * stash's own commits ("On main: …", "index on main: …", "untracked files on …") showed in the graph as commits.
+ */
+export function historyRevs(revs: string[]): string[] {
+  return revs.flatMap((r) => (r === '--all' ? ['--exclude=refs/stash', '--all'] : [r]));
 }
 
 /** All git operations for one working copy. Stateless: every call shells out to git. */
@@ -131,7 +206,7 @@ export class Repo {
 
   /** --date-order keeps parents after children (graph-safe) while showing recent work first, so HEAD lands on the first page. */
   async log(limit = 500, revs: string[] = ['--all']): Promise<Commit[]> {
-    const r = await this.git(['log', `--format=${LOG_FORMAT}`, '--date-order', `-n${limit}`, ...revs, '--']);
+    const r = await this.git(['log', `--format=${LOG_FORMAT}`, '--date-order', `-n${limit}`, ...historyRevs(revs), '--']);
     return parseLog(r.stdout);
   }
 
@@ -192,20 +267,170 @@ export class Repo {
   }
 
   async status() {
-    // untracked dirs collapsed and submodule worktrees not scanned: on huge trees this is the difference between 17s and 0.25s
+    // untracked dirs collapsed and submodule worktrees not scanned: on huge trees this is the difference between 17s
+    // and 0.25s. The submodules' own changes are read beside it, each submodule by itself (submoduleChanges)
+    const inside = this.submoduleChanges().catch(() => null);
     const r = await this.git(['status', '--porcelain=v2', '-z', '--branch', '--untracked-files=normal', '--ignore-submodules=dirty', '--no-renames']);
     const st = parseStatus(r.stdout);
-    if (st.unstaged.length + st.staged.length === 0) return st;
-    // +/- counts without loading hunks; sequential so the two processes do not fight over the index
+    // a wholly untracked folder comes as one entry ("Assets/ImageToUI/"): its files are listed (only those
+    // folders are walked, not the whole tree), and new files get their line counts
+    st.unstaged = await this.expandUntrackedDirs(st.unstaged);
+    countUntrackedLines(this.dir, st.unstaged);
+    // a read that takes longer does not hold the list: the last one known goes in, and the client asks for the
+    // fresh one (a submodule with edited files used to be missing from Changes, as Fork lists it)
+    const took = insideCache.get(this.dir)?.took;
+    const wait = took != null && took > INSIDE_WAIT_MS.value ? 0 : INSIDE_WAIT_MS.value;
+    const join = async () => {
+      const fresh = await Promise.race([inside, new Promise<null>((res) => setTimeout(() => res(null), wait).unref?.())]);
+      st.unstaged = joinSubmoduleChanges(st.unstaged, fresh ?? this.knownSubmoduleChanges());
+    };
+    if (st.unstaged.length + st.staged.length === 0) {
+      await join();
+      return st;
+    }
+    // +/- counts without loading hunks; sequential so the two processes do not fight over the index.
+    // --no-renames as the status above: a staged `git mv` is listed as D + A, and each gets its own counts
+    // (with renames numstat names only the new path, 100% similar: "+0 −0" on both rows)
+    const joined = join();
     const [un, idx] = await Promise.all([
-      st.unstaged.length ? this.git(['diff', '--numstat', '-z', '--ignore-submodules=dirty', '--'], { allowFail: true }) : Promise.resolve({ code: 0, stdout: '', stderr: '' }),
-      st.staged.length ? this.git(['diff', '--cached', '--numstat', '-z', '--ignore-submodules=dirty', '--'], { allowFail: true }) : Promise.resolve({ code: 0, stdout: '', stderr: '' }),
+      st.unstaged.length ? this.git(['diff', '--numstat', '-z', '--no-renames', '--ignore-submodules=dirty', '--'], { allowFail: true }) : Promise.resolve({ code: 0, stdout: '', stderr: '' }),
+      st.staged.length ? this.git(['diff', '--cached', '--numstat', '-z', '--no-renames', '--ignore-submodules=dirty', '--'], { allowFail: true }) : Promise.resolve({ code: 0, stdout: '', stderr: '' }),
     ]);
     const unMap = parseNumstat(un.stdout);
     const idxMap = parseNumstat(idx.stdout);
-    for (const f of st.unstaged) Object.assign(f, unMap.get(f.path) ?? {});
-    for (const f of st.staged) Object.assign(f, idxMap.get(f.path) ?? {});
+    const put = (f: FileChange, c?: { additions: number; deletions: number; binary?: boolean }) => {
+      if (!c) return;
+      f.additions = c.additions;
+      f.deletions = c.deletions;
+      // a binary file named like text (data.bin, a .asset): no "+0 −0", its diff is the binary preview
+      if (c.binary && f.kind === 'text') f.kind = 'binary';
+    };
+    await joined;
+    for (const f of st.unstaged) put(f, unMap.get(f.path));
+    for (const f of st.staged) put(f, idxMap.get(f.path));
     return st;
+  }
+
+  /**
+   * The submodules whose own files have changes (edited, new), each read by its own `git status`, a few at a time:
+   * the superproject's status skips them (--ignore-submodules=dirty) because git reads them one after another, and a
+   * big one alone takes seconds. A read within INSIDE_FRESH_MS is reused and one under way is shared. As git status,
+   * it honours `submodule.<name>.ignore` (.git/config over .gitmodules) and then `diff.ignoreSubmodules`.
+   */
+  async submoduleChanges(maxAge = INSIDE_FRESH_MS): Promise<SubmoduleChanges[]> {
+    const c = insideCache.get(this.dir);
+    if (c?.pending) return c.pending;
+    if (c && Date.now() - c.at < maxAge) return c.list;
+    const t0 = Date.now();
+    const pending = this.readSubmoduleChanges().then(
+      (list) => {
+        insideCache.set(this.dir, { at: Date.now(), list, took: Date.now() - t0 });
+        return list;
+      },
+      (e) => {
+        insideCache.set(this.dir, { at: c?.at ?? 0, list: c?.list ?? [], took: c?.took });
+        throw e;
+      },
+    );
+    insideCache.set(this.dir, { at: c?.at ?? 0, list: c?.list ?? [], took: c?.took, pending });
+    return pending;
+  }
+
+  /** the last read of submoduleChanges, without reading (none yet: none) */
+  knownSubmoduleChanges(): SubmoduleChanges[] {
+    return insideCache.get(this.dir)?.list ?? [];
+  }
+
+  private async readSubmoduleChanges(): Promise<SubmoduleChanges[]> {
+    if (!existsSync(path.join(this.dir, '.gitmodules'))) return [];
+    // -z: a name may hold spaces (key and value are split by a newline, entries by NUL)
+    const [gm, local] = await Promise.all([
+      this.git(['config', '-z', '-f', '.gitmodules', '--get-regexp', '^submodule\\..*\\.(path|ignore)$'], { allowFail: true }),
+      this.git(['config', '-z', '--get-regexp', '^(submodule\\..*\\.ignore|diff\\.ignoresubmodules)$'], { allowFail: true }),
+    ]);
+    const byName = new Map<string, { path?: string; ignore?: string }>();
+    const entries = (out: string) => out.split('\0').filter(Boolean).map((e) => [e.slice(0, e.indexOf('\n') < 0 ? e.length : e.indexOf('\n')), e.indexOf('\n') < 0 ? '' : e.slice(e.indexOf('\n') + 1)] as const);
+    for (const [k, v] of entries(gm.stdout)) {
+      const m = k.match(/^submodule\.(.+)\.(path|ignore)$/);
+      if (m) byName.set(m[1], { ...byName.get(m[1]), [m[2]]: v.trim() });
+    }
+    let fallback = 'none';
+    const own = new Map<string, string>();
+    for (const [k, v] of entries(local.stdout)) {
+      if (k === 'diff.ignoresubmodules') fallback = v.trim();
+      const m = k.match(/^submodule\.(.+)\.ignore$/);
+      if (m) own.set(m[1], v.trim());
+    }
+    const subs = [...byName]
+      .map(([name, e]) => ({ path: e.path ?? '', ignore: own.get(name) ?? e.ignore ?? fallback }))
+      // not checked out: nothing of its own to change
+      .filter((s) => s.path && safeRelPath(s.path) && s.ignore !== 'all' && s.ignore !== 'dirty' && existsSync(path.join(this.dir, s.path, '.git')));
+    const read = async (s: { path: string; ignore: string }): Promise<SubmoduleChanges | null> => {
+      // its own nested submodules count as in git status (a changed one is a changed file here)
+      const r = await runGit(['status', '--porcelain=v2', '-z', `--untracked-files=${s.ignore === 'untracked' ? 'no' : 'normal'}`, '--no-renames'], { cwd: path.join(this.dir, s.path), allowFail: true });
+      if (r.code !== 0) return null;
+      const st = parseStatus(r.stdout);
+      const tracked = new Map<string, FileStatus>();
+      for (const f of st.staged) tracked.set(f.path, f.status);
+      const untracked: string[] = [];
+      for (const f of st.unstaged) {
+        if (f.status === '?') untracked.push(f.path);
+        else tracked.set(f.path, f.status);
+      }
+      if (!tracked.size && !untracked.length) return null;
+      const files = [...[...tracked].map(([p, status]) => ({ path: p, status })), ...untracked.map((p) => ({ path: p, status: '?' as FileStatus }))];
+      return { path: s.path, modified: tracked.size, untracked: untracked.length, files: files.slice(0, INSIDE_FILES) };
+    };
+    const out: (SubmoduleChanges | null)[] = [];
+    let next = 0;
+    await Promise.all(
+      Array.from({ length: Math.min(INSIDE_JOBS, subs.length) }, async () => {
+        while (next < subs.length) {
+          const i = next++;
+          out[i] = await read(subs[i]).catch(() => null);
+        }
+      }),
+    );
+    return out.filter((x): x is SubmoduleChanges => !!x).sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
+  }
+
+  /**
+   * The files of the untracked folders git names once ("dir/"), in their place; ignored files are left out. A
+   * folder past the budget (UNTRACKED_LIST_MAX files in all) stays one entry, and so does a nested repository.
+   */
+  private async expandUntrackedDirs(list: FileChange[]): Promise<FileChange[]> {
+    if (!list.some((f) => f.status === '?' && f.path.endsWith('/'))) return list;
+    let budget = UNTRACKED_LIST_MAX;
+    const out: FileChange[] = [];
+    for (const f of list) {
+      if (f.status !== '?' || !f.path.endsWith('/') || budget <= 0) {
+        out.push(f);
+        continue;
+      }
+      const files: string[] = [];
+      let over = false;
+      await runGitLines(
+        ['ls-files', '--others', '--exclude-standard', '-z', '--', `:(literal)${f.path}`],
+        { cwd: this.dir },
+        (p) => {
+          if (!p) return;
+          files.push(p);
+          if (files.length > budget) {
+            over = true;
+            return false;
+          }
+        },
+        '\0',
+      ).catch(() => (over = true));
+      // a nested repository lists as itself ("dir/"): nothing to open
+      if (over || !files.length || (files.length === 1 && files[0] === f.path)) {
+        out.push(f);
+        continue;
+      }
+      budget -= files.length;
+      for (const p of files) out.push({ path: p, status: '?', kind: p.endsWith('/') ? 'text' : kindOf(p), additions: 0, deletions: 0 });
+    }
+    return out;
   }
 
   /** a clone whose history is cut off (`clone --depth`, `.git/shallow`) */
@@ -215,11 +440,28 @@ export class Repo {
   }
 
   async opState(): Promise<OpState> {
-    const g = path.join(this.dir, '.git');
+    // a submodule's (or a worktree's) .git is a file naming the real folder: a conflict there is shown too
+    let g = path.join(this.dir, '.git');
+    try {
+      if (statSync(g).isFile()) {
+        const m = readFileSync(g, 'utf8').match(/^gitdir:\s*(.+)$/m);
+        if (m) g = path.resolve(this.dir, m[1].trim());
+      }
+    } catch {
+      /* not a repository: nothing in progress */
+    }
     if (existsSync(path.join(g, 'rebase-merge')) || existsSync(path.join(g, 'rebase-apply'))) return { kind: 'rebase' };
-    if (existsSync(path.join(g, 'MERGE_HEAD'))) return { kind: 'merge' };
-    if (existsSync(path.join(g, 'CHERRY_PICK_HEAD'))) return { kind: 'cherry-pick' };
-    if (existsSync(path.join(g, 'REVERT_HEAD'))) return { kind: 'revert' };
+    const message = () => {
+      try {
+        const m = readFileSync(path.join(g, 'MERGE_MSG'), 'utf8').split('\n').filter((l) => !l.startsWith('#')).join('\n').trim();
+        return m ? { message: m } : {};
+      } catch {
+        return {};
+      }
+    };
+    if (existsSync(path.join(g, 'MERGE_HEAD'))) return { kind: 'merge', ...message() };
+    if (existsSync(path.join(g, 'CHERRY_PICK_HEAD'))) return { kind: 'cherry-pick', ...message() };
+    if (existsSync(path.join(g, 'REVERT_HEAD'))) return { kind: 'revert', ...message() };
     return { kind: 'none' };
   }
 
@@ -235,7 +477,8 @@ export class Repo {
 
   private refsSig(refs: { name: string; sha: string }[], head: Sha, limit: number) {
     const h = createHash('sha1');
-    h.update(head + '|' + limit + '|');
+    // "nostash": logs cached when the stash's commits were still in them are read again
+    h.update('nostash|' + head + '|' + limit + '|');
     for (const r of refs) h.update(r.name + '=' + r.sha + ';');
     return h.digest('hex');
   }
@@ -279,7 +522,9 @@ export class Repo {
     const [commits, remotes, stashes, op, shallow] = await Promise.all([timed('log', this.cachedLog(limit, refs, head)), this.remotes(), this.stashes(), this.opState(), this.isShallow()]);
     const st = await timed('status', this.status());
     timings.total = Date.now() - t0;
-    const snap = { commits, refs, remotes, stashes, unstaged: st.unstaged, staged: st.staged, head, op, shallow, timings };
+    // no commit yet: no ref names the branch, git status does ("main" after git init)
+    const unborn = !head && st.branch?.head && st.branch.head !== '(detached)' ? st.branch.head : undefined;
+    const snap = { commits, refs, remotes, stashes, unstaged: st.unstaged, staged: st.staged, head, op, shallow, unborn, timings };
     snapCache.set(this.dir, snap);
     try {
       mkdirSync(CACHE_DIR, { recursive: true });
@@ -305,7 +550,7 @@ export class Repo {
 
   /** Next page of history (topo order), for infinite scroll. */
   async logPage(skip: number, limit: number, revs: string[] = ['--all']): Promise<Commit[]> {
-    const r = await this.git(['log', `--format=${LOG_FORMAT}`, '--date-order', `--skip=${skip}`, `-n${limit}`, ...revs, '--']);
+    const r = await this.git(['log', `--format=${LOG_FORMAT}`, '--date-order', `--skip=${skip}`, `-n${limit}`, ...historyRevs(revs), '--']);
     return parseLog(r.stdout);
   }
 
@@ -316,7 +561,7 @@ export class Repo {
   async logPosition(sha: Sha, revs: string[] = ['--all'], max = 200000): Promise<number> {
     let i = 0;
     let found = -1;
-    await runGitLines(['rev-list', '--date-order', `-n${max}`, ...revs, '--'], { cwd: this.dir }, (line) => {
+    await runGitLines(['rev-list', '--date-order', `-n${max}`, ...historyRevs(revs), '--'], { cwd: this.dir }, (line) => {
       if (line === sha) {
         found = i;
         return false;
@@ -336,7 +581,7 @@ export class Repo {
     const n = Math.max(0, max - skip);
     if (n > 0)
       await runGitLines(
-        ['log', `--format=${LOG_FORMAT}`, '--date-order', `--skip=${skip}`, `-n${n}`, ...revs, '--'],
+        ['log', `--format=${LOG_FORMAT}`, '--date-order', `--skip=${skip}`, `-n${n}`, ...historyRevs(revs), '--'],
         { cwd: this.dir },
         (rec) => {
           records.push(rec);
@@ -347,6 +592,38 @@ export class Repo {
       );
     if (at < 0) return { index: -1, commits: [] };
     return { index: skip + at, commits: parseLog(records.join(REC)) };
+  }
+
+  /**
+   * The commit search over the whole history of `revs` (the list can only filter what it has loaded): commits whose
+   * subject, body, author name or e-mail contains `q` (any case), or whose id starts with it, in the order the
+   * history list shows, up to `limit`. One streamed `git log`, stopped at the limit or after `maxScan` commits;
+   * `more`: it stopped before the end.
+   */
+  async searchLog(q: string, revs: string[] = ['--all'], limit = 300, maxScan = 200000): Promise<{ commits: Commit[]; scanned: number; more: boolean }> {
+    const needle = q.trim().toLowerCase();
+    const commits: Commit[] = [];
+    let scanned = 0;
+    let more = false;
+    if (!needle) return { commits, scanned, more };
+    const hit = (c: Commit) => c.subject.toLowerCase().includes(needle) || c.body.toLowerCase().includes(needle) || c.author.toLowerCase().includes(needle) || c.email.toLowerCase().includes(needle) || c.sha.startsWith(needle);
+    await runGitLines(
+      ['log', `--format=${LOG_FORMAT}`, '--date-order', `-n${maxScan}`, ...historyRevs(revs), '--'],
+      { cwd: this.dir },
+      (rec) => {
+        const [c] = parseLog(rec);
+        if (!c) return;
+        scanned++;
+        if (!hit(c)) return;
+        if (commits.length >= limit) {
+          more = true;
+          return false;
+        }
+        commits.push(c);
+      },
+      REC,
+    );
+    return { commits, scanned, more: more || scanned >= maxScan };
   }
 
   /**
@@ -363,7 +640,11 @@ export class Repo {
     for (let hop = 0; hop < 20 && out.length < limit; hop++) {
       const r = await this.git(['log', `--format=${LOG_FORMAT}`, `-n${limit - out.length}`, from, '--', name]);
       const page = parseLog(r.stdout).filter((c) => !seen.has(c.sha));
-      for (const c of page) seen.add(c.sha);
+      for (const c of page) {
+        seen.add(c.sha);
+        // the name it had there: the history shows that file's diff for each commit
+        c.fileName = name;
+      }
       out.push(...page);
       const oldest = page[page.length - 1];
       if (!oldest || !oldest.parents[0] || out.length >= limit) break;
@@ -422,10 +703,12 @@ export class Repo {
     };
     for (let i = 0; i < paths.length; i += 8) await Promise.all(paths.slice(i, i + 8).map(probe));
     const out: Submodule[] = [];
+    const inside = new Map(this.knownSubmoduleChanges().map((c) => [c.path, c]));
     for (const [name, e] of byName) {
       if (!e.path) continue;
       const s = states.get(e.path);
-      out.push({ path: e.path, name, url: e.url ?? '', sha: s?.sha ?? '', state: s?.state ?? 'uninitialized', describe: s?.describe });
+      const c = inside.get(e.path);
+      out.push({ path: e.path, name, url: e.url ?? '', sha: s?.sha ?? '', state: s?.state ?? 'uninitialized', describe: s?.describe, ...(c ? { inside: { modified: c.modified, untracked: c.untracked } } : {}) });
     }
     return out.sort((a, b) => a.path.localeCompare(b.path));
   }
@@ -479,6 +762,10 @@ export class Repo {
   async setRemoteUrl(name: string, url: string) {
     await this.git(['remote', 'set-url', name, url]);
   }
+  /** a new name: git moves its remote branches and the upstreams that point there along */
+  async renameRemote(oldName: string, newName: string) {
+    await this.git(['remote', 'rename', oldName, newName]);
+  }
   async removeRemote(name: string) {
     await this.git(['remote', 'remove', name]);
   }
@@ -492,8 +779,11 @@ export class Repo {
   async checkoutDetached(sha: string) {
     await this.git(['checkout', '--detach', sha]);
   }
+  /** lines added at the end of the root .gitignore (on a line of their own: a file without a final newline gets one) */
   async appendIgnore(pattern: string) {
-    appendFileSync(path.join(this.dir, '.gitignore'), (existsSync(path.join(this.dir, '.gitignore')) && !readFileSync(path.join(this.dir, '.gitignore'), 'utf8').endsWith('\n') ? '\n' : '') + pattern + '\n');
+    const file = path.join(this.dir, '.gitignore');
+    const had = existsSync(file) ? readFileSync(file, 'utf8') : '';
+    appendFileSync(file, (had && !had.endsWith('\n') ? '\n' : '') + pattern + '\n');
   }
   async globalConfig(key: string): Promise<string | null> {
     const r = await this.git(['config', '--global', '--get', key], { allowFail: true });
@@ -518,10 +808,13 @@ export class Repo {
     return parseDiff(r.stdout, { largeThreshold: LARGE_DIFF_LINES });
   }
 
-  /** One file of a commit (or of a stash: `rev` = "stash@{n}"); `force` reads a large diff in full. */
-  async commitFileDiff(rev: string, file: string, oldPath?: string, force = false): Promise<FileChange | null> {
+  /**
+   * One file of a commit (or of a stash: `rev` = "stash@{n}"); `force` reads a large diff in full; `context`: lines
+   * around each change (Expand context).
+   */
+  async commitFileDiff(rev: string, file: string, oldPath?: string, force = false, context = 3): Promise<FileChange | null> {
     const paths = oldPath && oldPath !== file ? [oldPath, file] : [file];
-    const r = await this.git(['show', '--format=', '--no-color', '-U3', '--find-renames', '-m', '--first-parent', rev, '--', ...paths], { maxBytes: FILE_DIFF_BYTES });
+    const r = await this.git(['show', '--format=', '--no-color', `-U${context}`, '--find-renames', '-m', '--first-parent', rev, '--', ...paths], { maxBytes: FILE_DIFF_BYTES });
     const files = parseDiff(r.stdout, { largeThreshold: force ? undefined : LARGE_DIFF_LINES });
     const f = files.find((x) => x.path === file) ?? files[0] ?? null;
     if (f && r.truncated) f.truncated = true;
@@ -536,18 +829,25 @@ export class Repo {
   }
 
   /** Diff of one working-copy file: unstaged (worktree vs index) or staged (index vs HEAD). */
-  async fileDiff(file: string, area: 'unstaged' | 'staged', force = false): Promise<FileChange | null> {
+  async fileDiff(file: string, area: 'unstaged' | 'staged', force = false, context = 3): Promise<FileChange | null> {
+    if (area === 'unstaged') {
+      // a conflicted file: git gives a combined diff ("diff --cc") nothing here reads; its sides instead
+      const conflict = await this.conflictOf(file);
+      if (conflict) return { path: file, status: 'U', kind: conflict.binary ? 'binary' : kindOf(file), additions: 0, deletions: 0, conflict };
+    }
     const args = area === 'staged' ? ['diff', '--cached'] : ['diff'];
-    let r = await this.git([...args, '--no-color', '-U3', '--find-renames', '--', file]);
+    // read up to FILE_DIFF_BYTES, as a commit's file: a generated file of hundreds of megabytes is cut, not a crash
+    let r = await this.git([...args, '--no-color', `-U${context}`, '--find-renames', '--', file], { maxBytes: FILE_DIFF_BYTES });
     if (!r.stdout.trim() && area === 'unstaged') {
       // untracked file: show it as an addition
       const st = await this.git(['status', '--porcelain', '--', file]);
       if (st.stdout.startsWith('??')) {
-        r = await this.git(['diff', '--no-color', '-U3', '--no-index', '--', '/dev/null', file], { allowFail: true });
+        r = await this.git(['diff', '--no-color', '-U3', '--no-index', '--', '/dev/null', file], { allowFail: true, maxBytes: FILE_DIFF_BYTES });
         const [f] = parseDiff(r.stdout.replace(/^diff --git a\/.* b\/(.*)$/m, (_, p) => `diff --git a/${p} b/${p}`), { largeThreshold: force ? undefined : LARGE_DIFF_LINES });
         if (f) {
           f.status = '?';
           f.path = file;
+          if (r.truncated) f.truncated = true;
           return f;
         }
         return null;
@@ -555,6 +855,7 @@ export class Repo {
     }
     const [f] = parseDiff(r.stdout, { largeThreshold: force ? undefined : LARGE_DIFF_LINES });
     if (!f) return null;
+    if (r.truncated) f.truncated = true;
     return f;
   }
 
@@ -612,7 +913,9 @@ export class Repo {
     const out = path.join(dir, `${info.oid}${path.extname(file).toLowerCase()}`);
     if (existsSync(out) && statSync(out).size === info.bytes) return { path: out, bytes: info.bytes };
     mkdirSync(dir, { recursive: true });
-    const tmp = `${out}.${process.pid}.${Date.now()}.part`;
+    // a name of its own per read: two requests for the same blob in the same millisecond (the before and after
+    // panes, a range request) wrote one file, and the second rename failed ("ENOENT … .part", a 500)
+    const tmp = `${out}.${process.pid}.${Date.now()}.${++blobSeq}.part`;
     await new Promise<void>((resolve, reject) => {
       const child = spawn(GIT_BIN, ['cat-file', 'blob', info.oid!], { cwd: this.dir, stdio: ['ignore', 'pipe', 'pipe'] });
       const sink = createWriteStream(tmp);
@@ -664,26 +967,58 @@ export class Repo {
 
   // ---------- staging ----------
 
+  // a folder's worth of paths goes to git in runs that fit a command line
+
   async stage(paths: string[]) {
-    if (paths.length) await this.git(['add', '-A', '--', ...paths]);
+    for (const run of inRuns(paths)) await this.git(['add', '-A', '--', ...run]);
   }
   async stageAll() {
     await this.git(['add', '-A']);
   }
   async unstage(paths: string[]) {
-    if (paths.length) await this.git(['restore', '--staged', '--', ...paths]);
+    for (const run of inRuns(paths)) await this.git(['restore', '--staged', '--', ...run]);
   }
   async unstageAll() {
     await this.git(['reset', '-q']);
   }
-  async discard(paths: string[]) {
-    const tracked: string[] = [];
-    for (const p of paths) {
-      const st = await this.git(['status', '--porcelain', '--', p]);
-      if (st.stdout.startsWith('??')) rmSync(path.join(this.dir, p), { recursive: true, force: true });
-      else tracked.push(p);
+  /** `kept`: repositories of their own among the paths, left alone */
+  async discard(paths: string[]): Promise<{ kept: string[] }> {
+    // which are untracked (deleted from disk) and which git puts back: one status per run, not one per file
+    const untracked = new Set<string>();
+    for (const run of inRuns(paths)) {
+      const st = await this.git(['status', '--porcelain=v1', '-z', '--', ...run]);
+      for (const e of st.stdout.split('\0')) if (e.startsWith('?? ')) untracked.add(e.slice(3));
     }
-    if (tracked.length) await this.git(['checkout', '--', ...tracked]);
+    // status may name an untracked folder ("dir/") for a path inside it, or the files of a folder named "dir/"
+    // (status.showUntrackedFiles=all)
+    const dirs = [...untracked].filter((u) => u.endsWith('/'));
+    const isUntracked = (p: string) => untracked.has(p) || dirs.some((d) => p.startsWith(d)) || (p.endsWith('/') && [...untracked].some((u) => u.startsWith(p)));
+    const tracked: string[] = [];
+    // a repository of its own inside (git lists it as "dir/"): its history is not a change to drop, and the copy for
+    // Undo cannot hold its .git — left alone, as `git clean` leaves it
+    const nested: string[] = [];
+    for (const p of paths) {
+      if (!isUntracked(p)) {
+        tracked.push(p);
+        continue;
+      }
+      if (existsSync(path.join(this.dir, p.replace(/\/+$/, ''), '.git'))) {
+        nested.push(p);
+        continue;
+      }
+      rmSync(path.join(this.dir, p), { recursive: true, force: true });
+      // the files of a new folder go one by one: the folders they leave empty go too
+      for (let d = path.dirname(path.join(this.dir, p.replace(/\/+$/, ''))); d.startsWith(this.dir + path.sep); d = path.dirname(d)) {
+        try {
+          if (readdirSync(d).length) break;
+          rmdirSync(d);
+        } catch {
+          break;
+        }
+      }
+    }
+    for (const run of inRuns(tracked)) await this.git(['checkout', '--', ...run]);
+    return { kept: nested };
   }
   async discardAll() {
     await this.git(['checkout', '--', '.']);
@@ -700,7 +1035,87 @@ export class Repo {
     await this.git(['apply', '--reverse', '--unidiff-zero', '-'], { input: hunkPatch(file, hunk) });
   }
 
-  async resolveConflict(file: string, take: 'ours' | 'theirs') {
+  // ---------- conflicts ----------
+
+  /** the index stages of a conflicted file (1 base, 2 ours, 3 theirs) as object ids; none when it is not conflicted */
+  async stages(file: string): Promise<Record<number, string>> {
+    const r = await this.git(['ls-files', '-u', '-z', '--', `:(literal)${file}`], { allowFail: true });
+    const out: Record<number, string> = {};
+    for (const e of r.stdout.split('\0')) {
+      const m = e.match(/^\d+ ([0-9a-f]{40,64}) ([123])\t/);
+      if (m) out[+m[2]] = m[1];
+    }
+    return out;
+  }
+
+  /**
+   * The stages merged again by `git merge-file` in a temporary folder (the working copy is not touched): `diff3`
+   * marks each conflict with the base between the sides, `union` takes both sides of each one. Null when a side is
+   * binary.
+   */
+  private async mergeStages(st: Record<number, string>, mode: 'diff3' | 'union'): Promise<Buffer | null> {
+    const sides = await Promise.all([st[2], st[1], st[3]].map(async (sha) => (sha ? (await this.git(['cat-file', 'blob', sha], { binary: true })).raw ?? Buffer.alloc(0) : Buffer.alloc(0))));
+    if (sides.some((b) => b.subarray(0, 8000).includes(0))) return null;
+    const tmp = mkdtempSync(path.join(tmpdir(), 'prong-merge-'));
+    try {
+      const files = ['ours', 'base', 'theirs'].map((n, i) => {
+        const f = path.join(tmp, n);
+        writeFileSync(f, sides[i]);
+        return f;
+      });
+      // the exit code is the number of conflicts; a negative one (255) is an error
+      const r = await this.git(['merge-file', '-p', mode === 'diff3' ? '--diff3' : '--union', '-L', 'ours', '-L', 'base', '-L', 'theirs', ...files], { allowFail: true, binary: true });
+      if (r.code < 0 || r.code > 127) throw new Error(r.stderr.trim() || 'git merge-file failed');
+      return r.raw ?? Buffer.alloc(0);
+    } finally {
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  }
+
+  /**
+   * What the three-pane conflict view shows: the conflicting regions of ours, the base and theirs ("⋯" between two
+   * regions), from the index stages — the working copy's own markers lack the base and change as the user edits.
+   * `deleted`: one side removed the file; `binary`: nothing to show, only a side to take. Null: not conflicted.
+   */
+  async conflictOf(file: string): Promise<NonNullable<FileChange['conflict']> | null> {
+    const st = await this.stages(file);
+    if (!st[1] && !st[2] && !st[3]) return null;
+    if (!st[2] || !st[3]) return { ours: [], base: [], theirs: [], deleted: !st[2] ? 'ours' : 'theirs' };
+    const merged = await this.mergeStages(st, 'diff3');
+    if (!merged) return { ours: [], base: [], theirs: [], binary: true };
+    const out: Record<'ours' | 'base' | 'theirs', string[]> = { ours: [], base: [], theirs: [] };
+    let side: 'none' | 'ours' | 'base' | 'theirs' = 'none';
+    let regions = 0;
+    for (const l of merged.toString('utf8').split('\n')) {
+      if (side === 'none' && l.startsWith('<<<<<<< ours')) {
+        if (regions++) for (const k of ['ours', 'base', 'theirs'] as const) out[k].push('⋯');
+        side = 'ours';
+      } else if (side === 'ours' && l.startsWith('||||||| base')) side = 'base';
+      else if ((side === 'ours' || side === 'base') && l === '=======') side = 'theirs';
+      else if (side === 'theirs' && l.startsWith('>>>>>>> theirs')) side = 'none';
+      else if (side !== 'none') out[side].push(l);
+    }
+    return out;
+  }
+
+  /**
+   * Resolves a conflicted file and marks it resolved (staged): `ours` / `theirs` take that side whole (a side that
+   * deleted the file deletes it), `both` keeps both sides of every conflict, ours first.
+   */
+  async resolveConflict(file: string, take: 'ours' | 'theirs' | 'both') {
+    const st = await this.stages(file);
+    if (take === 'both') {
+      if (!st[2] || !st[3]) throw new Error(`${file} was deleted on one side: take ours or theirs`);
+      const merged = await this.mergeStages(st, 'union');
+      if (!merged) throw new Error(`${file} is binary: take ours or theirs`);
+      writeFileSync(path.join(this.dir, file), merged);
+      await this.git(['add', '--', file]);
+      return;
+    }
+    if ((take === 'ours' && st[1] && !st[2]) || (take === 'theirs' && st[1] && !st[3])) {
+      await this.git(['rm', '-q', '--', file]);
+      return;
+    }
     await this.git(['checkout', `--${take}`, '--', file]);
     await this.git(['add', '--', file]);
   }
@@ -1031,7 +1446,7 @@ export class Repo {
    * Interactive rebase driven by a todo list built in the UI. `reword` becomes pick + an exec that
    * amends the message, so no editor is ever opened.
    */
-  async rebaseInteractive(onto: string, todo: RebaseTodoItem[]) {
+  async rebaseInteractive(onto: string, todo: RebaseTodoItem[], opts: { autostash?: boolean } = {}) {
     const lines: string[] = [];
     for (const t of todo) {
       if (t.action === 'drop') continue;
@@ -1044,7 +1459,7 @@ export class Repo {
     const todoPath = path.join(tmp, 'todo');
     writeFileSync(todoPath, lines.join('\n') + '\n');
     try {
-      const r = await this.git(['rebase', '-i', onto], { env: { GIT_SEQUENCE_EDITOR: `cp ${shellQuote(todoPath)}`, GIT_EDITOR: 'true' }, allowFail: true });
+      const r = await this.git(['rebase', '-i', ...(opts.autostash ? ['--autostash'] : []), onto], { env: { GIT_SEQUENCE_EDITOR: `cp ${shellQuote(todoPath)}`, GIT_EDITOR: 'true' }, allowFail: true });
       if (r.code !== 0 && !/CONFLICT/.test(r.stdout + r.stderr)) throw new Error(r.stderr || r.stdout);
       return { conflicts: /CONFLICT/.test(r.stdout + r.stderr) };
     } finally {
@@ -1057,17 +1472,43 @@ export class Repo {
   async rebaseAbort() {
     await this.git(['rebase', '--abort']);
   }
+  /**
+   * Abort of the operation that stopped on conflicts: a merge, and also a cherry-pick or a revert (the conflict bar
+   * and the status panel offer one Abort; `git merge --abort` there failed with "There is no merge to abort").
+   */
   async mergeAbort() {
-    await this.git(['merge', '--abort']);
+    const op = await this.opState();
+    if (op.kind === 'cherry-pick') await this.git(['cherry-pick', '--abort']);
+    else if (op.kind === 'revert') await this.git(['revert', '--abort']);
+    else if (op.kind === 'rebase') await this.git(['rebase', '--abort']);
+    else await this.git(['merge', '--abort']);
+  }
+  /**
+   * Goes on with the rebase, cherry-pick or revert that stopped (on conflicts the user resolved and staged); stopping
+   * again on the next commit's conflicts is not a failure. A merge goes on with a commit (`merge --continue`).
+   */
+  async continueOp(): Promise<{ kind: OpState['kind']; conflicts: boolean }> {
+    const { kind } = await this.opState();
+    if (kind === 'none') throw new Error('No merge, rebase, cherry-pick or revert is in progress.');
+    const cmd = kind === 'merge' ? ['merge', '--continue'] : [kind, '--continue'];
+    const r = await this.git(cmd, { env: { GIT_EDITOR: 'true' }, allowFail: true });
+    const out = r.stdout + r.stderr;
+    if (r.code !== 0 && !/CONFLICT/.test(out)) throw new Error(r.stderr.trim() || r.stdout.trim());
+    return { kind, conflicts: r.code !== 0 };
   }
 
+  /** a merge commit takes its first parent as the mainline (`-m 1`, Fork's default): what the merge brought in */
+  private async mainline(sha: string): Promise<string[]> {
+    const p = await this.git(['rev-list', '--parents', '-n1', sha, '--'], { allowFail: true });
+    return p.stdout.trim().split(/\s+/).length > 2 ? ['-m', '1'] : [];
+  }
   async cherryPick(sha: string) {
-    const r = await this.git(['cherry-pick', sha], { allowFail: true });
+    const r = await this.git(['cherry-pick', ...(await this.mainline(sha)), sha], { allowFail: true });
     if (r.code !== 0 && !/CONFLICT/.test(r.stdout + r.stderr)) throw new Error(r.stderr || r.stdout);
     return { conflicts: /CONFLICT/.test(r.stdout + r.stderr) };
   }
   async revert(sha: string) {
-    const r = await this.git(['revert', '--no-edit', sha], { allowFail: true });
+    const r = await this.git(['revert', '--no-edit', ...(await this.mainline(sha)), sha], { allowFail: true });
     if (r.code !== 0 && !/CONFLICT/.test(r.stdout + r.stderr)) throw new Error(r.stderr || r.stdout);
     return { conflicts: /CONFLICT/.test(r.stdout + r.stderr) };
   }
@@ -1143,6 +1584,15 @@ export class Repo {
   async stashApply(index: number, pop: boolean) {
     await this.git(['stash', pop ? 'pop' : 'apply', `stash@{${index}}`]);
   }
+  /**
+   * `git stash branch`: a new branch at the commit the stash was made on, checked out, the stash applied there and
+   * dropped (kept when it does not apply cleanly). The name it got (see storedBranchName).
+   */
+  async stashBranch(name: string, index: number): Promise<{ name: string }> {
+    const stored = await this.storedBranchName(name);
+    await this.git(['stash', 'branch', stored, `stash@{${index}}`]);
+    return { name: stored };
+  }
   /** what was dropped (its commit and message), for Undo */
   async stashDrop(index: number): Promise<{ sha: string; message: string }> {
     const sha = (await this.git(['rev-parse', `stash@{${index}}`])).stdout.trim();
@@ -1153,10 +1603,25 @@ export class Repo {
 
   // ---------- repository lifecycle ----------
 
-  static async clone(url: string, dest: string, recursive: boolean, onProgress?: Progress) {
-    const args = ['clone', '--progress', ...(recursive ? ['--recurse-submodules'] : []), url, dest];
-    await runGit(args, { cwd: path.dirname(dest), onLine: (l) => onProgress?.(l, progressOf(l)) });
+  /**
+   * `net`: the connection to clone with (an SSH key, an account): the submodules cloned with it use it too — their
+   * git processes inherit its environment and `-c` settings.
+   */
+  static async clone(url: string, dest: string, recursive: boolean, onProgress?: Progress, net?: { env: Record<string, string>; config: string[] } | null, opts: { partial?: boolean } = {}) {
+    const cfg = (net?.config ?? []).flatMap((c) => ['-c', c]);
+    // partial: the history without the contents of old file versions (fetched when needed) — a large repository
+    // arrives in a fraction of the time, and a broken connection costs less
+    const partial = opts.partial ? ['--filter=blob:none', ...(recursive ? ['--also-filter-submodules'] : [])] : [];
+    const args = [...cfg, 'clone', '--progress', ...partial, ...(recursive ? ['--recurse-submodules'] : []), '--', url, dest];
+    await runGit(args, { cwd: path.dirname(dest), onLine: (l) => onProgress?.(l, progressOf(l)), env: net?.env });
     return new Repo(dest);
+  }
+  /** can this address be read with that connection? (`git ls-remote <url> HEAD`, read-only, nothing is written) */
+  static async testClone(url: string, net?: { env: Record<string, string>; config: string[] } | null) {
+    const cfg = (net?.config ?? []).flatMap((c) => ['-c', c]);
+    // outside any repository: in the engine's own folder git would read (or choke on) that folder's .git
+    const r = await runGit([...cfg, 'ls-remote', url, 'HEAD'], { cwd: homedir(), allowFail: true, timeoutMs: 30000, env: net?.env });
+    return { ok: r.code === 0, output: (r.stderr || r.stdout).trim() };
   }
   static async init(dir: string, initialBranch = 'main') {
     await runGit(['init', '-b', initialBranch, dir], { cwd: path.dirname(dir) });

@@ -1,4 +1,4 @@
-import React, { useEffect, useLayoutEffect, useState } from 'react';
+import React, { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { Animated, Easing, Platform, Pressable, ScrollView, StyleSheet, View } from 'react-native';
 import { FONT, useTheme } from '../theme';
 import { closeDialog, dismissToast, getState, hideContextMenu, hidePicker, PickerState, useStore } from '../state/store';
@@ -8,9 +8,16 @@ import { Button, DragHandle, Glass, Input, Kbd, PressScale, ResizeGrip, Txt, noS
 const native = Platform.OS !== 'web';
 
 /** Generic dialog shell: dimmed backdrop (content stays visible through the glass) + frosted card. */
-export function Modal({ title, children, width = 520, footer, onClose, icon, layer }: {
+/** whether the dialog around has been resized by hand (its content may then take all the height) */
+const ModalResized = React.createContext(false);
+export const useModalResized = () => React.useContext(ModalResized);
+
+export function Modal({ title, children, width = 520, footer, onClose, icon, layer, fill, testID }: {
+  testID?: string;
   /** 'error': the error dialog, above every other dialog; Escape closes it alone */
   layer?: 'error';
+  /** the body does not scroll: its content takes the height a resize gives (a list that grows with the window) */
+  fill?: boolean;
   title: string;
   children: React.ReactNode;
   width?: number;
@@ -25,6 +32,8 @@ export function Modal({ title, children, width = 520, footer, onClose, icon, lay
   const [w, setW] = useState(width);
   const [h, setH] = useState<number | null>(null);
   const [pos, setPos] = useState({ x: 0, y: 0 });
+  // the height it has now: a resize starts from it, not from a guess
+  const shown = useRef(420);
   useEffect(() => {
     Animated.timing(v, { toValue: 1, duration: 120 * t.motion, easing: Easing.out(Easing.cubic), useNativeDriver: native }).start();
   }, [v, t.motion]);
@@ -32,8 +41,12 @@ export function Modal({ title, children, width = 520, footer, onClose, icon, lay
   // while the error dialog is open, keys belong to it, not to the dialog underneath (see useKeyboard)
   useKeyboard(
     (e) => {
-      // an open menu or dropdown above the dialog takes the Escape
-      if (e.key === 'Escape' && !e.consumed) close();
+      // an open menu or dropdown above the dialog takes the Escape; the one that closes the dialog is used up
+      // (the sidebar's picked branches stay)
+      if (e.key === 'Escape' && !e.consumed) {
+        e.consume();
+        close();
+      }
     },
     { errorLayer: layer === 'error' },
   );
@@ -42,12 +55,12 @@ export function Modal({ title, children, width = 520, footer, onClose, icon, lay
   const cw = Math.min(w, maxW);
   const ch = h === null ? null : Math.min(h, maxH);
   return (
-    <View style={[StyleSheet.absoluteFill, { zIndex: layer === 'error' ? 120 : 100 }]} pointerEvents="box-none">
+    <View style={[StyleSheet.absoluteFill, { zIndex: layer === 'error' ? 120 : 100 }]} pointerEvents="box-none" testID={layer === 'error' ? 'modal-error' : 'modal'}>
       <Animated.View style={[StyleSheet.absoluteFill, { backgroundColor: t.shadow, opacity: v }]}>
         <Pressable style={StyleSheet.absoluteFill} onPress={close} />
       </Animated.View>
       <View style={[StyleSheet.absoluteFill, { alignItems: 'center', justifyContent: 'center' }]} pointerEvents="box-none">
-        <Animated.View style={{ width: cw, height: ch ?? undefined, maxHeight: maxH, opacity: v, transform: [{ translateX: pos.x }, { translateY: pos.y }, { scale: v.interpolate({ inputRange: [0, 1], outputRange: [0.985, 1] }) }] }}>
+        <Animated.View testID={testID} onLayout={(e) => (shown.current = e.nativeEvent.layout.height)} style={{ width: cw, height: ch ?? undefined, maxHeight: maxH, opacity: v, transform: [{ translateX: pos.x }, { translateY: pos.y }, { scale: v.interpolate({ inputRange: [0, 1], outputRange: [0.985, 1] }) }] }}>
           <Glass style={{ flex: ch ? 1 : undefined, maxHeight: maxH }}>
             <DragHandle onDelta={(dx, dy) => setPos((p) => ({ x: p.x + dx, y: p.y + dy }))}>
               <View style={[styles.cardHeader, { borderColor: t.glassBorder }]}>
@@ -63,14 +76,20 @@ export function Modal({ title, children, width = 520, footer, onClose, icon, lay
                 </PressScale>
               </View>
             </DragHandle>
-            <ScrollView style={{ flexShrink: 1 }} contentContainerStyle={{ padding: 14 }}>
-              {children}
-            </ScrollView>
+            {fill ? (
+              <View style={{ flex: ch ? 1 : undefined, flexShrink: 1, minHeight: 0, padding: 14 }}>
+                <ModalResized.Provider value={ch !== null}>{children}</ModalResized.Provider>
+              </View>
+            ) : (
+              <ScrollView style={{ flexShrink: 1 }} contentContainerStyle={{ padding: 14 }}>
+                {children}
+              </ScrollView>
+            )}
             {footer && <View style={[styles.cardFooter, { borderColor: t.glassBorder }]}>{footer}</View>}
             <ResizeGrip
               onDelta={(dx, dy) => {
                 setW((x) => Math.max(280, Math.min(maxW, x + dx)));
-                setH((y) => Math.max(200, Math.min(maxH, (y ?? Math.min(maxH, 420)) + dy)));
+                setH((y) => Math.max(200, Math.min(maxH, (y ?? shown.current) + dy)));
               }}
             />
           </Glass>
@@ -82,6 +101,15 @@ export function Modal({ title, children, width = 520, footer, onClose, icon, lay
 
 export function ConfirmDialog({ title, message, confirmLabel, danger, onConfirm }: { title: string; message: string; confirmLabel?: string; danger?: boolean; onConfirm: () => void }) {
   const t = useTheme();
+  // Enter answers with the dialog's button, as macOS dialogs do (Escape cancels: the Modal's)
+  useKeyboard((e) => {
+    if (e.key === 'Enter' && !e.meta && !e.shift && !e.consumed) {
+      e.preventDefault();
+      e.consume();
+      closeDialog();
+      onConfirm();
+    }
+  });
   return (
     <Modal
       title={title}
@@ -89,9 +117,10 @@ export function ConfirmDialog({ title, message, confirmLabel, danger, onConfirm 
       icon={<Icon name={danger ? 'warning' : 'info'} size={16} color={danger ? t.warn : t.info} />}
       footer={
         <>
-          <Button label="Cancel" onPress={closeDialog} />
+          <Button label="Cancel" onPress={closeDialog} testID="confirm-cancel" />
           <Button
             label={confirmLabel ?? 'OK'}
+            testID="confirm-ok"
             primary={!danger}
             danger={danger}
             style={{ marginLeft: 8 }}
@@ -103,7 +132,9 @@ export function ConfirmDialog({ title, message, confirmLabel, danger, onConfirm 
         </>
       }
     >
-      <Txt muted>{message}</Txt>
+      <Txt muted testID="confirm-message">
+        {message}
+      </Txt>
     </Modal>
   );
 }
@@ -134,7 +165,7 @@ export function ContextMenuHost() {
   return (
     <View style={[StyleSheet.absoluteFill, { zIndex: 110 }]}>
       <Pressable style={StyleSheet.absoluteFill} onPress={hideContextMenu} onPointerDown={(e: any) => e?.nativeEvent?.button === 2 && hideContextMenu()} />
-      <Animated.View style={[styles.menu, { left: x, top: y, width: menuW, opacity: v }]}>
+      <Animated.View style={[styles.menu, { left: x, top: y, width: menuW, opacity: v }]} testID="context-menu">
         <Glass style={{ paddingVertical: 4 }}>
           {menu.items.map((it, i) =>
             it.separator ? (
@@ -144,6 +175,7 @@ export function ContextMenuHost() {
                 key={i}
                 disabled={it.disabled}
                 scaleTo={1}
+                testID="menu-item"
                 onPress={() => {
                   hideContextMenu();
                   it.onPress?.();
@@ -321,30 +353,41 @@ function ToastCard({ id, text, kind, detail }: { id: number; text: string; kind:
 }
 
 export function ShortcutsDialog() {
+  // every one of them works: ⌘R and ⌃⌥T were shown in menus but did nothing; ⌘Z, ⌘/, zoom and ⌘A were not listed
   const items: [string, string][] = [
     ['⌘ T', 'New tab / open repository'],
     ['⌘ W', 'Close tab'],
+    ['⌘ O', 'Open a local repository'],
+    ['⌘ ⇧ N', 'Clone a repository'],
     ['⌘ 1', 'Local changes'],
     ['⌘ 2', 'All commits'],
     ['⌘ ⏎', 'Commit'],
+    ['⌘ Z', 'Undo the last action'],
     ['⌘ ⇧ F', 'Fetch'],
     ['⌘ ⇧ L', 'Pull'],
     ['⌘ ⇧ P', 'Push'],
+    ['⌘ R', 'Refresh'],
     ['⌘ F', 'Search commits'],
     ['⌘ K', 'Command palette'],
     ['⌘ ,', 'Preferences'],
+    ['⌘ /', 'Keyboard shortcuts'],
     ['⌘ B', 'Toggle sidebar'],
+    ['⌘ + / − / 0', 'Zoom in / out / reset'],
+    ['⌃ ⌥ T', 'Open in Terminal'],
     ['⌘ J', 'Ask the agent (command line)'],
     ['⌘ ⇧ J', 'Agent chat window'],
+    ['↑ / ↓', 'Previous / next commit (Home / End: first / last)'],
+    ['⌘ ⇧ C', 'Copy the selected commit’s SHA'],
     ['← / →', 'Collapse / expand merge'],
     ['Space', 'Stage / unstage selected file'],
+    ['⌘ A', 'Select every file of the list'],
     ['F7 / F8', 'Next / previous hunk'],
     ['Esc', 'Close dialog'],
   ];
   return (
     <Modal title="Keyboard shortcuts" width={440}>
       {items.map(([k, d]) => (
-        <View key={k} style={{ flexDirection: 'row', alignItems: 'center', paddingVertical: 3 }}>
+        <View key={k} style={{ flexDirection: 'row', alignItems: 'center', paddingVertical: 3 }} testID="shortcut-row">
           <Txt style={{ flex: 1 }}>{d}</Txt>
           <Kbd>{k}</Kbd>
         </View>

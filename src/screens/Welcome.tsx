@@ -7,6 +7,30 @@ import { Icon, IconName } from '../ui/Icon';
 import { Badge, Button, FadeIn, Input, PressScale, Row, Txt } from '../ui/primitives';
 import { StatusPanel } from '../components/StatusPanel';
 
+/** an account's sign-in as last checked: ok, expired (sign in again), not reachable, checking */
+export function AccountBadge({ id }: { id: string }) {
+  const t = useTheme();
+  const st = useStore((s) => s.accountStatus[id]);
+  if (!st || st.state === 'checking') return <Badge>…</Badge>;
+  if (st.state === 'ok')
+    return (
+      <Badge bg={t.addBg} color={t.add}>
+        ok
+      </Badge>
+    );
+  if (st.state === 'expired')
+    return (
+      <Badge bg={t.del + '22'} color={t.del}>
+        sign in again
+      </Badge>
+    );
+  return (
+    <Badge bg={t.warn + '22'} color={t.warn}>
+      not checked
+    </Badge>
+  );
+}
+
 export function Welcome() {
   const t = useTheme();
   const repos = useWorkspaceRepos();
@@ -18,6 +42,8 @@ export function Welcome() {
   const engine = useStore((s) => s.engine);
   const scanning = useStore((s) => s.scanning);
   const activeWsObj = workspaces.find((w) => w.id === activeWs);
+  // a repository's changes are known once it has been read (opened) in this session
+  const states = useStore((s) => s.repoStates);
   const [q, setQ] = useState('');
   const list = sortRepos(repos, q);
   return (
@@ -35,9 +61,9 @@ export function Welcome() {
               </Txt>
             </View>
           </View>
-          <Action icon="folder" title="Open" hint="Open a local repository" shortcut="⌘O" onPress={() => openDialog({ type: 'open' })} />
-          <Action icon="clone" title="Clone" hint="From GitHub or any URL" shortcut="⌘⇧N" onPress={() => openDialog({ type: 'clone' })} />
-          <Action icon="plus" title="Init" hint="Create a new repository" onPress={() => openDialog({ type: 'init' })} />
+          <Action icon="folder" title="Open" hint="Open a local repository" shortcut="⌘O" onPress={() => openDialog({ type: 'open' })} testID="action-open" />
+          <Action icon="clone" title="Clone" hint="From GitHub or any URL" shortcut="⌘⇧N" onPress={() => openDialog({ type: 'clone' })} testID="action-clone" />
+          <Action icon="plus" title="Init" hint="Create a new repository" onPress={() => openDialog({ type: 'init' })} testID="action-init" />
           <View style={{ height: 18 }} />
           <Txt label faint style={{ marginBottom: 6 }}>
             ── workspaces
@@ -51,11 +77,12 @@ export function Welcome() {
                 height={26}
                 selected={active}
                 selectMode="soft"
-                onPress={() => switchWorkspace(w.id)}
+                testID={`ws-${w.name}`}
+                onPress={() => switchWorkspace(w.id, true)}
                 style={{ paddingLeft: 6 }}
                 onContextMenu={(x, y) =>
                   showContextMenu(x, y, [
-                    { label: 'Switch', onPress: () => switchWorkspace(w.id) },
+                    { label: 'Switch', onPress: () => switchWorkspace(w.id, true) },
                     { label: 'Edit…', onPress: () => openDialog({ type: 'workspace', id: w.id }) },
                     { label: 'Rescan folder', disabled: !w.rootPath || !engine.online, onPress: () => void live.scanWorkspace(w.id, true) },
                     { label: 'Delete', danger: true, disabled: workspaces.length < 2, onPress: () => deleteWorkspace(w.id) },
@@ -74,7 +101,7 @@ export function Welcome() {
               </Row>
             );
           })}
-          <Row height={26} onPress={() => openDialog({ type: 'workspace' })} style={{ paddingLeft: 6 }}>
+          <Row height={26} onPress={() => openDialog({ type: 'workspace' })} style={{ paddingLeft: 6 }} testID="ws-new">
             <View style={{ width: 12 }} />
             <Icon name="plus" size={12} />
             <Txt size={FONT.sm} muted style={{ marginLeft: 6 }}>
@@ -86,23 +113,21 @@ export function Welcome() {
             ── accounts
           </Txt>
           {accounts.map((a) => (
-            <Row key={a.id} height={28} onPress={() => openDialog({ type: 'accounts', tab: 'github' })} style={{ borderRadius: 0, paddingLeft: 6 }}>
+            <Row key={a.id} height={28} onPress={() => openDialog({ type: 'accounts', tab: 'github' })} style={{ borderRadius: 0, paddingLeft: 6 }} testID={`account-${a.login}`}>
               <Icon name="github" size={14} color={t.text} />
               <Txt size={FONT.sm} style={{ marginLeft: 8, flex: 1 }}>
                 {a.login}
               </Txt>
-              <Badge bg={t.addBg} color={t.add}>
-                ok
-              </Badge>
+              <AccountBadge id={a.id} />
             </Row>
           ))}
-          <Row height={28} onPress={() => openDialog({ type: 'accounts', tab: 'github' })} style={{ borderRadius: 0, paddingLeft: 6 }}>
+          <Row height={28} onPress={() => openDialog({ type: 'accounts', tab: 'github' })} style={{ borderRadius: 0, paddingLeft: 6 }} testID="accounts-add">
             <Icon name="plus" size={13} />
             <Txt size={FONT.sm} muted style={{ marginLeft: 8 }}>
               Add account
             </Txt>
           </Row>
-          <Row height={28} onPress={() => openDialog({ type: 'accounts', tab: 'ssh' })} style={{ borderRadius: 0, paddingLeft: 6 }}>
+          <Row height={28} onPress={() => openDialog({ type: 'accounts', tab: 'ssh' })} style={{ borderRadius: 0, paddingLeft: 6 }} testID="accounts-ssh">
             <Icon name="key" size={13} />
             <Txt size={FONT.sm} muted style={{ marginLeft: 8 }}>
               SSH keys
@@ -122,21 +147,23 @@ export function Welcome() {
             <Txt size={FONT.lg} weight="600">
               Repositories
             </Txt>
-            <Txt size={FONT.sm} muted style={{ marginLeft: 8 }}>
+            <Txt size={FONT.sm} muted style={{ marginLeft: 8 }} numberOfLines={1}>
               @{wsName} · {repos.length}
             </Txt>
+            {/* a long folder shrinks (cut at its end), so the buttons and the filter stay in a narrow window: they used to
+                be pushed out of it */}
             {activeWsObj?.rootPath ? (
-              <PressScale onPress={() => openDialog({ type: 'workspace', id: activeWs })} style={{ marginLeft: 10, flexDirection: 'row', alignItems: 'center' }} scaleTo={0.98}>
+              <PressScale onPress={() => openDialog({ type: 'workspace', id: activeWs })} outerStyle={{ flexShrink: 1, minWidth: 40 }} style={{ marginLeft: 10, flexDirection: 'row', alignItems: 'center' }} scaleTo={0.98} testID="ws-root" label={activeWsObj.rootPath}>
                 <Icon name="folder" size={11} color={t.textFaint} />
-                <Txt size={FONT.xs} faint mono style={{ marginLeft: 4 }} numberOfLines={1}>
+                <Txt size={FONT.xs} faint mono style={{ marginLeft: 4, flexShrink: 1 }} numberOfLines={1}>
                   {activeWsObj.rootPath}
                 </Txt>
               </PressScale>
             ) : null}
-            <View style={{ flex: 1 }} />
-            <Button small label={activeWsObj?.rootPath ? 'Change folder…' : 'Choose folder to scan…'} icon="folder" primary={!activeWsObj?.rootPath && repos.length === 0} style={{ marginRight: 8 }} onPress={() => void live.chooseWorkspaceRoot(activeWs)} />
-            {activeWsObj?.rootPath && <Button small label={scanning === activeWs ? 'Scanning…' : 'Rescan'} icon="refresh" style={{ marginRight: 8 }} disabled={!engine.online || scanning === activeWs} onPress={() => void live.scanWorkspace(activeWs, true)} />}
-            <Input value={q} onChange={setQ} placeholder="filter repositories" slash small style={{ width: 220 }} />
+            <View style={{ flex: 1, minWidth: 8 }} />
+            <Button small label={activeWsObj?.rootPath ? 'Change folder…' : 'Choose folder to scan…'} icon="folder" primary={!activeWsObj?.rootPath && repos.length === 0} style={{ marginRight: 8 }} onPress={() => void live.chooseWorkspaceRoot(activeWs)} testID="ws-choose-folder" />
+            {activeWsObj?.rootPath && <Button small label={scanning === activeWs ? 'Scanning…' : 'Rescan'} icon="refresh" style={{ marginRight: 8 }} disabled={!engine.online || scanning === activeWs} onPress={() => void live.scanWorkspace(activeWs, true)} testID="ws-rescan" />}
+            <Input value={q} onChange={setQ} placeholder="filter repositories" slash small style={{ width: 220 }} testID="repo-filter" />
           </View>
         </FadeIn>
         <ScrollView>
@@ -145,6 +172,7 @@ export function Welcome() {
               <PressScale
                 onPress={() => openRepo(r.id)}
                 scaleTo={0.99}
+                testID={`repo-card-${r.name}`}
                 style={[styles.card, { backgroundColor: t.panel, borderColor: t.border }]}
                 hoverStyle={{ borderColor: t.accent }}
                 onContextMenu={(x, y) =>
@@ -154,7 +182,7 @@ export function Welcome() {
                     { label: 'Reveal in Finder', onPress: () => (r.live && engine.online ? live.revealPath(r.path) : toast('Revealed (mock)', 'info')) },
                     { label: 'Open in Terminal', onPress: () => (r.live && engine.online ? live.openTerminalAt(r.path) : toast('Terminal (mock)', 'info')) },
                     { separator: true },
-                    ...workspaces.filter((w) => w.id !== r.workspace).map((w) => ({ label: `Move to @${w.name}`, onPress: () => moveRepoToWorkspace(r.id, w.id) })),
+                    ...workspaces.filter((w) => w.id !== activeWs).map((w) => ({ label: `Move to @${w.name}`, onPress: () => moveRepoToWorkspace(r.id, w.id) })),
                     { separator: true },
                     { label: 'Remove from list', danger: true, onPress: () => removeRepo(r.id) },
                   ])
@@ -181,12 +209,12 @@ export function Welcome() {
                     <View style={{ alignItems: 'flex-end', marginRight: 10 }}>
                       <View style={{ flexDirection: 'row', alignItems: 'center' }}>
                         <Icon name="branch" size={11} />
-                        <Txt size={FONT.sm} muted style={{ marginLeft: 4 }}>
+                        <Txt size={FONT.sm} muted style={{ marginLeft: 4 }} testID={`repo-branch-${r.name}`}>
                           {r.currentBranch}
                         </Txt>
                       </View>
-                      <Txt size={FONT.xs} faint>
-                        {relTime(r.lastOpened)}
+                      <Txt size={FONT.xs} faint testID={`repo-when-${r.name}`}>
+                        {r.lastOpened ? relTime(r.lastOpened) : 'not opened yet'}
                       </Txt>
                     </View>
                     {r.live ? (
@@ -196,13 +224,16 @@ export function Welcome() {
                     ) : (
                       <Badge style={{ marginRight: 6 }}>mock</Badge>
                     )}
-                    {r.changes > 0 ? (
-                      <Badge bg={t.warn + '33'} color={t.warn}>
-                        {r.changes} changes
-                      </Badge>
-                    ) : (
-                      <Badge>{r.live && !r.currentBranch ? '…' : 'clean'}</Badge>
-                    )}
+                    {/* known once read: an unread one used to show "…" that never filled */}
+                    <View testID={`repo-changes-${r.name}`}>
+                      {r.live && (!states[r.id] || states[r.id].loading) ? null : r.changes > 0 ? (
+                        <Badge bg={t.warn + '33'} color={t.warn}>
+                          {r.changes} change{r.changes === 1 ? '' : 's'}
+                        </Badge>
+                      ) : (
+                        <Badge>clean</Badge>
+                      )}
+                    </View>
                     <View style={{ width: 16, marginLeft: 8, opacity: hovered ? 1 : 0 }}>
                       <Icon name="chevronRight" size={14} color={t.accent} />
                     </View>
@@ -212,7 +243,7 @@ export function Welcome() {
             </FadeIn>
           ))}
           {!engine.online && (
-            <View style={[styles.hint, { borderColor: t.warn + '66', backgroundColor: t.warn + '14' }]}>
+            <View style={[styles.hint, { borderColor: t.warn + '66', backgroundColor: t.warn + '14' }]} testID="engine-offline-hint">
               <Icon name="warning" size={13} color={t.warn} />
               <Txt size={FONT.sm} style={{ marginLeft: 8, flex: 1 }}>
                 Git engine is offline: repositories cannot be opened. Start it with <Txt size={FONT.sm} mono>npm run server</Txt> in the prong folder, or use Prong.app which bundles it.
@@ -220,17 +251,20 @@ export function Welcome() {
             </View>
           )}
           {list.length === 0 && (
-            <Txt muted style={{ paddingVertical: 12 }}>
-              No repositories in @{wsName} yet. Open or clone one, set a root folder for this workspace to discover repositories automatically, or move one here from another workspace.
+            <Txt muted style={{ paddingVertical: 12 }} testID="repo-list-empty">
+              {q.trim() && repos.length
+                ? `No repositories in @${wsName} match “${q.trim()}”.`
+                : `No repositories in @${wsName} yet. Open or clone one, set a root folder for this workspace to discover repositories automatically, or move one here from another workspace.`}
             </Txt>
           )}
           <FadeIn delay={300}>
-            <View style={[styles.drop, { borderColor: t.border }]}>
+            {/* a drop is handled by the window (App: droppedPath); a click opens the Open dialog */}
+            <PressScale onPress={() => openDialog({ type: 'open' })} scaleTo={0.99} style={[styles.drop, { borderColor: t.border }]} hoverStyle={{ borderColor: t.accent }} testID="drop-zone">
               <Icon name="folder" size={18} color={t.textFaint} />
               <Txt size={FONT.sm} faint style={{ marginLeft: 8 }}>
-                Drop a folder here to open it
+                Drop a repository’s path here, or click to open one (⌘O)
               </Txt>
-            </View>
+            </PressScale>
           </FadeIn>
         </ScrollView>
       </View>
@@ -238,10 +272,10 @@ export function Welcome() {
   );
 }
 
-function Action({ icon, title, hint, shortcut, onPress }: { icon: IconName; title: string; hint: string; shortcut?: string; onPress: () => void }) {
+function Action({ icon, title, hint, shortcut, onPress, testID }: { icon: IconName; title: string; hint: string; shortcut?: string; onPress: () => void; testID?: string }) {
   const t = useTheme();
   return (
-    <PressScale onPress={onPress} scaleTo={0.98} style={[styles.action, { borderColor: t.border }]} hoverStyle={{ backgroundColor: t.hover, borderColor: t.borderStrong }}>
+    <PressScale onPress={onPress} testID={testID} scaleTo={0.98} style={[styles.action, { borderColor: t.border }]} hoverStyle={{ backgroundColor: t.hover, borderColor: t.borderStrong }}>
       <View style={[styles.actionIcon, { backgroundColor: t.accentSoft }]}>
         <Icon name={icon} size={16} color={t.accent} />
       </View>

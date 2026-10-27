@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { FileChange } from '../git/types';
-import { buildTree, flatten } from './fileTree';
+import { buildTree, flatten, rowKey } from './fileTree';
 
 const f = (path: string): FileChange => ({ path, status: 'M', kind: 'text', additions: 0, deletions: 0 });
 
@@ -28,5 +28,31 @@ describe('file tree', () => {
     const rows = flatten(tree, 'commit', {});
     expect(rows.filter((r) => r.node.file)).toHaveLength(50000);
     expect(performance.now() - t0).toBeLessThan(1500);
+  });
+});
+
+describe('untracked folders in the tree (homescapes2: sdk/AiHelp/, src/Tests/runtime-test-framework/ …)', () => {
+  const status = [
+    'Server/updater/utils', 'autotests', 'sdk/AppsFlyerChina', 'src/Services/CrossAuth/CrossAuthService.cpp', 'src/Services/CrossAuth/CrossAuthService.h',
+    'src/Services/CrossAuth/TokenProviders/GameCenterCrossAuthTokenProvider.cpp', 'src/Services/SignIn/GameCenterWrapper.cpp', 'vpython',
+    'engine/', 'libs/lib-client/', 'libs/vso/', 'sdk/AiHelp/', 'sdk/Amplitude/', 'sdk/AntiAddiction/', 'sdk/AppsFlyer/', 'src/Tests/runtime-test-framework/',
+  ];
+  const files = status.map((p) => ({ path: p, status: (p.endsWith('/') ? '?' : 'M') as any, kind: 'text' as const, additions: 0, deletions: 0, hunks: [] }));
+
+  it('an untracked folder is one entry with its own name, not a folder holding a nameless file', () => {
+    const rows = flatten(buildTree(files), 'unstaged', {});
+    expect(rows.some((r) => r.node.name === '')).toBe(false);
+    const ai = rows.find((r) => r.node.file?.path === 'sdk/AiHelp/');
+    expect(ai?.node.name).toBe('AiHelp');
+    expect(rows.filter((r) => !r.node.file && r.node.path === 'sdk/AiHelp')).toHaveLength(0);
+  });
+
+  it('every row has its own key, folders open or closed (duplicate keys left stale rows on screen)', () => {
+    const tree = buildTree(files);
+    const states: Record<string, boolean>[] = [{}, { 'tree:unstaged:sdk': true }, { 'tree:unstaged:src': true, 'tree:unstaged:libs': true }];
+    for (const collapsed of states) {
+      const keys = flatten(tree, 'unstaged', collapsed).map(rowKey);
+      expect(new Set(keys).size).toBe(keys.length);
+    }
   });
 });

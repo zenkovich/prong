@@ -62,7 +62,8 @@ export function summarize(actions: string[]) {
   const edited = new Set(actions.filter((a) => /^(Edit|MultiEdit|Write) /.test(a)).map((a) => a.split(' ')[1])).size;
   const cmds = n(/^Bash /);
   const commit = actions.find((a) => /^commit /.test(a));
-  const other = actions.filter((a) => !/^(Read|Edit|MultiEdit|Write|Bash|Grep|Glob) |^commit |^no source changes|^⚠/.test(a)).length;
+  // outcome lines are not steps: the recorded version, the cost
+  const other = actions.filter((a) => !/^(Read|Edit|MultiEdit|Write|Bash|Grep|Glob) |^commit |^no source changes|^⚠|^version v|^cost \$|^done$/.test(a)).length;
   const warn = actions.find((a) => a.startsWith('⚠'));
   return [edited ? `${edited} file${edited > 1 ? 's' : ''} edited` : null, read ? `${read} read` : null, cmds ? `${cmds} command${cmds > 1 ? 's' : ''}` : null, other ? `${other} more step${other > 1 ? 's' : ''}` : null, commit, warn]
     .filter(Boolean)

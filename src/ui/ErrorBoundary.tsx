@@ -48,8 +48,11 @@ const AUTO_WINDOW = 10_000;
 interface Props {
   name: string;
   children: React.ReactNode;
-  /** resets the state that made the panel crash (e.g. deselects the file) */
-  onRecover?: () => void;
+  /**
+   * resets the state that made the panel crash (e.g. deselects the file); a promise (reading the repository again)
+   * is waited for before the panel draws again
+   */
+  onRecover?: () => void | Promise<unknown>;
   /** root boundary: a full-window fallback with reload */
   root?: boolean;
   /** show the error in place right away (no auto-recovery): for previews, where retrying the same file fails again */
@@ -65,6 +68,20 @@ export class ErrorBoundary extends React.Component<Props, State> {
   static contextType = ThemeContext;
   state: State = { failed: false, message: '', crashes: [] };
   private timer: number | null = null;
+  private gone = false;
+
+  /** runs the panel's recovery, then `then` (once a recovery that reads again has its answer) */
+  private recover(then: () => void) {
+    let r: unknown;
+    try {
+      r = this.props.onRecover?.();
+    } catch {
+      /* the recovery itself must never throw */
+    }
+    const after = () => !this.gone && then();
+    if (r && typeof (r as Promise<unknown>).then === 'function') (r as Promise<unknown>).then(after, after);
+    else after();
+  }
 
   static getDerivedStateFromError(e: unknown): Partial<State> {
     return { failed: true, message: e instanceof Error ? e.message : String(e) };
@@ -76,26 +93,20 @@ export class ErrorBoundary extends React.Component<Props, State> {
     const crashes = [...this.state.crashes.filter((t) => now - t < AUTO_WINDOW), now];
     this.setState({ crashes });
     if (!this.props.inline && crashes.length <= AUTO_LIMIT) {
-      try {
-        this.props.onRecover?.();
-      } catch {
-        /* the recovery itself must never throw */
-      }
-      this.timer = setTimeout(() => this.setState({ failed: false }), 60) as unknown as number;
+      this.recover(() => {
+        this.timer = setTimeout(() => this.setState({ failed: false }), 60) as unknown as number;
+      });
     }
   }
 
   componentWillUnmount() {
+    this.gone = true;
     if (this.timer) clearTimeout(this.timer);
   }
 
+  /** Retry: the panel's recovery (a repository view reads the repository again, see App), then it draws again */
   retry = () => {
-    try {
-      this.props.onRecover?.();
-    } catch {
-      /* ignore */
-    }
-    this.setState({ failed: false, crashes: [] });
+    this.recover(() => this.setState({ failed: false, crashes: [] }));
   };
 
   /** the crash, with where it happened in the component tree, to the agent */
@@ -117,7 +128,7 @@ export class ErrorBoundary extends React.Component<Props, State> {
           {this.state.message}
         </Txt>
         <View style={{ flexDirection: 'row', marginTop: 14 }}>
-          <Button label="Retry" primary onPress={this.retry} />
+          <Button label="Retry" primary onPress={this.retry} testID="crash-retry" />
           {this.props.root && typeof location !== 'undefined' && <Button label="Reload" style={{ marginLeft: 8 }} onPress={() => location.reload()} />}
           {assistant && <Button label="Ask AI" icon="agent" style={{ marginLeft: 8 }} onPress={this.askAi} testID="crash-ask-ai" />}
         </View>

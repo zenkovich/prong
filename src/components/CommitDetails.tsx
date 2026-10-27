@@ -1,6 +1,7 @@
 import React from 'react';
 import { ScrollView, StyleSheet, View } from 'react-native';
-import { applyStash, DETAILS_HEADER_MIN, dropStash, findCommit, findHunk, fullDate, openDialog, selectCommit, selectFile, setFileView, setLayout, shortSha, toast, toggleDetailsDesc, useRepo, useStore } from '../state/store';
+import { applyStash, DETAILS_HEADER_MIN, dropStash, findCommit, findHunk, fullDate, openDialog, revealCommit, selectFile, setFileView, setLayout, shortSha, toggleDetailsDesc, useRepo, useStore } from '../state/store';
+import * as live from '../state/live';
 import { FONT, useTheme } from '../theme';
 import { Icon } from '../ui/Icon';
 import { Avatar, Button, Chevron, FadeIn, PressScale, Segmented, Splitter, Txt } from '../ui/primitives';
@@ -20,6 +21,10 @@ export function CommitDetails() {
   const commit = !isStash ? findCommit(repo, repo.selectedCommit) : null;
   const { file } = findHunk(repo);
   const files = stash?.files ?? commit?.files ?? [];
+  // a commit's files come a moment after it is picked: "loading", not "0 files" and "No files"
+  const filesLoading = !!commit && !commit.files;
+  // an empty commit (or a merge that changed nothing against its first parent) has no diff to pick
+  const noChanges = !filesLoading && !!commit && files.length === 0;
   const refs = commit ? repo.refs.filter((r) => r.sha === commit.sha && r.name !== 'origin/HEAD') : [];
 
   if (!commit && !stash)
@@ -74,7 +79,8 @@ export function CommitDetails() {
                   <Txt size={FONT.xs} muted style={{ marginRight: 4 }}>
                     SHA
                   </Txt>
-                  <PressScale onPress={() => toast('Copied', 'info', commit.sha)} scaleTo={0.97}>
+                  {/* it copies (it used to only say "Copied") */}
+                  <PressScale onPress={() => live.copyText(commit.sha)} scaleTo={0.97} label="Copy the SHA" testID="details-sha">
                     <Txt size={FONT.xs} mono color={t.info}>
                       {commit.sha.slice(0, 12)}
                     </Txt>
@@ -85,7 +91,8 @@ export function CommitDetails() {
                     </Txt>
                   )}
                   {commit.parents.map((p) => (
-                    <PressScale key={p} onPress={() => selectCommit(p)} scaleTo={0.97} style={{ marginRight: 6 }}>
+                    // selected and scrolled to in the list, read from git when it is older than what is loaded
+                    <PressScale key={p} onPress={() => revealCommit(p)} scaleTo={0.97} style={{ marginRight: 6 }} label={`Go to the parent ${shortSha(p)}`} testID={`details-parent-${shortSha(p)}`}>
                       <Txt size={FONT.xs} mono color={t.info}>
                         {shortSha(p)}
                       </Txt>
@@ -113,10 +120,11 @@ export function CommitDetails() {
                   stash@{`{${stash.index}}`} · {fullDate(stash.date)}
                 </Txt>
                 <View style={{ flexDirection: 'row', marginTop: 10 }}>
-                  <Button small primary label="Apply" onPress={() => applyStash(stash.index, false)} />
-                  <Button small label="Pop" style={{ marginLeft: 6 }} onPress={() => applyStash(stash.index, true)} />
-                  <Button small label="Drop" danger style={{ marginLeft: 6 }} onPress={() => dropStash(stash.index)} />
-                  <Button small label="Branch from stash" style={{ marginLeft: 6 }} onPress={() => openDialog({ type: 'branch', fromSha: repo.head })} />
+                  <Button small primary label="Apply" onPress={() => applyStash(stash.index, false)} testID="stash-apply" />
+                  <Button small label="Pop" style={{ marginLeft: 6 }} onPress={() => applyStash(stash.index, true)} testID="stash-pop" />
+                  <Button small label="Drop" danger style={{ marginLeft: 6 }} onPress={() => dropStash(stash.index)} testID="stash-drop" />
+                  {/* a branch where the stash was made, with its changes (it made a plain branch at HEAD) */}
+                  <Button small label="Branch from stash" style={{ marginLeft: 6 }} onPress={() => openDialog({ type: 'branch', stash: stash.index })} testID="stash-branch" />
                 </View>
               </>
             )}
@@ -133,7 +141,7 @@ export function CommitDetails() {
       {descOpen && <Splitter orientation="horizontal" testID="details-header-splitter" onDelta={(d) => setLayout({ detailsHeader: Math.max(DETAILS_HEADER_MIN, Math.min(480, headerH + d)) })} />}
       <View style={{ flex: 1, flexDirection: 'row', minHeight: 0 }}>
       <View style={{ width: filesW }}>
-        <View style={{ flexDirection: 'row', alignItems: 'center', paddingHorizontal: 10, height: 24 }}>
+        <View style={{ flexDirection: 'row', alignItems: 'center', paddingHorizontal: 10, height: 24 }} testID="commit-files-header">
           <Txt label faint size={10}>
             ──
           </Txt>
@@ -141,15 +149,27 @@ export function CommitDetails() {
             Files
           </Txt>
           <Txt size={FONT.xs} faint style={{ marginLeft: 6 }}>
-            {files.length}
+            {filesLoading ? '…' : files.length}
           </Txt>
           <View style={{ flex: 1 }} />
           <Segmented value={repo.fileView} onChange={setFileView} options={[{ value: 'list', icon: 'list' }, { value: 'tree', icon: 'tree' }]} />
         </View>
-        <FileList files={files} area={isStash ? 'stash' : 'commit'} selected={repo.selectedFile} onSelect={(p) => selectFile(isStash ? 'stash' : 'commit', p)} filterable={files.length > 6} />
+        {filesLoading ? (
+          <Txt faint size={FONT.sm} style={{ padding: 12 }} testID="commit-files-loading">
+            loading…
+          </Txt>
+        ) : (
+          <FileList files={files} area={isStash ? 'stash' : 'commit'} selected={repo.selectedFile} onSelect={(p) => selectFile(isStash ? 'stash' : 'commit', p)} filterable={files.length > 6} />
+        )}
       </View>
       <Splitter orientation="vertical" onDelta={(d) => setLayout({ files: Math.max(220, Math.min(600, filesW + d)) })} />
-      <DiffView file={file} editable={false} area={isStash ? 'stash' : 'commit'} />
+      {noChanges && !repo.blame ? (
+        <View style={[styles.empty, { backgroundColor: t.panel }]} testID="commit-no-changes">
+          <Txt muted>{commit!.parents.length > 1 ? 'This merge changes nothing against its first parent.' : 'This commit changes no files.'}</Txt>
+        </View>
+      ) : (
+        <DiffView file={file} editable={false} area={isStash ? 'stash' : 'commit'} />
+      )}
       </View>
     </View>
   );

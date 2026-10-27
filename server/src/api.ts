@@ -3,12 +3,12 @@ import { createReadStream, existsSync, mkdirSync, readFileSync, statSync, writeF
 import { homedir } from 'node:os';
 import path from 'node:path';
 import { mimeOf, Repo, RebaseTodoItem, safeRelPath, WORKTREE } from './git/repo.js';
-import { accountAuth, NetAuth, RepoAuth, resolveAuth, sshAuth, sshDir, validKeyPath } from './auth.js';
+import { accountAuth, hostOwner, NetAuth, RepoAuth, resolveAuth, sshAuth, sshDir, validKeyPath } from './auth.js';
 import { allQueues, cancelQueued, LOCK_FILES, onQueueChange, QueueItem, queueFor } from './queue.js';
 import { restoreFromUndo, saveForUndo } from './undo.js';
 import { serveFile } from './http-file.js';
 import { systemFileIcon } from './fileicons.js';
-import { runGit } from './git/run.js';
+import { runGit, withStop } from './git/run.js';
 import { scanRepos } from './scan.js';
 import { loadSession, loadSettings, loadWorkspaces, readJson as readState, saveSession, saveSettings, saveWorkspaces, writeJson, Workspace } from './state.js';
 import { addKeyToAgent, deleteSecret, generateSshKey, getSecret, listSshKeys, openTerminal, openWith, reveal, setSecret, testSsh, which } from './system.js';
@@ -29,7 +29,7 @@ import type { FileChange, Hunk } from './types.js';
  *   POST /api/repos/open   { path }       → validates and registers a repository
  *   POST /api/repos/clone  { url, dir, recursive } → long operation (opId)
  *   POST /api/repos/init   { path }
- *   POST /api/repos/forget { path }; POST /api/repos/move { path, workspace }
+ *   POST /api/repos/forget { path }; POST /api/repos/move { path, workspace, from? }; POST /api/repos/pin { path, pinned }
  *   POST /api/repo/<op>    { path, ...args } → see OPS below; long ops return { opId }
  *   GET/PUT /api/workspaces, /api/settings; POST /api/scan { path, depth }
  *   POST /api/system/{open,reveal,terminal}; /api/ssh/{keys,generate,agentAdd,test}
@@ -37,7 +37,7 @@ import type { FileChange, Hunk } from './types.js';
  *   GET /api/agent/check; POST /api/agent/run { prompt, cwd, mode } → long op streaming text; POST /api/ops/cancel { opId }
  *   GET  /api/blob?repo&rev&file   → file content at a revision (WORKTREE, :0 or any rev), byte ranges
  *   GET  /api/fileicon?ext         → the OS icon for a file extension (png/svg)
- *   POST /api/app/{prepare,record,revert,versions,rebuild,factory} { sources } → agent versions of Prong's own
+ *   POST /api/app/{prepare,record,revert,versions,diff,rebuild,factory} { sources } → agent versions of Prong's own
  *        sources (shadow git repository) and the interface build the desktop app serves
  *   GET  /*                  → static web build when PRONG_WEB_DIR is set (desktop app shell)
  */
@@ -73,6 +73,29 @@ interface KnownRepo {
   pinned?: boolean;
   /** how git signs in to its remotes; submodules and nested repositories inherit it (see auth.ts) */
   auth?: RepoAuth;
+  /**
+   * removed from the list ("Remove from list") while a workspace's scan still finds it: kept so the next scan does
+   * not add it again; not listed; opening it again (Open, Clone) brings it back
+   */
+  hidden?: boolean;
+  /** workspaces it was moved out of: their scans no longer list it there */
+  excluded?: string[];
+}
+
+/** the branch a repository is on, from its HEAD file (no git process: the start screen lists every repository) */
+function headBranch(dir: string): string {
+  try {
+    let gd = path.join(dir, '.git');
+    if (statSync(gd).isFile()) {
+      const m = /^gitdir:\s*(.+)$/m.exec(readFileSync(gd, 'utf8'));
+      if (!m) return '';
+      gd = path.resolve(dir, m[1].trim());
+    }
+    const head = readFileSync(path.join(gd, 'HEAD'), 'utf8').trim();
+    return head.startsWith('ref: refs/heads/') ? head.slice('ref: refs/heads/'.length) : '';
+  } catch {
+    return '';
+  }
 }
 
 function loadRepos(): KnownRepo[] {
@@ -125,7 +148,7 @@ async function asAccount<T>(acc: TokenAccount, call: (token: string) => Promise<
  */
 const UNQUEUED = new Set([
   'snapshot', 'snapshotCached', 'status', 'log', 'commitFiles', 'commitFileDiff', 'logUntil', 'logPosition', 'stashFiles', 'fileDiff', 'mediaSides', 'blobFile', 'blame',
-  'config', 'globalConfig', 'logPage', 'logFile', 'fileAt', 'submodules', 'submoduleCommits', 'submoduleRange', 'changedSubmodules', 'authInfo', 'setAuth', 'testAuth',
+  'config', 'globalConfig', 'logPage', 'logFile', 'searchLog', 'fileAt', 'submodules', 'submoduleChanges', 'submoduleCommits', 'submoduleRange', 'changedSubmodules', 'authInfo', 'setAuth', 'testAuth',
   'fetch', 'unshallow', 'followAllBranches', 'pull', 'push', 'pushTag', 'submoduleUpdate', 'pushBranches', 'removeLock',
 ]);
 /** what the queue shows for an operation: "Checkout ver/925", "Stage hunk" */
@@ -159,6 +182,19 @@ function refNames(v: unknown): string[] {
   if (!Array.isArray(v) || v.length === 0 || v.length > 1000) throw new HttpError(400, 'bad branch list');
   for (const n of v) if (typeof n !== 'string' || !n || n.startsWith('-') || /[\0\s~^:?*[\\]/.test(n)) throw new HttpError(400, `bad branch name ${String(n)}`);
   return v as string[];
+}
+
+/** a commit id from the client (never an option) */
+function commitId(v: unknown): string {
+  const s = String(v ?? '');
+  if (!/^[0-9a-f]{4,64}$/.test(s)) throw new HttpError(400, `bad commit ${s}`);
+  return s;
+}
+
+/** lines of diff context from the client (Expand context): 3 by default, a whole number up to a million */
+function contextLines(v: unknown): number {
+  const n = Math.floor(Number(v));
+  return Number.isFinite(n) && n >= 0 ? Math.min(n, 1_000_000) : 3;
 }
 
 /** a remote's name from the client: one git cannot read as an option or a path outside */
@@ -196,8 +232,9 @@ export function createApi(opts: { log?: (s: string) => void } = {}) {
     const ctl = new AbortController();
     running.set(opId, ctl);
     emit({ opId, label, progress: 0 });
-    const work = () => fn((line, p) => emit({ opId, label, line, progress: p }), ctl.signal);
-    (dir ? queueFor(dir).run(label, work) : work())
+    // Stop kills the git processes of the work (runGit reads the signal from withStop), or takes it out of the queue
+    const work = () => withStop(ctl.signal, () => fn((line, p) => emit({ opId, label, line, progress: p }), ctl.signal));
+    (dir ? queueFor(dir).run(label, work, ctl.signal) : work())
       .then(() => emit({ opId, label, done: true, progress: 1 }))
       .catch((err: Error) => emit({ opId, label, done: true, error: ctl.signal.aborted ? 'Stopped' : err.message }))
       .finally(() => running.delete(opId));
@@ -230,6 +267,31 @@ export function createApi(opts: { log?: (s: string) => void } = {}) {
     throw new HttpError(400, 'unknown SSH key or account');
   };
 
+  /** a repository address from the client: one git cannot read as an option */
+  const cloneAddress = (v: unknown) => {
+    const s = String(v ?? '').trim();
+    if (!s || s.startsWith('-') || /[\0\n\r]/.test(s)) throw new HttpError(400, 'bad repository address');
+    return s;
+  };
+  /**
+   * Which connection to suggest for cloning an address: the one set for a registered repository whose origin has
+   * the same host and owner (an organization's repositories usually share a key), with that repository's name.
+   */
+  const cloneHint = async (address: string): Promise<{ auth: RepoAuth; from: string } | null> => {
+    const want = hostOwner(address);
+    if (!want) return null;
+    const repos = loadRepos();
+    // a repository with its own setting first (homescapes, rather than its submodule that inherits it)
+    for (const r of [...repos].sort((a, b) => (a.auth ? 0 : 1) - (b.auth ? 0 : 1))) {
+      const own = resolveAuth(repos, r.path);
+      if (!own || own.auth.kind === 'default' || !existsSync(r.path)) continue;
+      const origin = (await runGit(['config', '--get', 'remote.origin.url'], { cwd: r.path, allowFail: true })).stdout.trim();
+      const have = hostOwner(origin);
+      if (have && have.host === want.host && have.owner.toLowerCase() === want.owner.toLowerCase()) return { auth: own.auth, from: r.name };
+    }
+    return null;
+  };
+
   const repoOf = (body: any): Repo => {
     const p = expandHome(String(body?.path ?? ''));
     if (!p || !Repo.isRepo(p)) throw new HttpError(400, `Not a git repository: ${p}`);
@@ -246,7 +308,7 @@ export function createApi(opts: { log?: (s: string) => void } = {}) {
     commitFileDiff: async (b) => {
       if (!safeRelPath(String(b.file)) || (b.oldPath && !safeRelPath(String(b.oldPath)))) throw new HttpError(400, 'bad path');
       if (!/^([0-9a-f]{4,64}|stash@\{\d+\})$/.test(String(b.rev))) throw new HttpError(400, 'bad revision');
-      return repoOf(b).commitFileDiff(String(b.rev), String(b.file), b.oldPath ? String(b.oldPath) : undefined, !!b.force);
+      return repoOf(b).commitFileDiff(String(b.rev), String(b.file), b.oldPath ? String(b.oldPath) : undefined, !!b.force, contextLines(b.context));
     },
     logUntil: async (b) => {
       if (!/^[0-9a-f]{40,64}$/.test(String(b.sha))) throw new HttpError(400, 'bad commit id');
@@ -257,7 +319,7 @@ export function createApi(opts: { log?: (s: string) => void } = {}) {
       return repoOf(b).logPosition(String(b.sha), safeRevs(b.revs), Math.min(Number(b.max) || 200000, 1000000));
     },
     stashFiles: async (b) => repoOf(b).stashFiles(b.index),
-    fileDiff: async (b) => repoOf(b).fileDiff(b.file, b.area, !!b.force),
+    fileDiff: async (b) => repoOf(b).fileDiff(b.file, b.area, !!b.force, contextLines(b.context)),
     mediaSides: async (b) => repoOf(b).mediaSides(String(b.file), String(b.area), b.oldPath ? String(b.oldPath) : undefined),
     blobFile: async (b) => {
       const f = await repoOf(b).materializeBlob(String(b.rev), String(b.file));
@@ -276,8 +338,8 @@ export function createApi(opts: { log?: (s: string) => void } = {}) {
     discard: async (b) => {
       const r = repoOf(b);
       const undo = await saveForUndo(r, b.paths);
-      await r.discard(b.paths);
-      return { undo };
+      const { kept } = await r.discard(b.paths);
+      return { undo, kept };
     },
     discardAll: async (b) => {
       const r = repoOf(b);
@@ -296,7 +358,12 @@ export function createApi(opts: { log?: (s: string) => void } = {}) {
       await r.discardHunk(f, b.hunk as Hunk);
       return { undo };
     },
-    resolveConflict: async (b) => repoOf(b).resolveConflict(b.file, b.take),
+    resolveConflict: async (b) => {
+      // "both" writes the file: a path inside the repository only
+      if (!safeRelPath(String(b.file))) throw new HttpError(400, 'bad path');
+      if (!['ours', 'theirs', 'both'].includes(b.take)) throw new HttpError(400, 'take ours, theirs or both');
+      return repoOf(b).resolveConflict(String(b.file), b.take);
+    },
     commit: async (b) => ({ sha: await repoOf(b).commit(b.message, { amend: !!b.amend }) }),
     checkout: async (b) => repoOf(b).checkout(refNames([b.ref])[0]),
     checkoutWithStash: async (b) => repoOf(b).checkoutWithStash(refNames([b.ref])[0], b.start ? refNames([b.start])[0] : undefined),
@@ -331,13 +398,15 @@ export function createApi(opts: { log?: (s: string) => void } = {}) {
     createTag: async (b) => repoOf(b).createTag(b.name, b.sha ?? 'HEAD', b.message),
     deleteTag: async (b) => repoOf(b).deleteTag(b.name),
     merge: async (b) => repoOf(b).merge(b.source, { noFf: !!b.noFf, squash: !!b.squash }),
-    rebase: async (b) => repoOf(b).rebase(b.onto, { preserveMerges: !!b.preserveMerges, autostash: !!b.autostash }),
-    rebaseInteractive: async (b) => repoOf(b).rebaseInteractive(b.onto, b.todo as RebaseTodoItem[]),
+    rebase: async (b) => repoOf(b).rebase(refNames([b.onto])[0], { preserveMerges: !!b.preserveMerges, autostash: !!b.autostash }),
+    rebaseInteractive: async (b) => repoOf(b).rebaseInteractive(refNames([b.onto])[0], b.todo as RebaseTodoItem[], { autostash: !!b.autostash }),
     rebaseContinue: async (b) => repoOf(b).rebaseContinue(),
     rebaseAbort: async (b) => repoOf(b).rebaseAbort(),
     mergeAbort: async (b) => repoOf(b).mergeAbort(),
-    cherryPick: async (b) => repoOf(b).cherryPick(b.sha),
-    revert: async (b) => repoOf(b).revert(b.sha),
+    // whichever of merge, rebase, cherry-pick and revert is in progress
+    continueOp: async (b) => repoOf(b).continueOp(),
+    cherryPick: async (b) => repoOf(b).cherryPick(commitId(b.sha)),
+    revert: async (b) => repoOf(b).revert(commitId(b.sha)),
     reset: async (b) => {
       const mode = ['soft', 'mixed', 'hard', 'keep'].includes(b.mode) ? b.mode : 'mixed';
       if (!/^[0-9a-f]{4,64}$/.test(String(b.sha)) && !/^HEAD[~^]?\d*$/.test(String(b.sha))) throw new HttpError(400, 'bad commit');
@@ -378,15 +447,18 @@ export function createApi(opts: { log?: (s: string) => void } = {}) {
     stashPush: async (b) => repoOf(b).stashPush(b.message ?? '', !!b.keepIndex, b.includeUntracked !== false),
     stashApply: async (b) => repoOf(b).stashApply(b.index, !!b.pop),
     stashDrop: async (b) => repoOf(b).stashDrop(b.index),
+    stashBranch: async (b) => repoOf(b).stashBranch(refNames([b.name])[0], Math.max(0, Math.floor(Number(b.index) || 0))),
     config: async (b) => ({ value: await repoOf(b).config(b.key) }),
     setConfig: async (b) => repoOf(b).setConfig(b.key, b.value),
     logPage: async (b) => repoOf(b).logPage(b.skip ?? 0, b.limit ?? 300, safeRevs(b.revs)),
+    searchLog: async (b) => repoOf(b).searchLog(String(b.q ?? '').slice(0, 500), safeRevs(b.revs), Math.min(Math.max(1, Number(b.limit) || 300), 5000), Math.min(Math.max(1, Number(b.maxScan) || 200000), 1000000)),
     logFile: async (b) => {
       if (b.from !== undefined && !/^[0-9a-f]{40,64}$/.test(String(b.from))) throw new HttpError(400, 'bad revision');
       return repoOf(b).logFile(b.file, b.limit ?? 200, b.from ?? 'HEAD');
     },
     fileAt: async (b) => ({ content: await repoOf(b).fileAt(b.rev, b.file) }),
     submodules: async (b) => repoOf(b).submodules(),
+    submoduleChanges: async (b) => repoOf(b).submoduleChanges(),
     submoduleSync: async (b) => repoOf(b).submoduleSync(),
     submoduleCommits: async (b) => {
       if (!safeRelPath(String(b.sub))) throw new HttpError(400, 'bad submodule path');
@@ -432,11 +504,18 @@ export function createApi(opts: { log?: (s: string) => void } = {}) {
     },
     addRemote: async (b) => repoOf(b).addRemote(b.name, b.url),
     setRemoteUrl: async (b) => repoOf(b).setRemoteUrl(b.name, b.url),
+    renameRemote: async (b) => {
+      if (!/^[A-Za-z0-9._\/-]+$/.test(String(b.newName)) || String(b.newName).startsWith('-')) throw new HttpError(400, 'bad remote name');
+      return repoOf(b).renameRemote(String(b.oldName), String(b.newName));
+    },
     removeRemote: async (b) => repoOf(b).removeRemote(b.name),
     pruneRemote: async (b) => repoOf(b).pruneRemote(b.name),
     pushTag: async (b) => {
       const r = repoOf(b);
-      return longOp(`Pushing tag ${b.tag}`, async () => r.pushTag(b.remote ?? 'origin', b.tag), r.dir);
+      // names git cannot read as options
+      const remote = remoteName(b.remote ?? 'origin');
+      const tag = refNames([b.tag])[0];
+      return longOp(`Pushing tag ${tag}`, async () => r.pushTag(remote, tag), r.dir);
     },
     checkoutDetached: async (b) => repoOf(b).checkoutDetached(b.sha),
     appendIgnore: async (b) => repoOf(b).appendIgnore(b.pattern),
@@ -520,12 +599,30 @@ export function createApi(opts: { log?: (s: string) => void } = {}) {
         });
         return;
       }
-      if (req.method === 'GET' && url.pathname === '/api/repos') return json(200, loadRepos());
+      // what the start screen lists: the hidden ones left out, each with the branch it is on
+      if (req.method === 'GET' && url.pathname === '/api/repos') return json(200, loadRepos().filter((r) => !r.hidden).map((r) => ({ ...r, branch: headBranch(r.path) })));
       if (req.method === 'GET' && url.pathname === '/api/workspaces') return json(200, loadWorkspaces());
       if (req.method === 'GET' && url.pathname === '/api/session') return json(200, loadSession());
       if (req.method === 'GET' && url.pathname === '/api/settings') return json(200, loadSettings());
       if (req.method === 'GET' && url.pathname === '/api/ssh/keys') return json(200, await listSshKeys());
       if (req.method === 'GET' && url.pathname === '/api/accounts') return json(200, readState<any[]>('accounts.json', []));
+      // whether each account's sign-in still works (renewed on the way when it can be): shown by the start screen,
+      // Accounts and Clone instead of an "ok" that checks nothing
+      if (req.method === 'GET' && url.pathname === '/api/accounts/check') {
+        const out: Record<string, { state: 'ok' | 'expired' | 'error'; message?: string }> = {};
+        await Promise.all(
+          readState<any[]>('accounts.json', []).map(async (acc) => {
+            try {
+              await asAccount(acc, (token) => github.validateToken(acc.host, token));
+              out[acc.id] = { state: 'ok' };
+            } catch (e) {
+              const message = String((e as Error)?.message ?? e);
+              out[acc.id] = { state: /sign in again/i.test(message) ? 'expired' : 'error', message };
+            }
+          }),
+        );
+        return json(200, out);
+      }
       if (req.method === 'GET' && url.pathname === '/api/agent/check') return json(200, await checkClaude(loadSettings().agent.cliPath));
       if ((req.method === 'GET' || req.method === 'HEAD') && url.pathname === '/api/blob') {
         // a file at a revision (or the working copy), with byte ranges for <video>/<audio>
@@ -588,7 +685,8 @@ export function createApi(opts: { log?: (s: string) => void } = {}) {
             .map((r) => {
               if (!inRoot(r.path)) return r;
               const set = new Set(r.workspaces ?? []);
-              if (top.has(r.path)) set.add(ws);
+              // a workspace it was moved out of does not take it back
+              if (top.has(r.path) && !(r.excluded ?? []).includes(ws)) set.add(ws);
               else set.delete(ws);
               return { ...r, workspaces: [...set] };
             })
@@ -661,6 +759,17 @@ export function createApi(opts: { log?: (s: string) => void } = {}) {
         if (!acc) throw new HttpError(400, 'Unknown account');
         if (op === 'repos') return json(200, await asAccount(acc, (token) => github.listRepos(acc.host, token, body.page ?? 1)));
         if (op === 'addKey') return json(200, await asAccount(acc, (token) => github.addSshKey(acc.host, token, String(body.title), String(body.key))));
+        // what the sign-in can see: a GitHub App's token reaches public repositories and those where the app is
+        // installed, so an organization's private ones are missing until it is installed there
+        if (op === 'access')
+          return json(
+            200,
+            await asAccount(acc, async (token) => {
+              const kind = token.startsWith('ghu_') ? 'app' : token.startsWith('gho_') ? 'oauth' : /^(ghp_|github_pat_)/.test(token) ? 'pat' : 'unknown';
+              const installations = kind === 'app' ? await github.userInstallations(acc.host, token).catch(() => []) : [];
+              return { kind, installations };
+            }),
+          );
         throw new HttpError(404, `Unknown github op ${op}`);
       }
       // ---------- Prong's own sources: agent versions and the interface build ----------
@@ -678,6 +787,7 @@ export function createApi(opts: { log?: (s: string) => void } = {}) {
         if (op === 'record') return json(200, await app.record(String(body.message ?? 'agent change'), body.before ?? {}));
         if (op === 'revert') return json(200, { sha: await app.revert(String(body.sha)) });
         if (op === 'versions') return json(200, await app.versions());
+        if (op === 'diff') return json(200, { diff: await app.diff(String(body.sha ?? '')) });
         if (op === 'rebuild') {
           if (!WEB_DIR) return json(200, { opId: null, skipped: 'the interface is served by a dev server, which reloads by itself' });
           return json(
@@ -720,19 +830,38 @@ export function createApi(opts: { log?: (s: string) => void } = {}) {
         if (!Repo.isRepo(p)) throw new HttpError(400, `Not a git repository: ${p}`);
         const prev = loadRepos().find((r) => r.path === p);
         const list = loadRepos().filter((r) => r.path !== p);
-        const entry: KnownRepo = { ...(prev ?? {}), path: p, name: path.basename(p), workspace: body.workspace ?? prev?.workspace ?? 'work', lastOpened: Date.now() };
+        const ws = body.workspace ?? prev?.workspace ?? 'work';
+        // opened again: listed again (a "Remove from list" is undone), in the workspace it is opened from
+        const entry: KnownRepo = { ...(prev ?? {}), path: p, name: path.basename(p), workspace: ws, lastOpened: Date.now(), hidden: undefined, excluded: prev?.excluded?.filter((w) => w !== ws) };
         saveRepos([entry, ...list]);
         return json(200, entry);
       }
       if (req.method === 'POST' && url.pathname === '/api/repos/move') {
         const p = expandHome(String(body.path ?? ''));
         const ws = String(body.workspace ?? 'work');
-        saveRepos(loadRepos().map((r) => (r.path === p ? { ...r, workspace: ws } : r)));
+        // `from`: the workspace it is taken out of; when that workspace's scan lists it, the scan stops listing it
+        // there (it used to stay, the move looked like it did nothing)
+        const from = body.from ? String(body.from) : null;
+        saveRepos(
+          loadRepos().map((r) => {
+            if (r.path !== p) return r;
+            const out = from && from !== ws;
+            const excluded = [...new Set([...(r.excluded ?? []), ...(out ? [from] : [])])].filter((w) => w !== ws);
+            return { ...r, workspace: ws, workspaces: out ? (r.workspaces ?? []).filter((w) => w !== from) : r.workspaces, excluded: excluded.length ? excluded : undefined };
+          }),
+        );
+        return json(200, { ok: true });
+      }
+      if (req.method === 'POST' && url.pathname === '/api/repos/pin') {
+        const p = expandHome(String(body.path ?? ''));
+        saveRepos(loadRepos().map((r) => (r.path === p ? { ...r, pinned: body.pinned ? true : undefined } : r)));
         return json(200, { ok: true });
       }
       if (req.method === 'POST' && url.pathname === '/api/repos/forget') {
         const p = expandHome(String(body.path ?? ''));
-        saveRepos(loadRepos().filter((r) => r.path !== p));
+        // one a workspace's scan lists would be added again by the next scan: it stays, hidden, until it is opened
+        // again or no scan finds it any more
+        saveRepos(loadRepos().flatMap((r) => (r.path !== p ? [r] : (r.workspaces ?? []).length ? [{ path: r.path, name: r.name, workspace: r.workspace, workspaces: r.workspaces, lastOpened: 0, hidden: true }] : [])));
         return json(200, { ok: true });
       }
       if (req.method === 'POST' && url.pathname === '/api/repos/init') {
@@ -743,15 +872,30 @@ export function createApi(opts: { log?: (s: string) => void } = {}) {
       }
       if (req.method === 'POST' && url.pathname === '/api/repos/clone') {
         const dir = expandHome(String(body.dir ?? ''));
-        const name = String(body.name ?? path.basename(String(body.url)).replace(/\.git$/, ''));
+        const cloneUrl = cloneAddress(body.url);
+        const name = body.name ? String(body.name).trim() : path.basename(cloneUrl.replace(/\/+$/, '')).replace(/\.git$/, '').replace(/^.*:/, '');
+        // one folder inside the parent folder
+        if (!name || name === '.' || name === '..' || /[/\\\0]/.test(name)) throw new HttpError(400, `Not a folder name: "${name}"`);
         const dest = path.join(dir, name);
         if (existsSync(dest)) throw new HttpError(400, `Already exists: ${dest}`);
+        // the connection chosen in the dialog; otherwise that of a registered folder it lands in
+        const auth = 'auth' in body ? checkAuth(body.auth) : null;
+        const net = auth ? await netAuthOf(auth, name) : Repo.auth ? await Repo.auth(dest) : null;
         const op = longOp(`Cloning ${name}`, async (p) => {
-          await Repo.clone(String(body.url), dest, !!body.recursive, p);
+          await Repo.clone(cloneUrl, dest, !!body.recursive, p, net, { partial: !!body.partial });
+          // fetch, pull and push of the new repository (and its submodules) sign in the same way from now on
           const list = loadRepos().filter((r) => r.path !== dest);
-          saveRepos([{ path: dest, name, workspace: body.workspace ?? 'work', lastOpened: Date.now() }, ...list]);
+          saveRepos([{ path: dest, name, workspace: body.workspace ?? 'work', lastOpened: Date.now(), ...(auth && auth.kind !== 'default' ? { auth } : {}) }, ...list]);
         });
         return json(200, { ...op, path: dest });
+      }
+      // the connection the user's other repositories of that owner use (homescapes for Playrix/township): no network
+      if (req.method === 'POST' && url.pathname === '/api/repos/cloneHint') return json(200, await cloneHint(cloneAddress(body.url)));
+      // can the address be read with this connection? read-only, before cloning
+      if (req.method === 'POST' && url.pathname === '/api/repos/cloneTest') {
+        const auth = checkAuth(body.auth);
+        const net = auth ? await netAuthOf(auth, 'clone') : null;
+        return json(200, { ...(await Repo.testClone(cloneAddress(body.url), net)), describe: net?.describe ?? 'system default' });
       }
       if (req.method === 'GET' && url.pathname === '/api/queue') return json(200, allQueues());
       if (req.method === 'POST' && url.pathname === '/api/queue/cancel') return json(200, { cancelled: cancelQueued(Number(body.id)) });

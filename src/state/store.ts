@@ -1,5 +1,5 @@
 import { useMemo, useSyncExternalStore } from 'react';
-import { Commit, FetchOptions, FileChange, GitHubAccount, PullOptions, PushOptions, QueueItem, RepoInfo, RepoSnapshot, Sha, SshKey, Stash, SyncPrefs, Workspace } from '../git/types';
+import { Commit, FetchOptions, FileChange, GitHubAccount, PullOptions, PushOptions, QueueItem, RepoAuth, RepoInfo, RepoSnapshot, Sha, SshKey, Stash, SyncPrefs, Workspace } from '../git/types';
 import { buildSmallSnapshot, buildSnapshot, cloneFile, fakeSha, WORKSPACES } from '../git/mock/fixtures';
 import { SCHEMES, ThemeName, UI_SCALES, THEMES } from '../theme';
 import { AgentMessage, AgentSettings, AgentTarget, AppMods, AppVersion, FACTORY_MODS } from '../agent/types';
@@ -46,18 +46,32 @@ export interface RepoState extends RepoSnapshot {
   submodules?: Submodule[];
   historyPath?: string | null;
   historyCommits?: Commit[];
-  blame?: { path: string; lines: { sha: string; author: string; date: number; line: string }[] } | null;
+  /** `loading`: the lines are on their way (an empty file has none) */
+  blame?: { path: string; lines: { sha: string; author: string; date: number; line: string }[]; loading?: boolean } | null;
   loadingMore?: boolean;
   logExhausted?: boolean;
   /** live repos: commits for the current branch filter, fetched from the engine (null = all) */
   filteredCommits?: Commit[] | null;
   /** the filtered history has no more pages */
   filterExhausted?: boolean;
+  /** the folder is not a repository any more (deleted, moved, renamed): its path; the tab says so */
+  missing?: string;
+  /**
+   * live repositories: what the commit search found in the whole history (the list filters only what is loaded);
+   * `commits` null while git looks; `more`: there are more matches than were read
+   */
+  searchResults?: { q: string; commits: Commit[] | null; more: boolean } | null;
   /** scroll the commit list to this commit (nonce: a new request for the same commit) */
   reveal?: { sha: Sha; nonce: number } | null;
   /** branches picked with ⌘/Shift in the sidebar for a batch action, and the last one clicked (Shift runs) */
   refSelection: string[];
   refAnchor: string | null;
+  /**
+   * Changes' files picked together with ⌘/Shift (two or more, all in `selectedArea`; empty: just `selectedFile`), and
+   * the last one clicked (Shift runs). The diff shows `selectedFile`.
+   */
+  fileSelection: string[];
+  fileAnchor: string | null;
 }
 
 /** one choice of a dropdown (`showPicker`): what it sets, how it reads, a quiet note on the right */
@@ -92,13 +106,15 @@ export type Dialog =
   | { type: 'clone'; url?: string }
   | { type: 'open' }
   | { type: 'init' }
-  | { type: 'accounts'; tab?: 'github' | 'ssh' | 'general' }
+  /** `token`: straight to signing in with a personal access token */
+  | { type: 'accounts'; tab?: 'github' | 'ssh' | 'general'; token?: boolean }
   | { type: 'rebase'; onto?: string; interactive?: boolean; fromSha?: Sha }
   /** `branch`: the local branch to push (the current one when not given) */
   | { type: 'push'; branch?: string }
   | { type: 'pull' }
   | { type: 'fetch' }
-  | { type: 'branch'; fromSha?: Sha }
+  /** `stash`: "Branch from stash" (the branch starts where that stash was made and gets its changes) */
+  | { type: 'branch'; fromSha?: Sha; /** the branch or tag it starts from (the sidebar's menus) */ fromName?: string; stash?: number }
   | { type: 'merge'; source?: string }
   | { type: 'tag'; sha: Sha }
   | { type: 'reset'; sha: Sha }
@@ -237,6 +253,8 @@ export interface AppState {
   syncPrefs: SyncPrefs;
   /** what can be undone, per repository (newest last) */
   undo: Record<string, UndoEntry[]>;
+  /** whether each GitHub account's sign-in works, by account id (checked at start and after signing in) */
+  accountStatus: Record<string, { state: 'ok' | 'expired' | 'error' | 'checking'; message?: string }>;
   /** the repository list of the start page as a popup (the + in the tab bar, ⌘T), at a window position */
   repoPicker: { x: number; y: number } | null;
   layout: { sidebar: number; details: number; files: number; commitBox: number; detailsHeader: number };
@@ -312,6 +330,7 @@ let state: AppState = {
   picker: null,
   syncPrefs: { fetchRemote: '', fetchPrune: true, fetchTags: false, pullAutostash: false, pushTags: false },
   undo: {},
+  accountStatus: {},
   repoPicker: null,
   layout: { sidebar: 230, details: 0.46, files: 300, commitBox: 170, detailsHeader: 130 },
   commitDescOpen: true,
@@ -379,6 +398,8 @@ export const EMPTY_REPO: RepoState = {
   loadedLarge: {},
   refSelection: [],
   refAnchor: null,
+  fileSelection: [],
+  fileAnchor: null,
 };
 
 function activeRepo(): RepoState | null {
@@ -494,10 +515,9 @@ export function setTheme(theme: ThemeName) {
   live.persistUi({ theme });
 }
 export function toggleTheme() {
-  setState((s) => {
-    const i = SCHEMES.findIndex((x) => x.id === s.theme);
-    return { theme: SCHEMES[(i + 1) % SCHEMES.length].id };
-  });
+  const i = SCHEMES.findIndex((x) => x.id === state.theme);
+  // remembered like a scheme picked in Preferences (the palette's "Next colour scheme" used to be lost on reload)
+  setTheme(SCHEMES[(i + 1) % SCHEMES.length].id);
 }
 export function setUiScale(uiScale: number) {
   const v = Math.min(2, Math.max(0.6, Math.round(uiScale * 100) / 100));
@@ -545,12 +565,20 @@ export function useWorkspaceRepos(): RepoInfo[] {
   return useMemo(() => repos.filter((r) => inWorkspace(r, ws)), [repos, ws]);
 }
 
-export function switchWorkspace(id: string) {
+/**
+ * Makes another workspace active, with the tabs it had. `stayHome`: switched from the start screen's list of
+ * workspaces — the start screen stays and shows that workspace's repositories (it used to jump into the
+ * workspace's last tab).
+ */
+export function switchWorkspace(id: string, stayHome = false) {
   if (id === state.activeWorkspace || !state.workspaces.some((w) => w.id === id)) return;
   const saved = state.workspaceTabs[id] ?? { tabs: [], activeTab: null };
   const workspaceTabs = { ...state.workspaceTabs, [state.activeWorkspace]: { tabs: state.tabs, activeTab: state.activeTab } };
   delete workspaceTabs[id];
-  setState({ activeWorkspace: id, workspaceTabs, tabs: saved.tabs, activeTab: saved.activeTab, screen: saved.activeTab ? 'repo' : 'welcome', dialog: null, contextMenu: null });
+  const screen = saved.activeTab && !(stayHome && state.screen === 'welcome') ? 'repo' : 'welcome';
+  setState({ activeWorkspace: id, workspaceTabs, tabs: saved.tabs, activeTab: saved.activeTab, screen, dialog: null, contextMenu: null });
+  // a tab restored from the last session is read when it is first shown
+  if (screen === 'repo' && saved.activeTab && !state.repoStates[saved.activeTab] && state.repos.find((r) => r.id === saved.activeTab)?.live) void live.openLive(saved.activeTab);
   toast(`Workspace: ${state.workspaces.find((w) => w.id === id)?.name}`, 'info');
 }
 
@@ -583,6 +611,9 @@ export function deleteWorkspace(id: string) {
   const target = state.workspaces.find((w) => w.id !== id)!;
   confirm(`Delete workspace ${ws?.name}?`, `Its repositories move to "${target.name}". Nothing is deleted on disk.`, () => {
     if (state.activeWorkspace === id) switchWorkspace(target.id);
+    // the engine keeps each repository's own workspace: left at the deleted one, the workspace came back (named by
+    // its id) on the next launch
+    for (const r of state.repos) if (r.live && r.path && r.workspace === id) void live.client.moveRepo(r.path, target.id).catch(() => {});
     setState((s) => {
       const workspaceTabs = { ...s.workspaceTabs };
       delete workspaceTabs[id];
@@ -596,11 +627,16 @@ export function deleteWorkspace(id: string) {
   }, 'Delete', true);
 }
 
+/**
+ * Moves a repository out of the active workspace into another: out of the active one's list even when its folder
+ * scan finds it (the scan stops listing it there; it used to stay, the move seemed to do nothing).
+ */
 export function moveRepoToWorkspace(repoId: string, workspace: string) {
   const info = state.repos.find((r) => r.id === repoId);
-  if (info?.live && info.path) void live.client.moveRepo(info.path, workspace).catch(() => {});
-  setState((s) => ({ repos: s.repos.map((r) => (r.id === repoId ? { ...r, workspace } : r)), tabs: s.tabs.filter((t) => t !== repoId), activeTab: s.activeTab === repoId ? null : s.activeTab }));
-  if (state.activeTab === null && state.screen === 'repo') setState({ screen: 'welcome' });
+  const from = state.activeWorkspace;
+  if (info?.live && info.path) void live.client.moveRepo(info.path, workspace, from).catch(() => {});
+  if (state.tabs.includes(repoId)) closeTab(repoId);
+  setState((s) => ({ repos: s.repos.map((r) => (r.id === repoId ? { ...r, workspace, workspaces: from !== workspace ? r.workspaces?.filter((w) => w !== from) : r.workspaces } : r)) }));
   toast(`Moved to ${state.workspaces.find((w) => w.id === workspace)?.name}`, 'info');
 }
 export function setLayout(patch: Partial<AppState['layout']>) {
@@ -608,6 +644,8 @@ export function setLayout(patch: Partial<AppState['layout']>) {
   if (patch.sidebar !== undefined) live.persistUi({ sidebarWidth: patch.sidebar });
   if (patch.commitBox !== undefined) live.persistUi({ commitBoxHeight: patch.commitBox });
   if (patch.detailsHeader !== undefined) live.persistUi({ detailsHeaderHeight: patch.detailsHeader });
+  // the history / details split is remembered too (it used to be back at the default after a reload)
+  if (patch.details !== undefined) live.persistUi({ detailsRatio: patch.details });
 }
 export function toggleCommitDesc() {
   const v = !state.commitDescOpen;
@@ -619,12 +657,91 @@ export function toggleDetailsDesc() {
   setState({ detailsDescOpen: v });
   live.persistUi({ detailsDescOpen: v });
 }
-/** a commit in whatever history is loaded: the main log, the branch-filtered log or a file history */
+/** a commit in whatever history is loaded: the main log, the branch-filtered log, a file history, search results */
 export function findCommit(r: RepoState, sha: Sha | null | undefined): Commit | undefined {
   if (!sha) return undefined;
-  return r.commits.find((c) => c.sha === sha) ?? r.filteredCommits?.find((c) => c.sha === sha) ?? r.historyCommits?.find((c) => c.sha === sha);
+  return r.commits.find((c) => c.sha === sha) ?? r.filteredCommits?.find((c) => c.sha === sha) ?? r.historyCommits?.find((c) => c.sha === sha) ?? r.searchResults?.commits?.find((c) => c.sha === sha);
 }
 /** a ⌘ / Shift click on a branch row; `order` is the order the sidebar shows (Shift runs) */
+/** the Changes files an action applies to in `area`: the picked ones, or the selected one */
+export function pickedFiles(r: RepoState | null | undefined, area: 'unstaged' | 'staged'): string[] {
+  if (!r || r.selectedArea !== area) return [];
+  const list = area === 'unstaged' ? r.unstaged : r.staged;
+  // (a folder's pick can be thousands of files)
+  const shown = new Set(list.map((f) => f.path));
+  const picked = r.fileSelection.filter((p) => shown.has(p));
+  if (picked.length > 1) return picked;
+  return r.selectedFile && list.some((f) => f.path === r.selectedFile) ? [r.selectedFile] : [];
+}
+/**
+ * ⌘ / Shift on a Changes file (as on branches): ⌘ toggles it, Shift picks the run from the last clicked one in the
+ * order the list shows. A pick in the other list starts over there. The diff follows the clicked file.
+ */
+export function clickFileSelection(area: 'unstaged' | 'staged', path: string, mods: { meta: boolean; shift: boolean }, order: string[]) {
+  const r = activeRepo();
+  if (!r) return;
+  const same = r.selectedArea === area;
+  const base = same ? (r.fileSelection.length > 1 ? r.fileSelection : r.selectedFile ? [r.selectedFile] : []) : [];
+  const n = nextSelection(base, same ? r.fileAnchor ?? r.selectedFile : null, path, mods, order);
+  setFileSelection(area, n.sel, n.sel.includes(path) ? path : n.sel.at(-1) ?? path, n.anchor ?? path);
+}
+/**
+ * A click on a Changes folder picks the files under it (`inside`, in the order shown), as a click on a file picks
+ * that file: plain, the folder alone; ⌘, its files join the selection (or leave it, when all were in); Shift, the run
+ * from the last clicked file to the folder, the folder whole. The diff shows its first file.
+ */
+export function clickFolderSelection(area: 'unstaged' | 'staged', inside: string[], mods: { meta: boolean; shift: boolean }, order: string[]) {
+  const r = activeRepo();
+  if (!r || !inside.length) return;
+  const same = r.selectedArea === area;
+  const base = same ? (r.fileSelection.length > 1 ? r.fileSelection : r.selectedFile ? [r.selectedFile] : []) : [];
+  if (mods.shift) {
+    const anchor = same ? r.fileAnchor ?? r.selectedFile : null;
+    // the run reaches the folder's near end; the rest of the folder joins it
+    const at = anchor ? order.indexOf(anchor) : -1;
+    const near = at >= 0 && at > order.indexOf(inside[0]) ? inside[0] : inside[inside.length - 1];
+    const n = nextSelection(base, anchor, near, mods, order);
+    const had = new Set(n.sel);
+    return setFileSelection(area, [...n.sel, ...inside.filter((p) => !had.has(p))], near, n.anchor ?? near);
+  }
+  if (mods.meta) {
+    const had = new Set(base);
+    if (inside.every((p) => had.has(p))) {
+      const out = new Set(inside);
+      const rest = base.filter((p) => !out.has(p));
+      return rest.length ? setFileSelection(area, rest, rest[rest.length - 1], rest[rest.length - 1]) : undefined;
+    }
+    return setFileSelection(area, [...base, ...inside.filter((p) => !had.has(p))], inside[0], inside[0]);
+  }
+  setFileSelection(area, inside, inside[0], inside[0]);
+}
+/** the picked files of a list (one or none: a plain selection), the one the diff shows, the anchor of Shift runs */
+export function setFileSelection(area: 'unstaged' | 'staged', paths: string[], focus?: string, anchor?: string) {
+  const sel = [...new Set(paths)];
+  const shown = focus ?? sel.at(-1) ?? null;
+  updateRepo({ fileSelection: sel.length > 1 ? sel : [], fileAnchor: anchor ?? shown });
+  if (shown) selectFile(area, shown, true);
+}
+export function clearFileSelection() {
+  if (activeRepo()?.fileSelection.length) updateRepo({ fileSelection: [] });
+}
+/** `what`: the folder the files are (the action is named for it) */
+export function stageFiles(paths: string[], what?: string) {
+  if (live.isLiveActive()) return live.stageFiles(paths, what);
+  paths.forEach(stageFile);
+  updateRepo({ fileSelection: [] });
+}
+export function unstageFiles(paths: string[], what?: string) {
+  if (live.isLiveActive()) return live.unstageFiles(paths, what);
+  paths.forEach(unstageFile);
+  updateRepo({ fileSelection: [] });
+}
+export function discardFiles(paths: string[], what?: string) {
+  if (live.isLiveActive()) return live.discardFiles(paths, what);
+  if (paths.length === 1) return discardFile(paths[0]);
+  confirm(`Discard ${paths.length} files?`, 'Their changes are dropped (mock).', () => updateRepo((r) => ({ unstaged: r.unstaged.filter((f) => !paths.includes(f.path)), fileSelection: [] })), 'Discard', true);
+}
+
 export function clickRefSelection(name: string, mods: { meta: boolean; shift: boolean }, order: string[]) {
   updateRepo((r) => {
     const n = nextSelection(r.refSelection, r.refAnchor, name, mods, order);
@@ -708,10 +825,19 @@ export function openRepo(id: string) {
   });
 }
 
+/**
+ * Closes a tab. The active one hands over to its neighbour (the next one, else the one before), which is read
+ * first when it has not been shown yet (a tab restored from the last session: it used to show an empty
+ * repository). The start screen stays the start screen.
+ */
 export function closeTab(id: string) {
+  const at = state.tabs.indexOf(id);
   const tabs = state.tabs.filter((t) => t !== id);
-  const activeTab = state.activeTab === id ? tabs[tabs.length - 1] ?? null : state.activeTab;
-  setState({ tabs, activeTab, screen: activeTab ? 'repo' : 'welcome' });
+  if (state.activeTab !== id) return setState({ tabs });
+  const next = tabs[Math.min(Math.max(0, at), tabs.length - 1)] ?? null;
+  const onStart = state.screen === 'welcome';
+  setState({ tabs, activeTab: next, screen: next && !onStart ? 'repo' : 'welcome' });
+  if (next && !onStart) activateTab(next);
 }
 
 export function goWelcome() {
@@ -728,21 +854,26 @@ export function activateTab(id: string) {
 }
 
 export function togglePin(id: string) {
+  const info = state.repos.find((r) => r.id === id);
+  // kept by the engine: a pin used to be lost on the next launch
+  if (info?.live && info.path) void live.client.pinRepo(info.path, !info.pinned).catch((e) => toast('Could not save the pin', 'error', String(e?.message ?? e)));
   setState((s) => ({ repos: s.repos.map((r) => (r.id === id ? { ...r, pinned: !r.pinned } : r)) }));
 }
 
 export function removeRepo(id: string) {
   const info = state.repos.find((r) => r.id === id);
   if (info?.live && info.path) void live.client.forgetRepo(info.path).catch(() => {});
-  setState((s) => ({ repos: s.repos.filter((r) => r.id !== id), tabs: s.tabs.filter((t) => t !== id) }));
+  if (state.tabs.includes(id)) closeTab(id);
+  setState((s) => ({ repos: s.repos.filter((r) => r.id !== id), activeTab: s.activeTab === id ? null : s.activeTab }));
 }
 
-export function cloneRepo(url: string, dir: string, recursive: boolean) {
+/** `name`: the folder made in `dir` (the address's last part when not given) */
+export function cloneRepo(url: string, dir: string, recursive: boolean, auth?: RepoAuth | null, partial = false, name?: string) {
   if (!state.engine.online) {
     toast('Git engine is offline', 'error', 'start it with npm run server (or use Prong.app)');
     return;
   }
-  void live.clone(url, dir, recursive);
+  void live.clone(url, dir, recursive, auth, partial, name);
 }
 
 export function openLocalRepo(path: string) {
@@ -787,13 +918,16 @@ export function selectStash(index: number) {
   });
 }
 
-export function selectFile(area: Area, path: string) {
-  if (live.isLiveActive()) return live.selectFile(area, path);
-  updateRepo({ selectedArea: area, selectedFile: path });
+/** `keepPicked`: the ⌘/Shift selection stays (a click within it); otherwise this file alone */
+export function selectFile(area: Area, path: string, keepPicked = false) {
+  if (live.isLiveActive()) return live.selectFile(area, path, keepPicked);
+  updateRepo(keepPicked ? { selectedArea: area, selectedFile: path } : { selectedArea: area, selectedFile: path, fileSelection: [], fileAnchor: path });
 }
 
 export function setSearch(search: string) {
   updateRepo({ search });
+  // a live repository searches the whole history too (a moment after the typing stops)
+  if (live.isLiveActive()) live.searchCommitsSoon();
 }
 export function setGraphFilter(patch: Partial<GraphFilter>) {
   updateRepo((r) => ({ graphFilter: { ...r.graphFilter, ...patch } }));
@@ -831,6 +965,10 @@ export function toggleMerge(sha: Sha) {
 }
 export function setMergeCollapsed(sha: Sha, collapsed: boolean) {
   updateRepo((r) => {
+    // ← on a plain commit folds nothing (it used to mark it, and the graph drew it as a folded merge)
+    const c = findCommit(r, sha);
+    if (collapsed && (!c || c.parents.length < 2)) return {};
+    if (!collapsed && !r.collapsedMerges[sha]) return {};
     const collapsedMerges = { ...r.collapsedMerges };
     if (collapsed) collapsedMerges[sha] = true;
     else delete collapsedMerges[sha];
@@ -868,7 +1006,7 @@ export function setCommitAction(commitAction: 'commit' | 'commit-push') {
   live.persistUi({ commitAction });
 }
 /** Applies persisted UI preferences (engine settings or local storage) without writing them back. */
-export function applyUiPrefs(ui: Partial<{ theme: string; uiScale: number; fileView: 'list' | 'tree'; diffMode: 'unified' | 'split'; sidebarWidth: number; submoduleView: 'list' | 'tree'; commitAction: 'commit' | 'commit-push'; commitBoxHeight: number; detailsHeaderHeight: number; commitDescOpen: boolean; detailsDescOpen: boolean; sync: Partial<SyncPrefs> }>) {
+export function applyUiPrefs(ui: Partial<{ theme: string; uiScale: number; fileView: 'list' | 'tree'; diffMode: 'unified' | 'split'; sidebarWidth: number; submoduleView: 'list' | 'tree'; commitAction: 'commit' | 'commit-push'; commitBoxHeight: number; detailsHeaderHeight: number; commitDescOpen: boolean; detailsDescOpen: boolean; detailsRatio: number; sync: Partial<SyncPrefs> }>) {
   setState((s) => ({
     syncPrefs: ui.sync ? { ...s.syncPrefs, ...ui.sync } : s.syncPrefs,
     commitDescOpen: ui.commitDescOpen ?? s.commitDescOpen,
@@ -884,6 +1022,7 @@ export function applyUiPrefs(ui: Partial<{ theme: string; uiScale: number; fileV
       ...(ui.sidebarWidth ? { sidebar: Math.max(170, Math.min(420, ui.sidebarWidth)) } : {}),
       ...(ui.commitBoxHeight ? { commitBox: Math.max(COMMIT_BOX_MIN, Math.min(640, ui.commitBoxHeight)) } : {}),
       ...(ui.detailsHeaderHeight ? { detailsHeader: Math.max(DETAILS_HEADER_MIN, Math.min(480, ui.detailsHeaderHeight)) } : {}),
+      ...(ui.detailsRatio ? { details: Math.max(0.2, Math.min(0.8, ui.detailsRatio)) } : {}),
     },
     repoStates: ui.fileView || ui.diffMode ? Object.fromEntries(Object.entries(s.repoStates).map(([k, r]) => [k, { ...r, fileView: ui.fileView ?? r.fileView, diffMode: ui.diffMode ?? r.diffMode }])) : s.repoStates,
   }));
@@ -904,15 +1043,20 @@ export function setCommitMessage(commitMessage: string) {
 export function setCommitDescription(commitDescription: string) {
   updateRepo({ commitDescription });
 }
+/**
+ * Amend on: an empty box gets the last commit's message (what is typed stays). Off: that loaded message goes
+ * again, unless it was edited; a message the user typed stays (unticking used to wipe it).
+ */
 export function toggleAmend() {
   updateRepo((r) => {
     const amend = !r.amend;
-    if (amend && !r.commitMessage) {
-      const head = r.commits.find((c) => c.sha === r.head);
-      return { amend, commitMessage: head?.subject ?? '', commitDescription: head?.body ?? '' };
-    }
-    return { amend, commitMessage: amend ? r.commitMessage : '', commitDescription: amend ? r.commitDescription : '' };
+    const head = r.commits.find((c) => c.sha === r.head);
+    if (amend) return !r.commitMessage.trim() && !r.commitDescription.trim() ? { amend, commitMessage: head?.subject ?? '', commitDescription: head?.body ?? '' } : { amend };
+    const loaded = !!head && r.commitMessage === head.subject && r.commitDescription === (head.body ?? '');
+    return loaded ? { amend, commitMessage: '', commitDescription: '' } : { amend };
   });
+  // ticked before the history arrived (a big repository, a tab just opened): the last commit's message is read
+  if (live.isLiveActive()) void live.fillAmendMessage();
 }
 
 // ---------- staging ----------
@@ -1079,6 +1223,16 @@ function recount(f: FileChange) {
   f.deletions = d;
 }
 
+/** a conflicted file edited by hand: marked resolved (staged) */
+export function markResolved(path: string) {
+  if (live.isLiveActive()) return live.markResolved(path);
+  updateRepo((r) => {
+    const f = r.unstaged.find((x) => x.path === path);
+    if (!f) return {};
+    const resolved: FileChange = { ...f, status: 'M', conflict: undefined };
+    return { unstaged: r.unstaged.filter((x) => x !== f), staged: [...r.staged.filter((x) => x.path !== path), resolved].sort(byPath) };
+  });
+}
 export function resolveConflict(path: string, take: 'ours' | 'theirs' | 'both') {
   if (live.isLiveActive()) return live.resolveConflict(path, take);
   updateRepo((r) => {
@@ -1112,11 +1266,11 @@ export function commit(andPush = false) {
   const r = activeRepo();
   if (!r) return;
   if (!r.commitMessage.trim()) {
-    toast('Commit message is empty', 'error');
+    toast('Commit message is empty', 'info', 'Write a summary first');
     return;
   }
   if (r.staged.length === 0 && !r.amend) {
-    toast('Nothing staged', 'error');
+    toast('Nothing staged', 'info', 'Stage files first (Space, or + on a file)');
     return;
   }
   const branch = currentBranch(r);
@@ -1301,8 +1455,9 @@ export function renameBranch(oldName: string, newName: string) {
   toast(`Renamed ${oldName} → ${newName}`, 'success');
 }
 
-export function createTag(name: string, sha: Sha, annotated: boolean, pushIt: boolean) {
-  if (live.isLiveActive()) return live.createTag(name, sha, annotated, pushIt);
+/** `message`: an annotated tag's message (its name when empty); `remote`: where "push" sends it */
+export function createTag(name: string, sha: Sha, annotated: boolean, pushIt: boolean, message?: string, remote?: string) {
+  if (live.isLiveActive()) return live.createTag(name, sha, annotated, pushIt, message, remote);
   closeDialog();
   if (!name.trim()) return;
   updateRepo((r) => ({ refs: [...r.refs, { name, kind: 'tag', sha }] }));
@@ -1371,8 +1526,8 @@ export function commitsToRebase(r: RepoState, ontoSha: Sha): Commit[] {
   return out.reverse(); // oldest first
 }
 
-export function rebase(onto: string, todo?: RebaseTodo[]) {
-  if (live.isLiveActive()) return live.rebase(onto, todo);
+export function rebase(onto: string, todo?: RebaseTodo[], opts: { autostash?: boolean; preserveMerges?: boolean } = {}) {
+  if (live.isLiveActive()) return live.rebase(onto, todo, opts);
   closeDialog();
   const r = activeRepo();
   if (!r) return;
@@ -1514,6 +1669,11 @@ export function applyStash(index: number, pop: boolean) {
   toast(pop ? 'Popped stash' : 'Applied stash', 'success');
 }
 
+export function stashBranch(name: string, index: number) {
+  if (live.isLiveActive()) return live.stashBranch(name, index);
+  closeDialog();
+  toast(`Created ${name} from stash@{${index}} (mock)`, 'success');
+}
 export function dropStash(index: number) {
   if (live.isLiveActive()) return live.dropStash(index);
   confirm('Drop stash?', 'The stashed changes will be lost.', () => {
@@ -1608,6 +1768,10 @@ export function toggleAgent(open?: boolean) {
     return { open: next, bar: next ? false : a.bar };
   });
 }
+/** the chat panel on its Chat tab ("open chat", Ask AI): it used to open on whichever tab was last, e.g. Settings */
+export function openAgentChat() {
+  updateAgent({ open: true, bar: false, tab: 'chat' });
+}
 /** the compact command line in the tab bar */
 export function toggleAgentBar(open?: boolean) {
   updateAgent((a) => ({ bar: open ?? !a.bar, open: (open ?? !a.bar) ? false : a.open }));
@@ -1627,14 +1791,17 @@ export function finishAgentRun(msgId: number, opts: { ok: boolean; error?: strin
   const a = state.agent;
   const durationMs = a.startedAt ? Date.now() - a.startedAt : undefined;
   updateAgent({ busy: false, status: null, startedAt: null });
-  if (state.agent.open) return;
+  // the answer is in sight in the chat; with the panel on Changes or Settings the card still says it came
+  if (state.agent.open && state.agent.tab === 'chat') return;
   const m = state.agent.messages.find((x) => x.id === msgId);
   if (!m) return;
   const cost = m.actions?.find((x) => x.startsWith('cost $'))?.slice(5);
   const actions = (m.actions ?? []).filter((x) => !x.startsWith('· ') && !x.startsWith('cost $'));
   const stopped = opts.error === 'Stopped';
+  // past the cards that came back with the chat after an interface reload (their ids were counted by that page)
+  noticeId = Math.max(noticeId, ...state.agent.notices.map((n) => n.id)) + 1;
   const notice: AgentNotice = {
-    id: ++noticeId,
+    id: noticeId,
     msgId,
     ok: opts.ok,
     title: opts.noChanges ? 'No changes' : opts.ok ? (m.target === 'app' ? 'Interface updated' : 'Done') : stopped ? 'Stopped' : opts.error && /^No |^Interface build failed/.test(opts.error) ? opts.error : 'Failed',
@@ -1765,6 +1932,19 @@ export function agentSend(text: string) {
   const clean = text.trim();
   if (!clean || state.agent.busy) return;
   pushMessage({ role: 'user', text: clean });
+  if (state.engine.online) {
+    // the offline demo agent never stands in for a missing Claude Code: it ran its scripted commands (create a
+    // branch, commit, rebase, push) in the real repository
+    const claude = state.agent.settings.provider === 'anthropic-claude-code';
+    const id = pushMessage({
+      role: 'agent',
+      text: claude
+        ? 'Claude Code не найден, запрос не выполнен. Установите его (`npm i -g @anthropic-ai/claude-code`) или укажите путь к нему в **Settings → Claude Code binary** и нажмите **check**.'
+        : 'Этот провайдер пока не работает, запрос не выполнен. Выберите **Anthropic · local Claude Code** в Settings.',
+    });
+    finishAgentRun(id, { ok: false, error: claude ? 'No Claude Code' : 'No agent for this provider' });
+    return;
+  }
   updateAgent({ busy: true, status: 'Working… (offline demo agent)', startedAt: Date.now() });
   const p = planCommand(clean, state.agent.target);
   const delay = p.kind === 'help' ? 500 : p.kind === 'repo' ? 700 : 1400;
@@ -1809,10 +1989,12 @@ export function rollbackTo(n: number) {
   if (real.length) {
     // real versions: revert the applied ones above n in reverse order, re-apply reverted ones up to n
     void (async () => {
-      // one interface rebuild at the end, not one per reverted version
-      for (const v of [...real].reverse()) if (v.n > n && v.status === 'applied') await live.setRealVersionStatus(v, 'reverted', false);
-      for (const v of real) if (v.n <= n && v.status === 'reverted') await live.setRealVersionStatus(v, 'applied', false);
-      toast(n === 0 ? 'Reset to factory build' : `Rolled back to v${n}`, 'info');
+      // one interface rebuild at the end, not one per reverted version; a step git refuses stops it (its error is
+      // shown), and what was done up to there is built — it used to go on and report the roll back as done
+      let ok = true;
+      for (const v of [...real].reverse()) if (ok && v.n > n && v.status === 'applied') ok = await live.setRealVersionStatus(v, 'reverted', false);
+      for (const v of real) if (ok && v.n <= n && v.status === 'reverted') ok = await live.setRealVersionStatus(v, 'applied', false);
+      if (ok) toast(n === 0 ? 'Reset to factory build' : `Rolled back to v${n}`, 'info');
       await live.rebuildInterface();
     })();
     updateAgent((a) => ({ versions: a.versions.map((v) => (v.sha ? v : { ...v, status: v.n <= n ? 'applied' : 'reverted' })) }));
@@ -1828,6 +2010,7 @@ export function resetFactory() {
   confirm('Reset to factory build?', 'All agent changes to the interface are reverted. The change log is kept, so any version can be re-applied.', () => rollbackTo(0), 'Reset', true);
 }
 export function clearAgentChat() {
+  if (state.agent.busy) return;
   // a new conversation: the agent no longer remembers the old one either
   updateAgent((a) => ({ messages: a.messages.slice(0, 1), session: null }));
 }

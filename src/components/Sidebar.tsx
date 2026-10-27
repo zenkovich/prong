@@ -1,6 +1,6 @@
-import React, { createContext, memo, useContext, useMemo, useState } from 'react';
+import React, { createContext, memo, useCallback, useContext, useMemo, useState } from 'react';
 import { Animated, ScrollView, StyleSheet, View } from 'react-native';
-import { Ref } from '../git/types';
+import { Ref, Remote } from '../git/types';
 import type { Submodule } from '../git/GitClient';
 import { FolderIcon } from '../ui/FileIcon';
 import { countLeaves, PathNode, pathTree } from './pathTree';
@@ -23,6 +23,7 @@ import {
   pushBranchesBatch,
   revealCommit,
   selectStash,
+  setGraphFilter,
   setSection,
   setSubmoduleView,
   showContextMenu,
@@ -38,13 +39,16 @@ import {
 } from '../state/store';
 import { FONT, useTheme } from '../theme';
 import { Icon, IconName } from '../ui/Icon';
-import { Badge, Button, Chevron, Collapsible, IconButton, Input, PressScale, Row, Segmented, Txt, useKeyboard, usePulse } from '../ui/primitives';
+import { Badge, Button, Chevron, Collapsible, HoverReveal, IconButton, Input, PressScale, Row, Segmented, Txt, useKeyboard, usePulse } from '../ui/primitives';
 import { inFilter } from './branchFilter';
+import { remoteTwin } from './branchNames';
 import { VersionGroup, versionGroups } from './versions';
 import * as live from '../state/live';
 
 /** how many versions the list shows before the “older versions” arrow */
 const VERSIONS_SHOWN = 5;
+/** rows a folder (or a remote) draws at first; a row under them shows the rest */
+const FOLDER_ROWS = 200;
 
 interface TreeNode {
   name: string;
@@ -60,9 +64,11 @@ function buildTree(refs: Ref[], strip = 0): TreeNode[] {
   // a lookup per folder (a remote can have thousands of branches in one folder)
   const index = new Map<TreeNode[], Map<string, TreeNode>>();
   for (const r of refs) {
-    const parts = r.name.split('/').slice(strip);
+    const all = r.name.split('/');
+    const parts = all.slice(strip);
     let level = root;
-    let full = '';
+    // a folder is named in full (`origin/feature`): two remotes' “feature” folders fold apart
+    let full = all.slice(0, strip).join('/');
     for (let i = 0; i < parts.length; i++) {
       const p = parts[i];
       const leaf = i === parts.length - 1;
@@ -88,14 +94,35 @@ function buildTree(refs: Ref[], strip = 0): TreeNode[] {
   return root;
 }
 
+/**
+ * While the filter is set every group and folder is open, so what matches shows; a click still folds one (until the
+ * filter is cleared), and the folds made without the filter stay as they were.
+ */
+const NO_FOLDS: ReadonlySet<string> = new Set();
+const FilterFolds = createContext<{ filtering: boolean; closed: ReadonlySet<string>; toggle: (key: string) => void }>({ filtering: false, closed: NO_FOLDS, toggle: () => {} });
+/** [open, toggle] of a group or folder: its own state, or while filtering the filter's */
+function useFold(key: string, open: boolean, toggle: () => void): [boolean, () => void] {
+  const f = useContext(FilterFolds);
+  return f.filtering ? [!f.closed.has(key), () => f.toggle(key)] : [open, toggle];
+}
+
 export function Sidebar() {
   const t = useTheme();
   const repo = useRepo();
   const collapsed = useStore((s) => s.sidebarCollapsed);
-  const changes = repo.unstaged.length + repo.staged.length;
+  // changed files: one that is staged and edited again is in both lists, and still one file
+  const changes = useMemo(() => new Set([...repo.unstaged.map((f) => f.path), ...repo.staged.map((f) => f.path)]).size, [repo.unstaged, repo.staged]);
   // the filter narrows branches, remotes, tags and submodules; while it is set every group and folder is open
   const [filter, setFilter] = useState('');
   const q = filter.trim().toLowerCase();
+  const [folds, setFolds] = useState<ReadonlySet<string>>(NO_FOLDS);
+  if (!q && folds.size) setFolds(NO_FOLDS);
+  const toggleFold = useCallback((key: string) => setFolds((f) => {
+    const next = new Set(f);
+    if (!next.delete(key)) next.add(key);
+    return next;
+  }), []);
+  const foldCtx = useMemo(() => ({ filtering: !!q, closed: folds, toggle: toggleFold }), [q, folds, toggleFold]);
   const refs = useMemo(() => (q ? repo.refs.filter((r) => r.name.toLowerCase().includes(q)) : repo.refs), [repo.refs, q]);
   const branches = useMemo(() => buildTree(refs.filter((r) => r.kind === 'branch')), [refs]);
   const remotes = useMemo(
@@ -115,7 +142,15 @@ export function Sidebar() {
   const picked = repo.refSelection;
   useKeyboard((e) => {
     const s = getState();
-    if (e.key === 'Escape' && !s.dialog && !s.contextMenu && !s.repoPicker && s.errorOpen == null) clearRefSelection();
+    if (e.key !== 'Escape' || e.consumed) return;
+    // in the filter field: Escape empties it
+    if (e.target?.getAttribute?.('data-testid') === 'sidebar-filter' && filter) {
+      e.consume();
+      setFilter('');
+      return;
+    }
+    // an Escape that closed a menu or a dialog (consumed there) leaves the picked branches alone
+    if (!s.dialog && !s.contextMenu && !s.repoPicker && s.errorOpen == null) clearRefSelection();
   });
   if (collapsed) return null;
   const filtering = !!q;
@@ -123,10 +158,11 @@ export function Sidebar() {
 
   return (
     <RefOrder.Provider value={order}>
-    <View style={[styles.sidebar, { backgroundColor: t.panel, borderColor: t.border }]}>
+    <FilterFolds.Provider value={foldCtx}>
+    <View style={[styles.sidebar, { backgroundColor: t.panel, borderColor: t.border }]} testID="sidebar">
       <ScrollView style={{ flex: 1 }} contentContainerStyle={{ paddingBottom: 20 }}>
         <View style={{ height: 6 }} />
-        <Row selected={repo.section === 'changes'} selectMode="soft" onPress={() => setSection('changes')} height={24}>
+        <Row selected={repo.section === 'changes'} selectMode="soft" onPress={() => setSection('changes')} height={24} testID="sidebar-changes">
           <Txt size={FONT.md} color={repo.section === 'changes' ? t.accent : 'transparent'} weight="700" style={{ width: 12 }}>
             ▸
           </Txt>
@@ -135,14 +171,14 @@ export function Sidebar() {
             Changes
           </Txt>
           {changes > 0 && (
-            <Animated.View style={{ transform: [{ scale: pulse }] }}>
+            <Animated.View style={{ transform: [{ scale: pulse }] }} testID="sidebar-changes-count">
               <Badge bg={t.accent} color={t.accentText}>
                 {changes}
               </Badge>
             </Animated.View>
           )}
         </Row>
-        <Row selected={inCommits} selectMode="soft" onPress={() => setSection('commits')} height={24}>
+        <Row selected={inCommits} selectMode="soft" onPress={() => setSection('commits')} height={24} testID="sidebar-commits">
           <Txt size={FONT.md} color={inCommits ? t.accent : 'transparent'} weight="700" style={{ width: 12 }}>
             ▸
           </Txt>
@@ -153,7 +189,7 @@ export function Sidebar() {
         </Row>
         <View style={{ height: 1, backgroundColor: t.border, marginTop: 6, marginHorizontal: 8 }} testID="sidebar-separator" />
         <View style={{ paddingHorizontal: 8, paddingTop: 8 }}>
-          <Input value={filter} onChange={setFilter} placeholder="filter branches" icon="search" small />
+          <Input value={filter} onChange={setFilter} placeholder="filter branches" icon="search" small testID="sidebar-filter" />
         </View>
         {filtering && branches.length === 0 && remotes.length === 0 && tags.length === 0 && !submodules?.length && (
           <Txt size={FONT.sm} faint style={{ paddingHorizontal: 12, paddingTop: 8 }}>
@@ -161,79 +197,26 @@ export function Sidebar() {
           </Txt>
         )}
 
-        <Group title="Versions" icon="tag" groupKey="versions" count={versions.length} forceOpen={filtering} hidden={versions.length === 0}>
+        <Group title="Versions" icon="tag" groupKey="versions" count={versions.length} hidden={versions.length === 0}>
           {(filtering ? versions : versions.slice(0, VERSIONS_SHOWN)).map((g) => (
-            <VersionNode key={g.version} group={g} forceOpen={filtering} />
+            <VersionNode key={g.version} group={g} />
           ))}
           {!filtering && versions.length > VERSIONS_SHOWN && <OlderVersions versions={versions.slice(VERSIONS_SHOWN)} />}
         </Group>
 
-        <Group title="Branches" icon="branch" groupKey="branches" forceOpen={filtering} hidden={filtering && branches.length === 0} count={filtering ? refs.filter((r) => r.kind === 'branch').length : undefined} right={<IconButton icon="plus" size={13} title="New branch" onPress={() => openDialog({ type: 'branch' })} />}>
+        <Group title="Branches" icon="branch" groupKey="branches" hidden={filtering && branches.length === 0} count={filtering ? refs.filter((r) => r.kind === 'branch').length : undefined} right={<IconButton icon="plus" size={13} title="New branch" onPress={() => openDialog({ type: 'branch' })} />}>
           {branches.map((n) => (
-            <BranchNode key={n.full} node={n} depth={0} kind="branch" defaultOpen={localCount < 300} forceOpen={filtering} />
+            <BranchNode key={n.full} node={n} depth={0} kind="branch" defaultOpen={localCount < 300} />
           ))}
         </Group>
 
-        <Group title="Remotes" icon="cloud" groupKey="remotes" forceOpen={filtering} hidden={filtering && remotes.length === 0} right={<><IconButton icon="key" size={13} title="Connection: SSH key or account" onPress={() => openDialog({ type: 'connection' })} /><IconButton icon="plus" size={13} title="Add remote" onPress={() => openDialog({ type: 'remote' })} /><IconButton icon="refresh" size={13} title="Fetch all" onPress={() => fetch()} /></>}>
+        <Group title="Remotes" icon="cloud" groupKey="remotes" hidden={filtering && remotes.length === 0} right={<><IconButton icon="key" size={13} title="Connection: SSH key or account" onPress={() => openDialog({ type: 'connection' })} /><IconButton icon="plus" size={13} title="Add remote" onPress={() => openDialog({ type: 'remote' })} /><IconButton icon="refresh" size={13} title="Fetch all" onPress={() => fetch()} /></>}>
           {remotes.map(({ remote, tree }) => (
-            <View key={remote.name}>
-              <Row
-                height={24}
-                indent={14}
-                onPress={() => toggleGroup('remote:' + remote.name)}
-                onContextMenu={(x, y) =>
-                  showContextMenu(x, y, [
-                    { label: `Fetch ${remote.name}`, onPress: () => fetch({ remote: remote.name }) },
-                    { label: 'Prune', onPress: () => (repo.live ? live.pruneRemote(remote.name) : toast(`Pruned ${remote.name} (mock)`, 'success')) },
-                    // a narrow clone follows only some branches: fetching never brings the rest until the fetch list is widened
-                    { label: remote.narrow ? 'Fetch every branch of this remote' : 'Fetch every branch — already followed', disabled: !remote.narrow, onPress: () => followAllBranches(remote.name) },
-                    { label: repo.shallow ? 'Fetch the full history (unshallow)' : 'Fetch the full history — the history is already complete', disabled: !repo.shallow, onPress: () => unshallow({ remote: remote.name }) },
-                    { separator: true },
-                    { label: 'Edit remote…', onPress: () => openDialog({ type: 'remote', name: remote.name, url: remote.url }) },
-                    { label: 'Connection (SSH key / account)…', onPress: () => openDialog({ type: 'connection' }) },
-                    { label: 'Copy URL', onPress: () => live.copyText(remote.url) },
-                    { label: 'Remove remote', danger: true, onPress: () => (repo.live ? live.removeRemote(remote.name) : toast('Remote kept (mock)', 'info')) },
-                  ])
-                }
-              >
-                <Chevron open={!repo.collapsedGroups['remote:' + remote.name]} color={t.textMuted} />
-                <Icon name="cloud" size={12} color={t.textFaint} />
-                <Txt size={FONT.md} style={{ marginLeft: 5, flex: 1 }} numberOfLines={1}>
-                  {remote.name}
-                </Txt>
-                {remote.narrow && (
-                  <Badge color={t.warn} style={{ marginRight: 5 }}>
-                    narrow
-                  </Badge>
-                )}
-                <Txt size={FONT.xs} faint numberOfLines={1} style={{ maxWidth: 90 }}>
-                  {remote.url.replace(/^.*[:/]([^/]+\/[^/]+?)(\.git)?$/, '$1')}
-                </Txt>
-              </Row>
-              {/* a --single-branch clone keeps asking for one branch only: say why the others are missing, and get them */}
-              {remote.narrow && (
-                <View style={{ paddingLeft: 32, paddingRight: 8, paddingBottom: 6 }}>
-                  <Txt size={FONT.xs} faint>
-                    This clone follows only some branches, so the rest of {remote.name} never arrives.
-                  </Txt>
-                  <Button small label="Fetch every branch" icon="fetch" style={{ marginTop: 4, alignSelf: 'flex-start' }} onPress={() => followAllBranches(remote.name)} testID={`follow-all-${remote.name}`} />
-                </View>
-              )}
-              <Collapsible open={filtering || !repo.collapsedGroups['remote:' + remote.name]}>
-                {tree.slice(0, 200).map((n) => (
-                  <BranchNode key={n.full} node={n} depth={1} kind="remote" defaultOpen={remoteCount < 300} forceOpen={filtering} />
-                ))}
-                {tree.length > 200 && (
-                  <Txt size={FONT.xs} faint style={{ paddingLeft: 40, paddingVertical: 3 }}>
-                    … {tree.length - 200} more
-                  </Txt>
-                )}
-              </Collapsible>
-            </View>
+            <RemoteNode key={remote.name} remote={remote} tree={tree} defaultOpen={remoteCount < 300} />
           ))}
         </Group>
 
-        <Group title="Tags" icon="tag" groupKey="tags" count={tags.length} forceOpen={filtering} hidden={filtering && tags.length === 0} right={<IconButton icon="plus" size={13} title="New tag" onPress={() => openDialog({ type: 'tag', sha: repo.head })} />}>
+        <Group title="Tags" icon="tag" groupKey="tags" count={tags.length} hidden={filtering && tags.length === 0} right={<IconButton icon="plus" size={13} title="New tag" onPress={() => openDialog({ type: 'tag', sha: repo.head })} />}>
           {tags.map((tag) => (
             <TagRow key={tag.name} tag={tag} />
           ))}
@@ -245,7 +228,6 @@ export function Sidebar() {
             icon="layers"
             groupKey="submodules"
             count={submodules?.length ?? 0}
-            forceOpen={filtering}
             hidden={filtering && !submodules?.length}
             right={
               <>
@@ -265,7 +247,7 @@ export function Sidebar() {
                 No submodules
               </Txt>
             )}
-            {submodules && submoduleView === 'tree' && pathTree(submodules).map((n) => <SubmoduleNode key={n.full} node={n} depth={0} forceOpen={filtering} />)}
+            {submodules && submoduleView === 'tree' && pathTree(submodules).map((n) => <SubmoduleNode key={n.full} node={n} depth={0} />)}
             {submodules && submoduleView === 'list' && submodules.map((sm) => <SubmoduleRow key={sm.path} sm={sm} label={sm.path} indent={14} />)}
           </Group>
         )}
@@ -282,6 +264,7 @@ export function Sidebar() {
               height={24}
               indent={14}
               selected={repo.selectedArea === 'stash' && repo.selectedStash === st.index}
+              testID={`stash-${st.index}`}
               onPress={() => selectStash(st.index)}
               onContextMenu={(x, y) =>
                 showContextMenu(x, y, [
@@ -305,18 +288,19 @@ export function Sidebar() {
       </ScrollView>
       {picked.length > 0 && <BatchBar names={picked} />}
     </View>
+    </FilterFolds.Provider>
     </RefOrder.Provider>
   );
 }
 
-function Group({ title, icon, groupKey, children, right, count, forceOpen, hidden }: { title: string; icon: IconName; groupKey: string; children: React.ReactNode; right?: React.ReactNode; count?: number; forceOpen?: boolean; hidden?: boolean }) {
+function Group({ title, icon, groupKey, children, right, count, hidden }: { title: string; icon: IconName; groupKey: string; children: React.ReactNode; right?: React.ReactNode; count?: number; hidden?: boolean }) {
   const t = useTheme();
   const repo = useRepo();
+  const [open, toggle] = useFold(groupKey, !repo.collapsedGroups[groupKey], () => toggleGroup(groupKey));
   if (hidden) return null;
-  const open = forceOpen || !repo.collapsedGroups[groupKey];
   return (
     <View style={{ marginTop: 8 }} testID={`group-${groupKey}`}>
-      <Row height={24} onPress={() => toggleGroup(groupKey)} style={{ paddingLeft: 8 }}>
+      <Row height={24} onPress={toggle} style={{ paddingLeft: 8 }} testID={`group-header-${groupKey}`}>
         {({ hovered }) => (
           <>
             <Chevron open={open} />
@@ -325,13 +309,17 @@ function Group({ title, icon, groupKey, children, right, count, forceOpen, hidde
               {title}
             </Txt>
             {count !== undefined ? (
-              <Txt size={FONT.xs} faint style={{ marginRight: right ? 4 : 0 }}>
+              <Txt size={FONT.xs} faint style={{ marginRight: right ? 4 : 0 }} testID={`group-count-${groupKey}`}>
                 {count}
               </Txt>
             ) : null}
-            {/* always in place (a button that appears only while its row is hovered vanishes the moment the
-                pointer moves onto it); faint until the row is hovered */}
-            {right ? <View style={{ flexDirection: 'row', alignItems: 'center', opacity: hovered ? 1 : 0.45 }}>{right}</View> : null}
+            {/* always in place, faint until the row or one of them is hovered (the pointer on a button ends the row's
+                hover: they used to fade under it) */}
+            {right ? (
+              <HoverReveal rowHovered={hovered} idleOpacity={0.45}>
+                {right}
+              </HoverReveal>
+            ) : null}
           </>
         )}
       </Row>
@@ -340,19 +328,19 @@ function Group({ title, icon, groupKey, children, right, count, forceOpen, hidde
   );
 }
 
-function SubmoduleNode({ node, depth, forceOpen }: { node: PathNode; depth: number; forceOpen?: boolean }) {
+function SubmoduleNode({ node, depth }: { node: PathNode; depth: number }) {
   const t = useTheme();
   const repo = useRepo();
   const key = `sub:${node.full}`;
-  const open = forceOpen || !repo.collapsedGroups[key];
+  const [open, toggle] = useFold(key, !repo.collapsedGroups[key], () => toggleGroup(key));
   const indent = 14 + depth * 12;
   if (node.sub) return <SubmoduleRow sm={node.sub} label={node.name} indent={indent} />;
   return (
     <View>
-      <Row height={22} indent={indent} onPress={() => toggleGroup(key)}>
+      <Row height={22} indent={indent} onPress={toggle} testID={`subfolder-${node.full}`}>
         <Chevron open={open} color={t.textMuted} />
         <FolderIcon name={node.name} open={open} size={12} />
-        <Txt size={FONT.md} muted style={{ marginLeft: 5 }} numberOfLines={1}>
+        <Txt size={FONT.md} muted style={{ marginLeft: 5, flexShrink: 1 }} numberOfLines={1}>
           {node.name}
         </Txt>
         <Txt size={FONT.xs} faint style={{ marginLeft: 6 }}>
@@ -361,21 +349,28 @@ function SubmoduleNode({ node, depth, forceOpen }: { node: PathNode; depth: numb
       </Row>
       <Collapsible open={open}>
         {node.children.map((c) => (
-          <SubmoduleNode key={c.full} node={c} depth={depth + 1} forceOpen={forceOpen} />
+          <SubmoduleNode key={c.full} node={c} depth={depth + 1} />
         ))}
       </Collapsible>
     </View>
   );
 }
 
+/** what the coloured square of a submodule says */
+const SUBMODULE_STATE: Record<string, string> = { ok: 'at the recorded commit', modified: 'at another commit than recorded', uninitialized: 'not checked out', conflict: 'in conflict' };
+
 function SubmoduleRow({ sm, label, indent }: { sm: Submodule; label: string; indent: number }) {
   const t = useTheme();
-  const color = sm.state === 'ok' ? t.add : sm.state === 'uninitialized' ? t.textFaint : sm.state === 'conflict' ? t.del : t.warn;
+  // edits in its own files (Changes lists it) mark it as a moved commit does
+  const inside = sm.inside && sm.inside.modified + sm.inside.untracked > 0 ? sm.inside : null;
+  const color = sm.state === 'ok' && !inside ? t.add : sm.state === 'uninitialized' ? t.textFaint : sm.state === 'conflict' ? t.del : t.warn;
+  const said = (SUBMODULE_STATE[sm.state] ?? sm.state) + (inside ? `, its own files changed (${[inside.modified ? `${inside.modified} changed` : '', inside.untracked ? `${inside.untracked} new` : ''].filter(Boolean).join(', ')})` : '');
   return (
     <Row
       height={24}
       indent={indent}
       selectMode="soft"
+      testID={`submodule-row-${sm.path}`}
       onPress={() => live.openSubmodule(sm)}
       onContextMenu={(x, y) =>
         showContextMenu(x, y, [
@@ -388,7 +383,7 @@ function SubmoduleRow({ sm, label, indent }: { sm: Submodule; label: string; ind
         ])
       }
     >
-      <View style={{ width: 7, height: 7, backgroundColor: color }} />
+      <View style={{ width: 7, height: 7, backgroundColor: color }} testID={`submodule-state-${sm.path}`} accessibilityLabel={said} />
       <Txt size={FONT.md} style={{ marginLeft: 6, flex: 1 }} numberOfLines={1} testID={`submodule-${sm.path}`}>
         {label}
       </Txt>
@@ -427,12 +422,14 @@ const TagRow = memo(function TagRow({ tag }: { tag: Ref }) {
       height={24}
       indent={14}
       selected={selected}
+      testID={`tag-${tag.name}`}
       onPress={() => revealCommit(tag.sha)}
       onContextMenu={(x, y) => {
         const isLive = live.isLiveActive();
         showContextMenu(x, y, [
           { label: `Checkout ${tag.name}`, onPress: () => (isLive ? live.checkoutDetached(tag.sha) : toast(`Detached HEAD at ${tag.name} (mock)`, 'info')) },
           { label: 'Push tag', onPress: () => (isLive ? live.pushTag(tag.name) : toast(`Pushed tag ${tag.name} (mock)`, 'success')) },
+          { label: 'Create branch here…', onPress: () => openDialog({ type: 'branch', fromSha: tag.sha, fromName: tag.name }) },
           { label: 'Copy name', onPress: () => live.copyText(tag.name) },
           { separator: true },
           { label: 'Delete tag', danger: true, onPress: () => deleteTag(tag.name) },
@@ -456,23 +453,26 @@ const TagRow = memo(function TagRow({ tag }: { tag: Ref }) {
  * one version (ver/XXX) with its branches under it. A version whose branch is in the local repository starts
  * open; a version that only exists on a remote starts collapsed.
  */
-const VersionNode = memo(function VersionNode({ group, forceOpen }: { group: VersionGroup; forceOpen?: boolean }) {
+const VersionNode = memo(function VersionNode({ group }: { group: VersionGroup }) {
   const t = useTheme();
   const key = `version:${group.version}`;
   const stored = useRepoValue((r) => r.collapsedGroups[key]);
-  const open = forceOpen || (stored === undefined ? group.local : !stored);
-  const toggle = () => updateRepo((r) => ({ collapsedGroups: { ...r.collapsedGroups, [key]: open } }));
+  const own = stored === undefined ? group.local : !stored;
+  const [open, toggle] = useFold(key, own, () => updateRepo((r) => ({ collapsedGroups: { ...r.collapsedGroups, [key]: own } })));
   const primary = group.refs[0];
+  // a version only on a remote checks out as its local branch (ver/XXX, tracking it)
+  const target = primary?.kind === 'remote' ? primary.name.slice(primary.name.indexOf('/') + 1) : primary?.name;
   return (
     <View testID={`version-${group.version}`}>
       <Row
         height={22}
         indent={14}
+        testID={`version-row-${group.version}`}
         onPress={toggle}
         onDoublePress={() => !group.current && primary && checkout(primary.name)}
         onContextMenu={(x, y) =>
           showContextMenu(x, y, [
-            { label: group.current ? 'Already checked out' : `Checkout ${primary?.name ?? group.version}`, disabled: group.current || !primary, onPress: () => primary && checkout(primary.name) },
+            { label: group.current ? 'Already checked out' : `Checkout ${target ?? group.version}`, disabled: group.current || !primary, onPress: () => primary && checkout(primary.name) },
             { label: 'Show only this version', disabled: !primary, onPress: () => primary && showOnlyRef(primary.name) },
             { separator: true },
             { label: 'Copy version', onPress: () => live.copyText(group.version) },
@@ -511,7 +511,7 @@ function OlderVersions({ versions }: { versions: VersionGroup[] }) {
   const toggle = () => updateRepo((r) => ({ collapsedGroups: { ...r.collapsedGroups, [key]: open } }));
   return (
     <View testID="versions-older">
-      <Row height={22} indent={14} onPress={toggle}>
+      <Row height={22} indent={14} onPress={toggle} testID="versions-older-row">
         <Chevron open={open} color={t.textMuted} />
         <Txt size={FONT.sm} faint style={{ marginLeft: 6, flex: 1 }} numberOfLines={1}>
           {versions.length} older version{versions.length === 1 ? '' : 's'}
@@ -526,37 +526,133 @@ function OlderVersions({ versions }: { versions: VersionGroup[] }) {
   );
 }
 
-const BranchNode = memo(function BranchNode({ node, depth, kind, defaultOpen = true, forceOpen }: { node: TreeNode; depth: number; kind: 'branch' | 'remote'; defaultOpen?: boolean; forceOpen?: boolean }) {
+/** under the first rows of a long folder: the rest, on a click (they are drawn only then) */
+function MoreRow({ count, indent, onPress, testID }: { count: number; indent: number; onPress: () => void; testID: string }) {
+  const t = useTheme();
+  return (
+    <Row height={22} indent={indent} onPress={onPress} testID={testID}>
+      <Txt size={FONT.xs} color={t.accent} numberOfLines={1} style={{ flex: 1 }}>
+        {`Show ${count} more`}
+      </Txt>
+    </Row>
+  );
+}
+
+/** the folders inside a folder (itself included), as fold keys */
+function folderKeys(node: TreeNode, kind: 'branch' | 'remote'): string[] {
+  if (node.ref) return [];
+  return [`${kind}:${node.full}`, ...node.children.flatMap((c) => folderKeys(c, kind))];
+}
+
+/** what can be done with every branch in a folder (and the folders inside it) */
+function folderMenu(node: TreeNode, kind: 'branch' | 'remote'): MenuItem[] {
+  const names = leafNames([node]);
+  const what = names.length === 1 ? 'branch' : `${names.length} branches`;
+  const fold = (collapsed: boolean) => updateRepo((r) => ({ collapsedGroups: { ...r.collapsedGroups, ...Object.fromEntries(folderKeys(node, kind).map((k) => [k, collapsed])) } }));
+  const nested = node.children.some((c) => !c.ref);
+  return [
+    { label: `Show only its ${what} in the history`, onPress: () => setGraphFilter({ mode: 'selected', refs: names }) },
+    { label: `Select its ${what}`, onPress: () => updateRepo({ refSelection: names, refAnchor: names[0] ?? null }) },
+    { label: kind === 'remote' ? `Delete its ${what} on the remote…` : `Delete its ${what}…`, danger: true, onPress: () => openDialog({ type: 'deleteBranches', names }) },
+    { separator: true },
+    { label: 'Open every folder inside', disabled: !nested, onPress: () => fold(false) },
+    { label: 'Close every folder inside', disabled: !nested, onPress: () => fold(true) },
+    { label: 'Copy folder name', onPress: () => live.copyText(node.full) },
+  ];
+}
+
+const BranchNode = memo(function BranchNode({ node, depth, kind, defaultOpen = true }: { node: TreeNode; depth: number; kind: 'branch' | 'remote'; defaultOpen?: boolean }) {
   const t = useTheme();
   const key = `${kind}:${node.full}`;
   const stored = useRepoValue((r) => r.collapsedGroups[key]);
   // huge trees (thousands of remote branches) start collapsed so the sidebar paints instantly
-  const open = forceOpen || (stored === undefined ? defaultOpen : !stored);
-  const toggle = () => updateRepo((r) => ({ collapsedGroups: { ...r.collapsedGroups, [key]: open } }));
+  const own = stored === undefined ? defaultOpen : !stored;
+  const [open, toggle] = useFold(key, own, () => updateRepo((r) => ({ collapsedGroups: { ...r.collapsedGroups, [key]: own } })));
+  const [all, setAll] = useState(false);
   const indent = 14 + depth * 12;
   if (node.ref) return <BranchLeaf r={node.ref} label={node.name} kind={kind} indent={indent} />;
+  const shown = all ? node.children : node.children.slice(0, FOLDER_ROWS);
   return (
     <View>
-      <Row height={22} indent={indent} onPress={toggle}>
+      <Row height={22} indent={indent} onPress={toggle} onContextMenu={(x, y) => showContextMenu(x, y, folderMenu(node, kind))} testID={`folder-${key}`}>
         <Chevron open={open} color={t.textMuted} />
         <Icon name="folder" size={12} color={t.textFaint} />
-        <Txt size={FONT.md} muted style={{ marginLeft: 5 }} numberOfLines={1}>
+        <Txt size={FONT.md} muted style={{ marginLeft: 5, flex: 1 }} numberOfLines={1}>
           {node.name}
         </Txt>
       </Row>
       <Collapsible open={open}>
-        {node.children.slice(0, 200).map((c) => (
-          <BranchNode key={c.full} node={c} depth={depth + 1} kind={kind} defaultOpen={defaultOpen} forceOpen={forceOpen} />
+        {shown.map((c) => (
+          <BranchNode key={c.full} node={c} depth={depth + 1} kind={kind} defaultOpen={defaultOpen} />
         ))}
-        {node.children.length > 200 && (
-          <Txt size={FONT.xs} faint style={{ paddingLeft: indent + 30, paddingVertical: 3 }}>
-            … {node.children.length - 200} more (use the branch filter above the graph)
-          </Txt>
-        )}
+        {shown.length < node.children.length && <MoreRow count={node.children.length - shown.length} indent={indent + 26} onPress={() => setAll(true)} testID={`more-${key}`} />}
       </Collapsible>
     </View>
   );
 });
+
+/** a remote: its row (fold, menu, the short URL) and its branches in folders */
+function RemoteNode({ remote, tree, defaultOpen }: { remote: Remote; tree: TreeNode[]; defaultOpen: boolean }) {
+  const t = useTheme();
+  const repo = useRepo();
+  const key = 'remote:' + remote.name;
+  const [open, toggle] = useFold(key, !repo.collapsedGroups[key], () => toggleGroup(key));
+  const [all, setAll] = useState(false);
+  const shown = all ? tree : tree.slice(0, FOLDER_ROWS);
+  return (
+    <View>
+      <Row
+        height={24}
+        indent={14}
+        testID={`remote-${remote.name}`}
+        onPress={toggle}
+        onContextMenu={(x, y) =>
+          showContextMenu(x, y, [
+            { label: `Fetch ${remote.name}`, onPress: () => fetch({ remote: remote.name }) },
+            { label: 'Prune', onPress: () => (repo.live ? live.pruneRemote(remote.name) : toast(`Pruned ${remote.name} (mock)`, 'success')) },
+            // a narrow clone follows only some branches: fetching never brings the rest until the fetch list is widened
+            { label: remote.narrow ? 'Fetch every branch of this remote' : 'Fetch every branch — already followed', disabled: !remote.narrow, onPress: () => followAllBranches(remote.name) },
+            { label: repo.shallow ? 'Fetch the full history (unshallow)' : 'Fetch the full history — the history is already complete', disabled: !repo.shallow, onPress: () => unshallow({ remote: remote.name }) },
+            { separator: true },
+            { label: 'Edit remote…', onPress: () => openDialog({ type: 'remote', name: remote.name, url: remote.url }) },
+            { label: 'Connection (SSH key / account)…', onPress: () => openDialog({ type: 'connection' }) },
+            { label: 'Copy URL', onPress: () => live.copyText(remote.url) },
+            { label: 'Remove remote', danger: true, onPress: () => (repo.live ? live.removeRemote(remote.name) : toast('Remote kept (mock)', 'info')) },
+          ])
+        }
+      >
+        <Chevron open={open} color={t.textMuted} />
+        <Icon name="cloud" size={12} color={t.textFaint} />
+        <Txt size={FONT.md} style={{ marginLeft: 5, flex: 1 }} numberOfLines={1}>
+          {remote.name}
+        </Txt>
+        {remote.narrow && (
+          <Badge color={t.warn} style={{ marginRight: 5 }}>
+            narrow
+          </Badge>
+        )}
+        <Txt size={FONT.xs} faint numberOfLines={1} style={{ maxWidth: 90 }}>
+          {remote.url.replace(/^.*[:/]([^/]+\/[^/]+?)(\.git)?$/, '$1')}
+        </Txt>
+      </Row>
+      {/* a --single-branch clone keeps asking for one branch only: say why the others are missing, and get them */}
+      {remote.narrow && (
+        <View style={{ paddingLeft: 32, paddingRight: 8, paddingBottom: 6 }}>
+          <Txt size={FONT.xs} faint>
+            This clone follows only some branches, so the rest of {remote.name} never arrives.
+          </Txt>
+          <Button small label="Fetch every branch" icon="fetch" style={{ marginTop: 4, alignSelf: 'flex-start' }} onPress={() => followAllBranches(remote.name)} testID={`follow-all-${remote.name}`} />
+        </View>
+      )}
+      <Collapsible open={open}>
+        {shown.map((n) => (
+          <BranchNode key={n.full} node={n} depth={1} kind="remote" defaultOpen={defaultOpen} />
+        ))}
+        {shown.length < tree.length && <MoreRow count={tree.length - shown.length} indent={38} onPress={() => setAll(true)} testID={`more-remote:${remote.name}`} />}
+      </Collapsible>
+    </View>
+  );
+}
 
 /** one branch: subscribes to the few values it shows, so selecting a commit does not re-render thousands of these */
 const BranchLeaf = memo(function BranchLeaf({ r, label, kind, indent }: { r: Ref; label: string; kind: 'branch' | 'remote'; indent: number }) {
@@ -577,6 +673,8 @@ const BranchLeaf = memo(function BranchLeaf({ r, label, kind, indent }: { r: Ref
     const repo = getState().repoStates[getState().activeTab ?? ''];
     const current = repo?.refs.find((x) => x.kind === 'branch' && x.current);
     const mode = repo?.graphFilter.mode ?? 'all';
+    // the remote branch “Delete (local + remote)” takes along (none: it is on no remote)
+    const twin = repo && kind === 'branch' ? remoteTwin(repo.refs, repo.remotes, r) : undefined;
     const graphItems = [
       { separator: true },
       { label: 'Show only this branch', onPress: () => showOnlyRef(r.name) },
@@ -593,18 +691,23 @@ const BranchLeaf = memo(function BranchLeaf({ r, label, kind, indent }: { r: Ref
         { label: r.current ? 'Pull…' : 'Pull (check it out first)', disabled: !r.current, onPress: () => openDialog({ type: 'pull' }) },
         { label: 'Set upstream…', onPress: () => openDialog({ type: 'upstream', branch: r.name }) },
         { separator: true },
+        { label: 'Create branch here…', onPress: () => openDialog({ type: 'branch', fromSha: r.sha, fromName: r.name }) },
         { label: 'Rename…', onPress: () => openDialog({ type: 'renameBranch', name: r.name }) },
         { label: 'Copy branch name', onPress: () => live.copyText(r.name) },
         { separator: true },
         { label: 'Delete', danger: true, disabled: !!r.current, onPress: () => deleteBranch(r.name) },
-        { label: 'Delete (local + remote)', danger: true, disabled: !!r.current, onPress: () => deleteBranch(r.name, true) },
+        { label: twin ? `Delete (local + ${twin})` : 'Delete (local + remote): it is on no remote', danger: true, disabled: !!r.current || !twin, onPress: () => deleteBranch(r.name, true) },
         ...graphItems,
       ];
+    // a remote branch checks out its local branch: the one tracking it, else the same name, else a new one (as Fork)
+    const short = r.name.slice(r.name.indexOf('/') + 1);
+    const local = repo?.refs.find((x) => x.kind === 'branch' && x.upstream === r.name) ?? repo?.refs.find((x) => x.kind === 'branch' && x.name === short);
     return [
-      { label: `Checkout ${r.name.replace(/^[^/]+\//, '')}`, onPress: () => checkout(r.name) },
-      { label: `Merge into ${current?.name ?? 'HEAD'}`, onPress: () => openDialog({ type: 'merge', source: r.name }) },
+      { label: local?.current ? `Already on ${local.name}` : local && local.name !== short ? `Checkout ${local.name} (tracks ${r.name})` : `Checkout ${short}`, disabled: !!local?.current, onPress: () => checkout(r.name) },
+      { label: `Merge ${r.name} into ${current?.name ?? 'HEAD'}`, onPress: () => openDialog({ type: 'merge', source: r.name }) },
       { label: `Rebase ${current?.name ?? 'HEAD'} onto ${r.name}`, onPress: () => openDialog({ type: 'rebase', onto: r.name }) },
       { separator: true },
+      { label: 'Create branch here…', onPress: () => openDialog({ type: 'branch', fromSha: r.sha, fromName: r.name }) },
       { label: 'Copy branch name', onPress: () => live.copyText(r.name) },
       { label: 'Delete remote branch', danger: true, onPress: () => deleteBranch(r.name) },
       ...graphItems,
@@ -646,6 +749,12 @@ const BranchLeaf = memo(function BranchLeaf({ r, label, kind, indent }: { r: Ref
             <View style={{ marginRight: 4 }} testID={`branch-cloud-${r.name}`}>
               <Icon name="cloud" size={11} strokeWidth={2.2} color={t.info} />
             </View>
+          ) : null}
+          {/* its branch on the server was deleted (git says “gone”): the next push makes it again */}
+          {kind === 'branch' && r.upstream && r.gone ? (
+            <Txt size={FONT.xs} faint style={{ marginRight: 4 }} testID={`branch-gone-${r.name}`}>
+              gone
+            </Txt>
           ) : null}
           {kind === 'branch' && (r.ahead || r.behind) ? (
             <Txt size={FONT.xs} muted>

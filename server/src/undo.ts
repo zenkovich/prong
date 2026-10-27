@@ -2,6 +2,7 @@ import { cpSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, rm
 import path from 'node:path';
 import { STATE_DIR } from './state.js';
 import type { Repo } from './git/repo.js';
+import { inRuns } from './git/run.js';
 
 /**
  * Discarding is the one change git cannot take back: the files are copied aside first (the working-tree version
@@ -55,12 +56,17 @@ function walk(abs: string, rel: string, out: string[]) {
 export async function saveForUndo(repo: Repo, paths: string[] | null): Promise<string | null> {
   prune();
   // the working-tree side of every change: modified and untracked files, and the ones deleted from disk
-  const args = ['status', '--porcelain=v1', '-z', '--untracked-files=all', '--ignore-submodules=all', '--no-renames', ...(paths ? ['--', ...paths] : [])];
-  const r = await repo.git(args, { allowFail: true });
-  if (r.code !== 0) return null;
+  // (a folder's files in runs that fit a command line)
+  const args = ['status', '--porcelain=v1', '-z', '--untracked-files=all', '--ignore-submodules=all', '--no-renames'];
+  let listed = '';
+  for (const run of paths ? inRuns(paths) : [null]) {
+    const r = await repo.git(run ? [...args, '--', ...run] : args, { allowFail: true });
+    if (r.code !== 0) return null;
+    listed += r.stdout;
+  }
   const files: string[] = [];
   const absent: string[] = [];
-  for (const entry of r.stdout.split('\0').filter(Boolean)) {
+  for (const entry of [...new Set(listed.split('\0').filter(Boolean))]) {
     const xy = entry.slice(0, 2);
     const rel = entry.slice(3);
     if (!rel || rel.includes('..')) continue;

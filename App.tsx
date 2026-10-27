@@ -6,26 +6,33 @@ import { DialogHost } from './src/components/dialogs';
 import { ErrorDialogHost } from './src/components/ErrorDialog';
 import { RepoPickerHost } from './src/components/RepoPicker';
 import { RepoTabs } from './src/components/Toolbar';
+import { focusCommitSearch } from './src/components/CommitList';
 import { Repository } from './src/screens/Repository';
 import { Welcome } from './src/screens/Welcome';
-import { closeErrors, closeRepoPicker, closeTab, commit, getState, openRepoPickerCentered, openDialog, setMergeCollapsed, setSection, setState, stageFile, stepUiScale, toast, toggleAgent, toggleAgentBar, unstageFile, useStore } from './src/state/store';
+import { closeErrors, closeRepoPicker, closeTab, commit, getState, openLocalRepo, openRepoPickerCentered, openDialog, setMergeCollapsed, setSection, setState, stepUiScale, toast, toggleAgent, toggleAgentBar, useStore, pickedFiles, stageFiles, unstageFiles, setFileSelection, clearFileSelection } from './src/state/store';
 import { AgentPanel } from './src/components/AgentPanel';
 import { AgentNotices } from './src/components/AgentBar';
 import { isDark, THEMES, ThemeContext } from './src/theme';
 import { ContextMenuHost, PickerHost } from './src/ui/overlays';
 import { ErrorBoundary, reportCrash, setCrashAssistant } from './src/ui/ErrorBoundary';
-import { applyLocalUi, askAgentAbout, bootstrap as bootstrapEngine, client, restoreAgentSession, undoLast } from './src/state/live';
+import { applyLocalUi, askAgentAbout, bootstrap as bootstrapEngine, client, openTerminalAt, refresh as refreshRepo, refreshNow, restoreAgentSession, undoLast } from './src/state/live';
 import { setSystemIconBase } from './src/ui/FileIcon';
 import { setAvatarBase, useKeyboard } from './src/ui/primitives';
+import { droppedPath } from './src/ui/droppedPath';
 
-/** After a crash in the repository view: drop the selection that was being rendered, keep the repository open. */
-function recoverRepoView() {
+/**
+ * After a crash in the repository view: drop the selection that was being rendered, keep the repository open, and
+ * read it again before it is drawn — what the engine sent may be what could not be drawn (Retry used to draw the
+ * same data and crash the same way).
+ */
+async function recoverRepoView() {
   const s = getState();
   const id = s.activeTab;
   if (!id || !s.repoStates[id]) return;
   const r = s.repoStates[id];
   setState({ repoStates: { ...s.repoStates, [id]: { ...r, selectedFile: null, blame: null, historyPath: null } }, contextMenu: null, dialog: null });
   toast('Recovered from an error', 'info', 'the selection was reset');
+  if (r.live) await refreshRepo(id).catch(() => {});
 }
 /** Root-level crash: back to the welcome screen with every dialog closed. */
 function recoverApp() {
@@ -66,9 +73,27 @@ export default function App() {
       };
       window.addEventListener('error', onErr);
       window.addEventListener('unhandledrejection', onRej);
+      const onDragOver = (e: DragEvent) => {
+        if ([...(e.dataTransfer?.types ?? [])].some((t) => t === 'Files' || t === 'text/uri-list')) e.preventDefault();
+      };
+      const onDrop = (e: DragEvent) => {
+        const types = [...(e.dataTransfer?.types ?? [])];
+        if (!types.some((t) => t === 'Files' || t === 'text/uri-list' || t === 'text/plain')) return;
+        // a text field takes a dropped text as typing
+        const target = e.target as HTMLElement | null;
+        if (target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA') && !types.includes('Files')) return;
+        e.preventDefault();
+        const p = droppedPath(e.dataTransfer);
+        if (p) openLocalRepo(p);
+        else if (types.includes('Files')) toast('A dropped folder does not say where it is here', 'info', 'Open it with Open… (⌘O): type or paste its path');
+      };
+      document.addEventListener('dragover', onDragOver);
+      document.addEventListener('drop', onDrop);
       return () => {
         window.removeEventListener('error', onErr);
         window.removeEventListener('unhandledrejection', onRej);
+        document.removeEventListener('dragover', onDragOver);
+        document.removeEventListener('drop', onDrop);
       };
     }
   }, []);
@@ -119,11 +144,23 @@ export default function App() {
   useKeyboard((e) => {
     const s = getState();
     const typing = e.target && ['INPUT', 'TEXTAREA'].includes(e.target.tagName);
+    // ⌃⌥T: a terminal in the repository (More → Open in Terminal); before ⌘T, which Ctrl also reaches
+    if (e.ctrl && e.alt && e.code === 'KeyT') {
+      e.preventDefault();
+      const info = s.screen === 'repo' ? s.repos.find((r) => r.id === s.activeTab && r.live) : undefined;
+      if (info && !s.dialog) openTerminalAt(info.path);
+      return;
+    }
     if (e.meta && e.key === 'k') return (e.preventDefault(), openDialog({ type: 'palette' }));
     if (e.meta && e.key === ',') return (e.preventDefault(), openDialog({ type: 'accounts', tab: 'general' }));
     if (e.meta && e.key === '/') return (e.preventDefault(), openDialog({ type: 'shortcuts' }));
     if (e.meta && e.key === 't') return (e.preventDefault(), openRepoPickerCentered());
-    if (e.key === 'Escape' && s.agent.bar && !s.dialog && !s.agent.busy) return toggleAgentBar(false);
+    // as the start screen's buttons say: Open (⌘O) and Clone (⌘⇧N)
+    if (e.meta && !e.shift && e.key.toLowerCase() === 'o' && !s.dialog) return (e.preventDefault(), openDialog({ type: 'open' }));
+    if (e.meta && e.shift && e.key.toLowerCase() === 'n' && !s.dialog) return (e.preventDefault(), openDialog({ type: 'clone' }));
+    // the repository list (⌘T) takes its own Escape
+    // the command line folds on an Escape nothing above it took (a menu, a dropdown, the repository list close first)
+    if (e.key === 'Escape' && !e.consumed && s.agent.bar && !s.dialog && !s.contextMenu && !s.picker && !s.repoPicker && !s.agent.busy) return toggleAgentBar(false);
     if (e.meta && e.shift && e.key.toLowerCase() === 'j') return (e.preventDefault(), toggleAgent());
     if (e.meta && e.key === 'j') return (e.preventDefault(), toggleAgentBar());
     if (e.meta && (e.key === '=' || e.key === '+')) return (e.preventDefault(), stepUiScale(1));
@@ -134,6 +171,8 @@ export default function App() {
     if (e.meta && e.key === '1') return (e.preventDefault(), setSection('changes'));
     if (e.meta && e.key === '2') return (e.preventDefault(), setSection('commits'));
     if (e.meta && e.key === 'b') return (e.preventDefault(), setState({ sidebarCollapsed: !s.sidebarCollapsed }));
+    // ⌘R: the repository read again, as More → Refresh says (the browser's reload of the whole window is ⌘⇧R)
+    if (e.meta && !e.shift && e.key.toLowerCase() === 'r') return (e.preventDefault(), void refreshNow());
     if (e.meta && e.key === 'Enter') return (e.preventDefault(), commit(s.commitAction === 'commit-push'));
     // ⌘Z in a text field is the field's own undo; elsewhere it takes back the repository's last action
     if (e.meta && !e.shift && e.key.toLowerCase() === 'z' && !typing) return (e.preventDefault(), undoLast());
@@ -141,6 +180,8 @@ export default function App() {
     if (e.meta && e.shift && e.key.toLowerCase() === 'f') return (e.preventDefault(), openDialog({ type: 'fetch' }));
     if (e.meta && e.shift && e.key.toLowerCase() === 'p') return (e.preventDefault(), openDialog({ type: 'push' }));
     if (e.meta && e.shift && e.key.toLowerCase() === 'l') return (e.preventDefault(), openDialog({ type: 'pull' }));
+    // ⌘F: search commits (the shortcut list promised it; nothing answered)
+    if (e.meta && !e.shift && e.key.toLowerCase() === 'f') return (e.preventDefault(), focusCommitSearch());
     if ((e.key === 'ArrowLeft' || e.key === 'ArrowRight') && !typing) {
       const r = s.repoStates[s.activeTab ?? ''];
       if (r?.section === 'commits' && r.selectedArea === 'commit' && r.selectedCommit) {
@@ -148,14 +189,24 @@ export default function App() {
         setMergeCollapsed(r.selectedCommit, e.key === 'ArrowLeft');
       }
     }
-    if (e.key === ' ' && !typing) {
-      const r = s.repoStates[s.activeTab ?? ''];
-      if (r?.section === 'changes' && r.selectedFile) {
+    const rs = s.repoStates[s.activeTab ?? ''];
+    const listArea = rs?.section === 'changes' && (rs.selectedArea === 'unstaged' || rs.selectedArea === 'staged') ? rs.selectedArea : null;
+    // Space: the picked files (or the selected one) go to the other list
+    if (e.key === ' ' && !typing && listArea) {
+      const paths = pickedFiles(rs, listArea);
+      if (paths.length) {
         e.preventDefault();
-        if (r.selectedArea === 'unstaged') stageFile(r.selectedFile);
-        else if (r.selectedArea === 'staged') unstageFile(r.selectedFile);
+        if (listArea === 'unstaged') stageFiles(paths);
+        else unstageFiles(paths);
       }
     }
+    // ⌘A in Changes: every file of the list the selection is in
+    if (e.meta && e.key.toLowerCase() === 'a' && !typing && listArea) {
+      e.preventDefault();
+      const list = listArea === 'unstaged' ? rs!.unstaged : rs!.staged;
+      if (list.length) setFileSelection(listArea, list.map((f) => f.path), rs!.selectedFile ?? undefined);
+    }
+    if (e.key === 'Escape' && !e.consumed && !typing && rs?.fileSelection.length && !s.dialog && !s.contextMenu) clearFileSelection();
   });
 
   // fonts swap in when loaded; the UI renders immediately with the platform fallback

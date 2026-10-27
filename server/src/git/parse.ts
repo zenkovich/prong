@@ -1,4 +1,4 @@
-import type { Commit, ContentKind, DiffLine, FileChange, FileStatus, Hunk, Ref, Remote, Stash } from '../types.js';
+import type { Commit, ContentKind, DiffLine, FileChange, FileStatus, Hunk, Ref, Remote, Stash, SubmoduleChanges } from '../types.js';
 
 export const SEP = '\x1f';
 export const REC = '\x1e';
@@ -189,7 +189,36 @@ export function parseStatus(out: string): StatusResult {
   return { unstaged, staged, branch };
 }
 
+/**
+ * The submodules with changes in their own files, joined to a status read with --ignore-submodules=dirty: a listed
+ * submodule (its commit moved) gets them as `inside`; one at its recorded commit is listed for them alone (`only`),
+ * among the tracked entries in path order as git lists it. A path the list has as something else (a conflict) is
+ * left as it is.
+ */
+export function joinSubmoduleChanges(unstaged: FileChange[], list: SubmoduleChanges[]): FileChange[] {
+  const rest = new Map(list.filter((s) => s.modified + s.untracked > 0).map((s) => [s.path, s]));
+  if (!rest.size) return unstaged;
+  const out = unstaged.map((f) => {
+    const s = rest.get(f.path);
+    if (!s) return f;
+    rest.delete(f.path);
+    return f.kind === 'submodule' ? { ...f, inside: { modified: s.modified, untracked: s.untracked, files: s.files } } : f;
+  });
+  for (const s of [...rest.values()].sort((a, b) => (a.path < b.path ? -1 : 1))) {
+    const at = out.findIndex((f) => f.status === '?' || f.path > s.path);
+    const row: FileChange = { path: s.path, status: 'M', kind: 'submodule', additions: 0, deletions: 0, inside: { modified: s.modified, untracked: s.untracked, files: s.files, only: true } };
+    out.splice(at < 0 ? out.length : at, 0, row);
+  }
+  return out;
+}
+
 // ---------- unified diff ----------
+
+/**
+ * The commit of a "Subproject commit <sha>" line. A submodule with changes in its own files is "<sha>-dirty" in a
+ * working-copy diff: the sha is the commit (it used to be taken whole, and "Go to" looked for "<sha>-dirty").
+ */
+export const subprojectSha = (s: string) => s.trim().replace(/-dirty$/, '');
 
 export interface ParsedDiff {
   files: FileChange[];
@@ -256,7 +285,17 @@ export function parseDiff(out: string, opts: { largeThreshold?: number } = {}): 
       cur.hunks = undefined;
       continue;
     }
-    if (line.startsWith('index ') || line.startsWith('--- ') || line.startsWith('+++ ') || line.startsWith('old mode') || line.startsWith('new mode')) continue;
+    // a mode change (chmod +x) says so: a diff without hunks is not "no changes"
+    if (line.startsWith('old mode ')) {
+      cur.mode = { before: line.slice(9).trim(), after: cur.mode?.after ?? '' };
+      continue;
+    }
+    if (line.startsWith('new mode ')) {
+      cur.mode = { before: cur.mode?.before ?? '', after: line.slice(9).trim() };
+      continue;
+    }
+    // file headers come before the first hunk: inside one, "--- x" is a removed line "-- x" (an SQL or Lua comment)
+    if (!hunk && (line.startsWith('index ') || line.startsWith('--- ') || line.startsWith('+++ '))) continue;
     if (line.startsWith('@@')) {
       const m = line.match(/^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@(.*)$/);
       if (!m) continue;
@@ -271,14 +310,19 @@ export function parseDiff(out: string, opts: { largeThreshold?: number } = {}): 
       if (/^[-+]Subproject commit/.test(line)) {
         cur.kind = 'submodule';
         cur.hunks = undefined;
-        const sha = line.slice('+Subproject commit '.length).trim();
+        const sha = subprojectSha(line.slice('+Subproject commit '.length));
         cur.submodule = cur.submodule ?? { before: '', after: '' };
         if (line[0] === '-') cur.submodule.before = sha;
         else cur.submodule.after = sha;
       }
       continue;
     }
-    if (line.startsWith('\\ No newline')) continue;
+    // the line before has no newline at its end: kept, so a patch of this hunk still applies (git apply is strict)
+    if (line.startsWith('\\ No newline')) {
+      const last = hunk.lines[hunk.lines.length - 1];
+      if (last) last.noEol = true;
+      continue;
+    }
     const c = line[0];
     const text = line.slice(1);
     if ((c === '+' || c === '-') && text.startsWith('Subproject commit ')) {
@@ -286,8 +330,8 @@ export function parseDiff(out: string, opts: { largeThreshold?: number } = {}): 
       cur.hunks = undefined;
       hunk = null;
       cur.submodule = cur.submodule ?? { before: '', after: '' };
-      if (c === '-') cur.submodule.before = text.slice('Subproject commit '.length).trim();
-      else cur.submodule.after = text.slice('Subproject commit '.length).trim();
+      if (c === '-') cur.submodule.before = subprojectSha(text.slice('Subproject commit '.length));
+      else cur.submodule.after = subprojectSha(text.slice('Subproject commit '.length));
       continue;
     }
     rawLines++;
@@ -322,7 +366,8 @@ export function hunkPatch(file: FileChange, hunk: Hunk): string {
   const a = creates ? '/dev/null' : `a/${file.oldPath ?? file.path}`;
   const b = deletes ? '/dev/null' : `b/${file.path}`;
   const mode = creates ? 'new file mode 100644\n' : deletes ? 'deleted file mode 100644\n' : '';
-  const body = hunk.lines.map((l) => (l.kind === 'add' ? '+' : l.kind === 'del' ? '-' : ' ') + l.text).join('\n');
+  // a line with no newline at its end is followed by git's marker, or the patch does not apply
+  const body = hunk.lines.map((l) => (l.kind === 'add' ? '+' : l.kind === 'del' ? '-' : ' ') + l.text + (l.noEol ? '\n\\ No newline at end of file' : '')).join('\n');
   return `diff --git a/${file.oldPath ?? file.path} b/${file.path}\n${mode}--- ${a}\n+++ ${b}\n${hunk.header}\n${body}\n`;
 }
 
@@ -354,8 +399,9 @@ export function parseRaw(out: string): FileChange[] {
   return files;
 }
 
-export function parseNumstat(out: string): Map<string, { additions: number; deletions: number }> {
-  const map = new Map<string, { additions: number; deletions: number }>();
+/** `binary`: git counts no lines ("-\t-"): a binary file whatever its name says */
+export function parseNumstat(out: string): Map<string, { additions: number; deletions: number; binary?: boolean }> {
+  const map = new Map<string, { additions: number; deletions: number; binary?: boolean }>();
   const tokens = out.split('\0');
   for (let i = 0; i < tokens.length; i++) {
     const t = tokens[i];
@@ -365,7 +411,7 @@ export function parseNumstat(out: string): Map<string, { additions: number; dele
     let path = m[3];
     if (path === '') path = tokens[i + 2] ?? '';
     if (m[3] === '') i += 2; // rename: "a\tb\t\0old\0new\0"
-    map.set(path, { additions: m[1] === '-' ? 0 : parseInt(m[1], 10), deletions: m[2] === '-' ? 0 : parseInt(m[2], 10) });
+    map.set(path, { additions: m[1] === '-' ? 0 : parseInt(m[1], 10), deletions: m[2] === '-' ? 0 : parseInt(m[2], 10), ...(m[1] === '-' && m[2] === '-' ? { binary: true } : {}) });
   }
   return map;
 }

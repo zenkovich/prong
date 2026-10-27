@@ -134,9 +134,17 @@ export class AppSources {
     const r = await this.git(['revert', '--no-edit', sha], { allowFail: true });
     if (r.code !== 0) {
       await this.git(['revert', '--abort'], { allowFail: true });
-      throw new Error((r.stderr || r.stdout).trim().split('\n').slice(-2).join(' ') || 'revert failed');
+      throw new Error(revertFailure(`${r.stdout}\n${r.stderr}`));
     }
     return (await this.git(['rev-parse', 'HEAD'])).stdout.trim();
+  }
+
+  /** what a version changed, as a patch (the versions list shows only the files); a huge one is cut */
+  async diff(sha: string, max = 200_000): Promise<string> {
+    if (!/^[0-9a-f]{7,40}$/i.test(sha)) throw new Error(`Not a version: ${sha}`);
+    const r = await this.git(['show', '--format=', '--patch', '--no-color', '--no-renames', '--no-ext-diff', sha], { allowFail: true });
+    if (r.code !== 0) throw new Error((r.stderr || r.stdout).trim().split('\n').slice(-1)[0] || `no version ${sha}`);
+    return r.stdout.length > max ? r.stdout.slice(0, max) + '\n… (cut)' : r.stdout;
   }
 
   /** Agent versions in order, with their state after every later revert / re-apply. */
@@ -193,6 +201,18 @@ export class AppSources {
     }
     return versions;
   }
+}
+
+/**
+ * Why a revert of a version stopped, in words: git's own last lines are hints about `git revert --abort` (already
+ * done here), not the cause.
+ */
+export function revertFailure(output: string): string {
+  const conflicts = [...output.matchAll(/^CONFLICT \([^)]*\): .*? in (.+)$/gm)].map((m) => m[1].trim());
+  if (conflicts.length)
+    return `A later version changed the same lines of ${[...new Set(conflicts)].join(', ')}, so this one cannot be taken back or applied again on its own. Nothing was changed: roll back to an earlier version instead, or revert the later versions first.`;
+  const lines = output.split('\n').map((l) => l.trim()).filter((l) => l && !l.startsWith('hint:'));
+  return lines.slice(-2).join(' ') || 'git revert failed';
 }
 
 // ---------- interface build ----------

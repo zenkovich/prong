@@ -29,8 +29,12 @@ import {
   switchWorkspace,
   toast,
   toggleBranchFilter,
+  setCommitMessage,
+  toggleAmend,
   toggleCommitDesc,
   toggleDetailsDesc,
+  togglePin,
+  toggleTheme,
 } from './store';
 import type { Commit } from '../git/types';
 
@@ -314,5 +318,146 @@ describe('store: notifications', () => {
     toast('Later', 'error');
     vi.advanceTimersByTime(7100);
     expect(getState().toasts).toEqual([]);
+  });
+});
+
+describe('store: the commit box Amend checkbox', () => {
+  const head = { sha: 'h1', parents: [], subject: 'Last commit', body: 'Its body', author: 'A', email: 'a@x', date: 0 } as unknown as Commit;
+  const box = () => {
+    const r = getState().repoStates.a;
+    return { amend: r.amend, summary: r.commitMessage, description: r.commitDescription };
+  };
+  beforeEach(() => {
+    setState({ workspaces: [{ id: 'work', name: 'work' }], activeWorkspace: 'work', tabs: [], activeTab: null, repoStates: {}, repos: [info('a')], engine: { online: false, git: '', version: '' } });
+    openRepo('a');
+    const r = getState().repoStates.a;
+    setState({ repoStates: { a: { ...r, commits: [head], head: 'h1', commitMessage: '', commitDescription: '', amend: false } } });
+  });
+
+  it('an empty box gets the last message; unticking takes it away again', () => {
+    toggleAmend();
+    expect(box()).toEqual({ amend: true, summary: 'Last commit', description: 'Its body' });
+    toggleAmend();
+    expect(box()).toEqual({ amend: false, summary: '', description: '' });
+  });
+  it('what the user typed stays, ticked and unticked (unticking wiped it)', () => {
+    setCommitMessage('my words');
+    toggleAmend();
+    expect(box()).toEqual({ amend: true, summary: 'my words', description: '' });
+    toggleAmend();
+    expect(box()).toEqual({ amend: false, summary: 'my words', description: '' });
+  });
+  it('the loaded message, once edited, is the user’s: unticking keeps it', () => {
+    toggleAmend();
+    setCommitMessage('Last commit, reworded');
+    toggleAmend();
+    expect(box().summary).toBe('Last commit, reworded');
+  });
+});
+
+describe('store: tabs, workspaces and the start screen (shell audit)', () => {
+  const liveInfo = (id: string, workspace = 'work', workspaces?: string[]) => ({ ...info(id, workspace), live: true, workspaces });
+  beforeEach(() => {
+    vi.spyOn(live, 'persistUi').mockImplementation(() => {});
+    vi.spyOn(live, 'openLive').mockImplementation(async (id: string) => void setState((s) => ({ activeTab: id, screen: 'repo', repoStates: { ...s.repoStates, [id]: { ...(s.repoStates.a ?? ({} as any)), id } } })));
+    vi.spyOn(live.client, 'moveRepo').mockResolvedValue(undefined);
+    vi.spyOn(live.client, 'pinRepo').mockResolvedValue(undefined);
+    setState({ workspaces: [{ id: 'work', name: 'work' }, { id: 'home', name: 'home' }], activeWorkspace: 'work', workspaceTabs: {}, tabs: [], activeTab: null, repoStates: {}, repos: [info('a'), info('b'), info('c'), info('h', 'home')], screen: 'welcome', toasts: [], dialog: null, engine: { online: false, git: '', version: '' } });
+  });
+  afterEach(() => vi.restoreAllMocks());
+
+  it('closing the active tab shows its neighbour (the next one, else the one before)', () => {
+    openRepo('a');
+    openRepo('b');
+    openRepo('c');
+    setState({ activeTab: 'b' });
+    closeTab('b');
+    expect(getState().activeTab).toBe('c');
+    closeTab('c');
+    expect(getState().activeTab).toBe('a');
+    expect(getState().screen).toBe('repo');
+    closeTab('a');
+    expect(getState().activeTab).toBeNull();
+    expect(getState().screen).toBe('welcome');
+  });
+
+  it('closing a tab from the start screen keeps the start screen; closing another tab keeps the shown one', () => {
+    openRepo('a');
+    openRepo('b');
+    setState({ screen: 'welcome' });
+    closeTab('b');
+    expect(getState().screen).toBe('welcome');
+    expect(getState().tabs).toEqual(['a']);
+    openRepo('b');
+    openRepo('c');
+    closeTab('a');
+    expect(getState().activeTab).toBe('c');
+    expect(getState().screen).toBe('repo');
+  });
+
+  it('the neighbour that was never read (a tab of the last session) is read when it is shown', () => {
+    setState({ repos: [liveInfo('x'), liveInfo('y')], tabs: ['x', 'y'], activeTab: 'x', screen: 'repo', repoStates: { x: { id: 'x' } as any } });
+    closeTab('x');
+    expect(live.openLive).toHaveBeenCalledWith('y');
+    expect(getState().activeTab).toBe('y');
+  });
+
+  it('a workspace picked on the start screen keeps the start screen; from a repository it shows its last tab', () => {
+    openRepo('a');
+    switchWorkspace('home');
+    expect(getState().screen).toBe('welcome');
+    openRepo('h');
+    setState({ screen: 'welcome' });
+    switchWorkspace('work', true);
+    expect(getState().screen).toBe('welcome');
+    expect(getState().tabs).toEqual(['a']);
+    switchWorkspace('home');
+    expect(getState().screen).toBe('repo');
+    expect(getState().activeTab).toBe('h');
+  });
+
+  it('moving a repository out of the workspace whose scan lists it takes it out of that list, and tells the engine where from', () => {
+    setState({ repos: [liveInfo('s', 'work', ['work', 'home'])] });
+    moveRepoToWorkspace('s', 'home');
+    const s = getState().repos.find((r) => r.id === 's')!;
+    expect(inWorkspace(s, 'work')).toBe(false);
+    expect(inWorkspace(s, 'home')).toBe(true);
+    expect(live.client.moveRepo).toHaveBeenCalledWith('/tmp/s', 'home', 'work');
+  });
+
+  it('a pin is kept by the engine; the palette’s next scheme is remembered', () => {
+    setState({ repos: [liveInfo('p')] });
+    togglePin('p');
+    expect(live.client.pinRepo).toHaveBeenCalledWith('/tmp/p', true);
+    expect(getState().repos[0].pinned).toBe(true);
+    setState({ theme: 'amber' });
+    toggleTheme();
+    expect(live.persistUi).toHaveBeenCalledWith({ theme: 'phosphor' });
+  });
+
+  it('deleting a workspace moves the repositories it owned in the engine too (or it came back on the next launch)', () => {
+    setState({ workspaces: [{ id: 'work', name: 'work' }, { id: 'gone', name: 'gone' }], repos: [liveInfo('g', 'gone'), liveInfo('w', 'work')] });
+    deleteWorkspace('gone');
+    (getState().dialog as any).onConfirm();
+    expect(live.client.moveRepo).toHaveBeenCalledWith('/tmp/g', 'work');
+    expect(live.client.moveRepo).toHaveBeenCalledTimes(1);
+  });
+
+  it('the history / details split is remembered', () => {
+    setLayout({ details: 0.3 });
+    expect(live.persistUi).toHaveBeenCalledWith({ detailsRatio: 0.3 });
+    applyUiPrefs({ detailsRatio: 0.95 });
+    expect(getState().layout.details).toBe(0.8);
+  });
+
+  it('removing the shown repository from the list closes its tab and points nowhere else', () => {
+    openRepo('a');
+    openRepo('b');
+    removeRepo('b');
+    expect(getState().tabs).toEqual(['a']);
+    expect(getState().activeTab).toBe('a');
+    setState({ screen: 'welcome' });
+    removeRepo('a');
+    expect(getState().activeTab).toBeNull();
   });
 });

@@ -1,4 +1,4 @@
-import React, { useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { ScrollView, StyleSheet, View } from 'react-native';
 import { Ref } from '../git/types';
 import {
@@ -29,6 +29,7 @@ import {
   setTheme,
   shortSha,
   stash,
+  stashBranch,
   stepUiScale,
   switchWorkspace,
   toast,
@@ -49,8 +50,10 @@ import { AccountsDialog, CloneDialog, Field, InitDialog, OpenDialog } from './ac
 import { Select } from './Select';
 import { ConnectionDialog } from './ConnectionDialog';
 import { DeleteBranchesDialog } from './BranchBatchDialog';
+import { branchNameProblem } from './branchNames';
 import * as live from '../state/live';
 import { desktop, pickFolder } from '../desktop';
+import { refNameProblem } from './refName';
 
 export function DialogHost() {
   const d = useStore((s) => s.dialog);
@@ -63,7 +66,7 @@ export function DialogHost() {
     case 'init':
       return <InitDialog />;
     case 'accounts':
-      return <AccountsDialog tab={d.tab} />;
+      return <AccountsDialog tab={d.tab} token={d.token} />;
     case 'confirm':
       return <ConfirmDialog title={d.title} message={d.message} confirmLabel={d.confirmLabel} danger={d.danger} onConfirm={d.onConfirm} />;
     case 'rebase':
@@ -75,7 +78,7 @@ export function DialogHost() {
     case 'fetch':
       return <FetchDialog />;
     case 'branch':
-      return <BranchDialog fromSha={d.fromSha} />;
+      return <BranchDialog fromSha={d.fromSha} fromName={d.fromName} stash={d.stash} />;
     case 'merge':
       return <MergeDialog source={d.source} />;
     case 'tag':
@@ -128,25 +131,25 @@ function WorkspaceDialog({ id }: { id?: string }) {
       footer={
         <>
           <Button label="Cancel" onPress={closeDialog} />
-          <Button label={existing ? 'Save' : 'Create & switch'} primary style={{ marginLeft: 8 }} disabled={!valid} onPress={() => void submit()} />
+          <Button label={existing ? 'Save' : 'Create & switch'} primary style={{ marginLeft: 8 }} disabled={!valid} onPress={() => void submit()} testID="ws-save" />
         </>
       }
     >
       <Field label="Name">
-        <Input value={name} onChange={setName} placeholder="work, home, client-x…" autoFocus onSubmit={() => void submit()} />
+        <Input value={name} onChange={setName} placeholder="work, home, client-x…" autoFocus onSubmit={() => void submit()} testID="ws-name" />
       </Field>
       <Field label="Root folder (scanned for repositories, optional)" style={{ marginTop: 10 }}>
         <View style={{ flexDirection: 'row' }}>
-          <Input value={root} onChange={setRoot} mono placeholder="~/work" style={{ flex: 1 }} />
+          <Input value={root} onChange={setRoot} onSubmit={() => void submit()} mono placeholder="~/work" style={{ flex: 1 }} testID="ws-root-input" />
           <Button label="Browse…" icon="folder" style={{ marginLeft: 6 }} onPress={async () => (desktop() ? setRoot((await pickFolder('Choose the workspace root folder')) ?? root) : toast('Folder picker is available in the macOS app; type the path', 'info'))} />
         </View>
       </Field>
       <View style={{ flexDirection: 'row', alignItems: 'flex-end', marginTop: 10 }}>
         <Field label="Scan depth" style={{ width: 90 }}>
-          <Input value={depth} onChange={setDepth} mono />
+          <Input value={depth} onChange={setDepth} onSubmit={() => void submit()} mono testID="ws-depth" />
         </Field>
         {existing?.rootPath && (
-          <Button small label={scanning === existing.id ? 'Scanning…' : 'Scan now'} icon="refresh" style={{ marginLeft: 10, marginBottom: 1 }} disabled={!engine.online || scanning === existing.id} onPress={() => void live.scanWorkspace(existing.id, true)} />
+          <Button small label={scanning === existing.id ? 'Scanning…' : 'Scan now'} icon="refresh" testID="ws-scan-now" style={{ marginLeft: 10, marginBottom: 1 }} disabled={!engine.online || scanning === existing.id} onPress={() => void live.scanWorkspace(existing.id, true)} />
         )}
       </View>
       <Txt size={FONT.sm} muted style={{ marginTop: 10 }}>
@@ -165,7 +168,9 @@ function RenameBranchDialog({ name }: { name: string }) {
   const t = useTheme();
   const repo = useRepo();
   const [next, setNext] = useState(name);
-  const valid = /^[\w./-]+$/.test(next) && next !== name && !repo.refs.some((r) => r.kind === 'branch' && r.name === next);
+  // why it cannot be renamed to that (said under the field); a change of case alone is a rename
+  const problem = next === name ? null : branchNameProblem(next) ?? (repo.refs.some((r) => r.kind === 'branch' && r.name === next) ? `A branch named ${next} already exists` : null);
+  const valid = next !== name && !problem;
   const submit = () => valid && (repo.live ? live.renameBranchTo(name, next) : (renameBranch(name, next), closeDialog()));
   return (
     <Modal
@@ -175,13 +180,18 @@ function RenameBranchDialog({ name }: { name: string }) {
       footer={
         <>
           <Button label="Cancel" onPress={closeDialog} />
-          <Button label="Rename" primary style={{ marginLeft: 8 }} disabled={!valid} onPress={submit} />
+          <Button label="Rename" primary style={{ marginLeft: 8 }} disabled={!valid} onPress={submit} testID="rename-go" />
         </>
       }
     >
       <Field label={`New name for ${name}`}>
-        <Input value={next} onChange={setNext} mono autoFocus onSubmit={submit} />
+        <Input value={next} onChange={setNext} mono autoFocus onSubmit={submit} testID="rename-input" />
       </Field>
+      {problem ? (
+        <Txt size={FONT.xs} color={t.del} style={{ marginTop: 4 }} testID="rename-note">
+          {problem}
+        </Txt>
+      ) : null}
     </Modal>
   );
 }
@@ -190,7 +200,13 @@ function UpstreamDialog({ branch }: { branch: string }) {
   const t = useTheme();
   const repo = useRepo();
   const current = repo.refs.find((r) => r.name === branch);
-  const [upstream, setUpstream] = useState(current?.upstream ?? `origin/${branch}`);
+  // what it tracks now (while the remote still has it), else the same name on a remote; nothing picked when neither
+  // exists (git refuses an upstream that is not there)
+  const isRemote = (n: string) => repo.refs.some((r) => r.kind === 'remote' && r.name === n);
+  const sameName = repo.remotes.map((rm) => `${rm.name}/${branch}`).find(isRemote);
+  const [upstream, setUpstream] = useState(current?.upstream && isRemote(current.upstream) ? current.upstream : sameName ?? '');
+  const go = () => upstream && (repo.live ? live.setUpstream(branch, upstream) : (toast(`Upstream of ${branch} → ${upstream} (mock)`, 'info'), closeDialog()));
+  useEnter(go, !!upstream);
   return (
     <Modal
       title={`Upstream for ${branch}`}
@@ -199,11 +215,13 @@ function UpstreamDialog({ branch }: { branch: string }) {
       footer={
         <>
           <Button label="Cancel" onPress={closeDialog} />
-          <Button label="Set upstream" primary style={{ marginLeft: 8 }} disabled={!upstream} onPress={() => (repo.live ? live.setUpstream(branch, upstream) : (toast(`Upstream of ${branch} → ${upstream} (mock)`, 'info'), closeDialog()))} />
+          <Button label="Set upstream" primary style={{ marginLeft: 8 }} disabled={!upstream} onPress={go} testID="upstream-go" />
         </>
       }
     >
-      <BranchPicker value={upstream} onChange={setUpstream} kinds={['remote']} />
+      <View testID="upstream-dialog">
+        <BranchPicker value={upstream} onChange={setUpstream} kinds={['remote']} />
+      </View>
     </Modal>
   );
 }
@@ -211,15 +229,20 @@ function UpstreamDialog({ branch }: { branch: string }) {
 function RemoteDialog({ name, url }: { name?: string; url?: string }) {
   const t = useTheme();
   const repo = useRepo();
-  const [n, setN] = useState(name ?? 'origin');
-  const [u, setU] = useState(url ?? '');
   const editing = !!name;
-  const valid = /^[\w.-]+$/.test(n) && u.trim().length > 0;
+  // a new remote is “origin” unless there is one already
+  const [n, setN] = useState(name ?? (repo.remotes.some((r) => r.name === 'origin') ? '' : 'origin'));
+  const [u, setU] = useState(url ?? '');
+  const clean = n.trim();
+  // why it cannot be saved, said under the fields (an empty address is plain to see)
+  const problem = !clean ? null : !/^[\w.-]+$/.test(clean) ? 'Not a valid remote name: letters, digits, “.”, “_” and “-”' : clean !== name && repo.remotes.some((r) => r.name === clean) ? `A remote named ${clean} already exists` : null;
+  const valid = !!clean && !problem && u.trim().length > 0 && (!editing || clean !== name || u.trim() !== url);
   const submit = () => {
     if (!valid) return;
-    if (!repo.live) return (toast(`${editing ? 'Updated' : 'Added'} remote ${n} (mock)`, 'success'), closeDialog());
-    if (editing) live.setRemoteUrl(name!, u.trim());
-    else live.addRemote(n, u.trim());
+    if (!repo.live) return (toast(`${editing ? 'Updated' : 'Added'} remote ${clean} (mock)`, 'success'), closeDialog());
+    // the name used to be editable but ignored: a new name renames the remote
+    if (editing) live.editRemote(name!, clean, u.trim());
+    else live.addRemote(clean, u.trim());
   };
   return (
     <Modal
@@ -229,15 +252,20 @@ function RemoteDialog({ name, url }: { name?: string; url?: string }) {
       footer={
         <>
           <Button label="Cancel" onPress={closeDialog} />
-          <Button label={editing ? 'Save' : 'Add'} primary style={{ marginLeft: 8 }} disabled={!valid} onPress={submit} />
+          <Button label={editing ? 'Save' : 'Add'} primary style={{ marginLeft: 8 }} disabled={!valid} onPress={submit} testID="remote-go" />
         </>
       }
     >
       <Field label="Name">
-        <Input value={n} onChange={setN} mono autoFocus={!editing} />
+        <Input value={n} onChange={setN} mono autoFocus={!editing} onSubmit={submit} testID="remote-name" />
       </Field>
+      {problem ? (
+        <Txt size={FONT.xs} color={t.del} style={{ marginTop: 4 }} testID="remote-note">
+          {problem}
+        </Txt>
+      ) : null}
       <Field label="URL" style={{ marginTop: 10 }}>
-        <Input value={u} onChange={setU} mono placeholder="git@github.com:user/repo.git" autoFocus={editing} onSubmit={submit} />
+        <Input value={u} onChange={setU} mono placeholder="git@github.com:user/repo.git" autoFocus={editing} onSubmit={submit} testID="remote-url" />
       </Field>
     </Modal>
   );
@@ -249,13 +277,14 @@ function BranchPicker({ value, onChange, exclude, kinds = ['branch', 'remote'] }
   const t = useTheme();
   const repo = useRepo();
   const [q, setQ] = useState('');
-  const list = repo.refs.filter((r) => kinds.includes(r.kind) && r.name !== exclude && r.name !== 'origin/HEAD' && r.name.toLowerCase().includes(q.toLowerCase()));
+  // a remote's HEAD is only a pointer to one of its branches
+  const list = repo.refs.filter((r) => kinds.includes(r.kind) && r.name !== exclude && !(r.kind === 'remote' && r.name.endsWith('/HEAD')) && r.name.toLowerCase().includes(q.toLowerCase()));
   return (
     <View>
       <Input value={q} onChange={setQ} placeholder="search branches" slash small autoFocus />
       <ScrollView style={[styles.pickerList, { borderColor: t.border, backgroundColor: t.bg }]}>
         {list.map((r) => (
-          <Row key={r.name} height={26} selected={value === r.name} onPress={() => onChange(r.name)}>
+          <Row key={r.name} height={26} selected={value === r.name} onPress={() => onChange(r.name)} testID={value === r.name ? `branch-pick-${r.name}-selected` : `branch-pick-${r.name}`}>
             <Icon name={r.kind === 'remote' ? 'cloud' : r.kind === 'tag' ? 'tag' : 'branch'} size={12} color={r.current ? t.accent : t.textFaint} />
             <Txt size={FONT.sm} style={{ marginLeft: 8, flex: 1 }} weight={r.current ? '600' : '400'}>
               {r.name}
@@ -276,11 +305,18 @@ function RebaseDialog({ d }: { d: Extract<Dialog, { type: 'rebase' }> }) {
   const t = useTheme();
   const repo = useRepo();
   const current = repo.refs.find((r) => r.kind === 'branch' && r.current);
-  const defaultOnto = d.onto ?? (d.fromSha ? repo.refs.find((r) => r.sha === d.fromSha && r.kind !== 'tag')?.name : undefined) ?? repo.refs.find((r) => r.name === 'origin/main')?.name ?? '';
+  // from a commit: its branch when it has one, else the commit itself — never origin/main, which a commit without a
+  // branch used to fall back to (the rebase then went onto origin/main, not onto the commit clicked)
+  const atCommit = d.fromSha ? repo.refs.find((r) => r.sha === d.fromSha && r.kind !== 'tag')?.name : undefined;
+  const defaultOnto = d.onto ?? (d.fromSha ? atCommit ?? '' : repo.refs.find((r) => r.name === 'origin/main')?.name ?? '');
   const [onto, setOnto] = useState(defaultOnto);
   const [interactive, setInteractive] = useState(!!d.interactive);
+  // what git is asked for (these used to be painted on: merges always "kept", autostash always "off", neither sent)
+  const [autostash, setAutostash] = useState(true);
+  const [preserveMerges, setPreserveMerges] = useState(false);
   const ontoRef = repo.refs.find((r) => r.name === onto);
-  const ontoSha = d.fromSha ?? ontoRef?.sha;
+  // the commits listed are those the rebase replays: onto the branch picked, else onto the commit
+  const ontoSha = ontoRef?.sha ?? d.fromSha;
   const commits = useMemo(() => (ontoSha ? commitsToRebase(repo, ontoSha) : []), [repo, ontoSha]);
   const [todo, setTodo] = useState<RebaseTodo[] | null>(null);
   const list = todo ?? commits.map((c) => ({ sha: c.sha, action: 'pick' as const, message: c.subject }));
@@ -303,34 +339,33 @@ function RebaseDialog({ d }: { d: Extract<Dialog, { type: 'rebase' }> }) {
     { a: 'drop', color: t.del, hint: 'remove commit' },
   ];
   const target = d.fromSha && !ontoRef ? `${shortSha(d.fromSha)}` : onto;
+  // nothing of its own to replay but the target is elsewhere: the branch is behind it, and a rebase fast-forwards it
+  const fastForward = list.length === 0 && !interactive && !!ontoSha && ontoSha !== repo.head;
+  const ready = (list.length > 0 || fastForward) && (!!ontoRef || !!d.fromSha);
+  const go = () => {
+    if (!ready) return;
+    const opts = { autostash, preserveMerges: preserveMerges && !interactive };
+    // a bare commit is rebased onto as it is: git takes a commit id (a temporary "__tmp_…" branch made for it used
+    // to stay in the repository)
+    if (d.fromSha && !ontoRef) return rebase(d.fromSha, interactive ? list : undefined, opts);
+    rebase(onto, interactive ? list : undefined, opts);
+  };
+  // Enter starts it, except while a commit message of the list is being edited (Enter ends that edit)
+  useEnter(go, ready && !editing);
 
   return (
     <Modal
       title={interactive ? 'Interactive rebase' : 'Rebase'}
       width={interactive ? 760 : 520}
       icon={<Icon name="rebase" size={18} color={t.accent} />}
+      testID="rebase-dialog"
       footer={
         <>
-          <Txt size={FONT.xs} faint style={{ flex: 1 }}>
-            {list.length} commit{list.length === 1 ? '' : 's'} will be replayed on top of {target || '…'}
+          <Txt size={FONT.xs} faint style={{ flex: 1 }} testID="rebase-note">
+            {fastForward ? `${current?.name ?? 'HEAD'} has no commits of its own: it moves up to ${target} (fast-forward)` : `${list.length} commit${list.length === 1 ? '' : 's'} will be replayed on top of ${target || '…'}`}
           </Txt>
           <Button label="Cancel" onPress={closeDialog} />
-          <Button
-            label={interactive ? 'Start rebase' : 'Rebase'}
-            primary
-            style={{ marginLeft: 8 }}
-            disabled={list.length === 0 || (!ontoRef && !d.fromSha)}
-            onPress={() => {
-              if (d.fromSha && !ontoRef) {
-                // rebase onto a bare commit: use a temporary ref name for the mock
-                const name = `__tmp_${shortSha(d.fromSha)}`;
-                createBranch(name, d.fromSha, false);
-                rebase(name, interactive ? list : undefined);
-                return;
-              }
-              rebase(onto, interactive ? list : undefined);
-            }}
-          />
+          <Button label={interactive ? 'Start rebase' : 'Rebase'} primary style={{ marginLeft: 8 }} testID="rebase-run" disabled={!ready} onPress={go} />
         </>
       }
     >
@@ -349,13 +384,14 @@ function RebaseDialog({ d }: { d: Extract<Dialog, { type: 'rebase' }> }) {
             </View>
           )}
           <View style={{ marginTop: 10 }}>
-            <Checkbox checked={interactive} onChange={setInteractive} label="Interactive (edit, squash, reorder)" />
+            <Checkbox checked={interactive} onChange={setInteractive} label="Interactive (edit, squash, reorder)" testID="rebase-interactive" />
           </View>
           <View style={{ marginTop: 4 }}>
-            <Checkbox checked={true} onChange={() => {}} label="Preserve merges (--rebase-merges)" />
+            {/* an interactive list is flat: git cannot keep merges with it */}
+            <Checkbox checked={preserveMerges && !interactive} disabled={interactive} onChange={setPreserveMerges} label="Preserve merges (--rebase-merges)" testID="rebase-merges" />
           </View>
           <View style={{ marginTop: 4 }}>
-            <Checkbox checked={false} onChange={() => toast('Autostash is on by default in the real client', 'info')} label="Autostash local changes" />
+            <Checkbox checked={autostash} onChange={setAutostash} label="Autostash local changes" testID="rebase-autostash" />
           </View>
         </View>
         {interactive && (
@@ -579,7 +615,8 @@ function PullDialog() {
   const [branch, setBranch] = useState(() => defaultBranch(remote));
   const [strategy, setStrategy] = useState<'merge' | 'rebase' | 'ff'>(pullMode);
   const [autostash, setAutostash] = useState(prefs.pullAutostash);
-  const changes = repo.unstaged.length + repo.staged.length;
+  // changed files (one staged and edited again is one)
+  const changes = new Set([...repo.unstaged.map((f) => f.path), ...repo.staged.map((f) => f.path)]).size;
   const from = `${remote}/${branch}`;
   const fromUpstream = !!cur?.upstream && cur.upstream === from;
   const upShort = cur?.upstream && upRemote === remote ? cur.upstream.slice(remote.length + 1) : undefined;
@@ -637,9 +674,9 @@ function PullDialog() {
                 : `${from} is not what ${cur.name} tracks${cur.upstream ? ` (${cur.upstream})` : ''}: it is pulled in this once, the upstream stays`}
             </Note>
             <Line label="Mode" top>
-              <Radio checked={strategy === 'merge'} onPress={() => setStrategy('merge')} label="Merge" hint="a merge commit when the branches have diverged" />
-              <Radio checked={strategy === 'rebase'} onPress={() => setStrategy('rebase')} label="Rebase" hint="your local commits replayed on top of the pulled ones" />
-              <Radio checked={strategy === 'ff'} onPress={() => setStrategy('ff')} label="Fast-forward only" hint="stop if the branches have diverged" />
+              <Radio checked={strategy === 'merge'} onPress={() => setStrategy('merge')} label="Merge" hint="a merge commit when the branches have diverged" testID="pull-mode-merge" />
+              <Radio checked={strategy === 'rebase'} onPress={() => setStrategy('rebase')} label="Rebase" hint="your local commits replayed on top of the pulled ones" testID="pull-mode-rebase" />
+              <Radio checked={strategy === 'ff'} onPress={() => setStrategy('ff')} label="Fast-forward only" hint="stop if the branches have diverged" testID="pull-mode-ff" />
             </Line>
             <Line label="Options" top>
               <Checkbox checked={autostash} onChange={setAutostash} label="Stash and reapply local changes" testID="pull-autostash" />
@@ -691,7 +728,9 @@ function PushDialog({ branch: initial }: { branch?: string }) {
   const target = `${remote}/${remoteBranch}`;
   const exists = repo.refs.some((r) => r.kind === 'remote' && r.name === target);
   const tracks = local?.upstream === target;
-  const valid = /^[\w./-]+$/.test(remoteBranch) && !remoteBranch.includes('..') && !remoteBranch.startsWith('-') && !remoteBranch.startsWith('/') && !remoteBranch.endsWith('/') && !remoteBranch.endsWith('.lock');
+  // the branch rules of the other dialogs (refName.ts), with the reason said
+  const nameProblem = remoteBranch ? branchNameProblem(remoteBranch) : null;
+  const valid = !!remoteBranch && !nameProblem;
   const ready = !!local && !!remote && valid;
   const go = () => {
     if (!ready) return;
@@ -764,7 +803,7 @@ function PushDialog({ branch: initial }: { branch?: string }) {
                 </View>
               </View>
             </Line>
-            <Note color={!valid && remoteBranch ? t.del : local?.behind && tracks ? t.warn : undefined}>{!valid && remoteBranch ? 'Not a valid branch name' : status}</Note>
+            <Note color={!valid && remoteBranch ? t.del : local?.behind && tracks ? t.warn : undefined}>{nameProblem ?? status}</Note>
             <Line label="Options" top>
               {tracks ? (
                 <Checkbox checked disabled onChange={() => {}} label={`${branch} tracks ${target}`} testID="push-track" />
@@ -784,47 +823,74 @@ function PushDialog({ branch: initial }: { branch?: string }) {
 
 // ---------- branch / merge / tag / reset / stash ----------
 
-function BranchDialog({ fromSha }: { fromSha?: string }) {
+function BranchDialog({ fromSha, fromName, stash: stashIndex }: { fromSha?: string; fromName?: string; stash?: number }) {
   const t = useTheme();
   const repo = useRepo();
   const [name, setName] = useState('');
   const [co, setCo] = useState(true);
   const base = fromSha ?? repo.head;
+  // from a stash: `git stash branch` (where the stash was made, checked out, its changes applied)
+  const fromStash = stashIndex != null ? repo.stashes.find((x) => x.index === stashIndex) : undefined;
+  const create = () => (fromStash ? stashBranch(name, fromStash.index) : createBranch(name, base, co));
   const baseCommit = findCommit(repo, base);
-  const baseRef = repo.refs.find((r) => r.sha === base && r.kind === 'branch');
-  const valid = /^[\w./-]+$/.test(name) && !name.endsWith('/') && !name.includes('..');
+  const baseRef = fromName ? { name: fromName } : repo.refs.find((r) => r.sha === base && r.kind === 'branch');
+  // git's own rules, with the reason said (a narrower pattern used to refuse names git takes, such as fix#12)
+  const problem = refNameProblem(name);
+  const valid = !!name && !problem;
   const stored = storedName(name, repo.refs);
+  // a name that is taken: said here, not by git's error afterwards (any case: on this disk they are one file)
+  const taken = valid ? repo.refs.find((r) => r.kind === 'branch' && r.name.toLowerCase() === stored.toLowerCase()) : undefined;
+  const ok = valid && !taken;
+  // Enter creates it wherever the focus is (the checkbox too), as the dialog's default button
+  useEnter(() => ok && create(), ok);
   return (
     <Modal
       title="New branch"
       width={440}
       icon={<Icon name="branch" size={18} color={t.accent} />}
+      testID="branch-dialog"
       footer={
         <>
           <Button label="Cancel" onPress={closeDialog} />
-          <Button label="Create" primary style={{ marginLeft: 8 }} disabled={!valid} onPress={() => createBranch(name, base, co)} />
+          <Button label="Create" primary style={{ marginLeft: 8 }} disabled={!ok} onPress={create} testID="branch-create" />
         </>
       }
     >
       <Field label="Branch name">
-        <Input value={name} onChange={setName} placeholder="feature/…" mono autoFocus onSubmit={() => valid && createBranch(name, base, co)} />
+        <Input value={name} onChange={setName} placeholder="feature/…" mono autoFocus onSubmit={() => ok && create()} testID="branch-name" />
       </Field>
-      {name && !valid ? (
-        <Txt size={FONT.xs} color={t.del} style={{ marginTop: 4 }}>
-          Invalid branch name
+      {name && problem ? (
+        <View style={{ flexDirection: 'row', flexWrap: 'wrap', marginTop: 4 }} testID="branch-note">
+          <Txt size={FONT.xs} color={t.del}>
+            Invalid branch name
+          </Txt>
+          <Txt size={FONT.xs} color={t.del}>{`: ${problem}`}</Txt>
+        </View>
+      ) : null}
+      {taken ? (
+        <Txt size={FONT.xs} color={t.del} style={{ marginTop: 4 }} testID="branch-exists">
+          {`A branch named ${taken.name} already exists`}
         </Txt>
       ) : null}
-      {valid && stored !== name ? (
+      {ok && stored !== name ? (
         <Txt size={FONT.xs} color={t.warn} style={{ marginTop: 4 }} testID="branch-case-note">
           {`${stored.split('/').slice(0, -1).join('/')}/ already exists: on this Mac names that differ only in case are one folder, so the branch is ${stored}`}
         </Txt>
       ) : null}
-      <Txt size={FONT.sm} muted style={{ marginTop: 10 }}>
-        From: <Txt size={FONT.sm} mono>{shortSha(base)}</Txt> {baseRef ? `(${baseRef.name})` : ''} — {baseCommit?.subject}
-      </Txt>
-      <View style={{ marginTop: 10 }}>
-        <Checkbox checked={co} onChange={setCo} label="Checkout new branch" />
-      </View>
+      {fromStash ? (
+        <Txt size={FONT.sm} muted style={{ marginTop: 10 }} testID="branch-from">
+          From: <Txt size={FONT.sm} mono>{`stash@{${fromStash.index}}`}</Txt> — {fromStash.message}. The branch starts where the stash was made, is checked out, and gets the stash’s changes (the stash is then dropped).
+        </Txt>
+      ) : (
+        <>
+          <Txt size={FONT.sm} muted style={{ marginTop: 10 }} testID="branch-from">
+            From: <Txt size={FONT.sm} mono>{shortSha(base)}</Txt> {baseRef ? `(${baseRef.name})` : ''} — {baseCommit?.subject}
+          </Txt>
+          <View style={{ marginTop: 10 }}>
+            <Checkbox checked={co} onChange={setCo} label="Checkout new branch" testID="branch-checkout" />
+          </View>
+        </>
+      )}
     </Modal>
   );
 }
@@ -836,6 +902,8 @@ function MergeDialog({ source: initial }: { source?: string }) {
   const [source, setSource] = useState(initial ?? '');
   const [noFf, setNoFf] = useState(false);
   const [squash, setSquash] = useState(false);
+  const go = () => source && merge(source, { noFf, squash });
+  useEnter(go, !!source);
   return (
     <Modal
       title="Merge"
@@ -844,17 +912,20 @@ function MergeDialog({ source: initial }: { source?: string }) {
       footer={
         <>
           <Button label="Cancel" onPress={closeDialog} />
-          <Button label={`Merge into ${current?.name ?? ''}`} primary style={{ marginLeft: 8 }} disabled={!source} onPress={() => merge(source, { noFf, squash })} />
+          <Button label={current ? `Merge into ${current.name}` : 'Merge into HEAD'} primary style={{ marginLeft: 8 }} disabled={!source} onPress={go} testID="merge-go" />
         </>
       }
     >
-      <Txt size={FONT.sm} muted style={{ marginBottom: 6 }}>
-        Merge into <Txt size={FONT.sm} weight="600">{current?.name}</Txt>:
-      </Txt>
-      <BranchPicker value={source} onChange={setSource} exclude={current?.name} kinds={['branch', 'remote', 'tag']} />
-      <View style={{ marginTop: 10 }}>
-        <Checkbox checked={noFf} onChange={setNoFf} label="Always create a merge commit (--no-ff)" />
-        <Checkbox checked={squash} onChange={setSquash} label="Squash commits (--squash)" />
+      <View testID="merge-dialog">
+        <Txt size={FONT.sm} muted style={{ marginBottom: 6 }}>
+          Merge into <Txt size={FONT.sm} weight="600">{current?.name}</Txt>:
+        </Txt>
+        <BranchPicker value={source} onChange={setSource} exclude={current?.name} kinds={['branch', 'remote', 'tag']} />
+        <View style={{ marginTop: 10 }}>
+          {/* git refuses the two together: ticking one unticks the other */}
+          <Checkbox checked={noFf} onChange={(v) => (setNoFf(v), v && setSquash(false))} label="Always create a merge commit (--no-ff)" testID="merge-no-ff" />
+          <Checkbox checked={squash} onChange={(v) => (setSquash(v), v && setNoFf(false))} label="Squash commits (--squash): the changes are staged, you commit them" testID="merge-squash" />
+        </View>
       </View>
     </Modal>
   );
@@ -868,21 +939,40 @@ function TagDialog({ sha }: { sha: string }) {
   const [msg, setMsg] = useState('');
   const [pushIt, setPushIt] = useState(false);
   const c = findCommit(repo, sha);
+  const tag = name.trim();
+  // what git would refuse, said before it does
+  const problem = refNameProblem(tag);
+  const taken = !problem && repo.refs.some((r) => r.kind === 'tag' && r.name === tag);
+  const ok = !!tag && !problem && !taken;
+  // "push" sends this tag alone to origin, else to the remote there is
+  const remote = repo.remotes.find((r) => r.name === 'origin')?.name ?? repo.remotes[0]?.name;
+  const create = () => ok && createTag(tag, sha, annotated, pushIt && !!remote, msg, remote);
   return (
     <Modal
       title="New tag"
       width={440}
       icon={<Icon name="tag" size={18} color={t.tag} />}
+      testID="tag-dialog"
       footer={
         <>
           <Button label="Cancel" onPress={closeDialog} />
-          <Button label="Create tag" primary style={{ marginLeft: 8 }} disabled={!name.trim()} onPress={() => createTag(name.trim(), sha, annotated, pushIt)} />
+          <Button label="Create tag" primary style={{ marginLeft: 8 }} disabled={!ok} onPress={create} testID="tag-go" />
         </>
       }
     >
       <Field label="Tag name">
-        <Input value={name} onChange={setName} placeholder="v1.1.0" mono autoFocus />
+        <Input value={name} onChange={setName} placeholder="v1.1.0" mono autoFocus onSubmit={create} testID="tag-name" />
       </Field>
+      {tag && problem ? (
+        <Txt size={FONT.xs} color={t.del} style={{ marginTop: 4 }} testID="tag-invalid">
+          {`Invalid tag name: ${problem}`}
+        </Txt>
+      ) : null}
+      {taken ? (
+        <Txt size={FONT.xs} color={t.del} style={{ marginTop: 4 }} testID="tag-exists">
+          {`A tag named ${tag} already exists`}
+        </Txt>
+      ) : null}
       <Txt size={FONT.sm} muted style={{ marginTop: 8 }}>
         At <Txt size={FONT.sm} mono>{shortSha(sha)}</Txt> — {c?.subject}
       </Txt>
@@ -891,11 +981,11 @@ function TagDialog({ sha }: { sha: string }) {
       </View>
       {annotated && (
         <Field label="Message" style={{ marginTop: 8 }}>
-          <Input value={msg} onChange={setMsg} multiline />
+          <Input value={msg} onChange={setMsg} multiline placeholder={tag || 'the tag name when empty'} testID="tag-message" />
         </Field>
       )}
       <View style={{ marginTop: 8 }}>
-        <Checkbox checked={pushIt} onChange={setPushIt} label="Push tag to origin" />
+        <Checkbox checked={pushIt && !!remote} onChange={setPushIt} disabled={!remote} label={remote ? `Push the tag to ${remote}` : 'Push the tag (no remote)'} testID="tag-push" />
       </View>
     </Modal>
   );
@@ -907,15 +997,18 @@ function ResetDialog({ sha }: { sha: string }) {
   const [mode, setMode] = useState<'soft' | 'mixed' | 'hard'>('mixed');
   const current = repo.refs.find((r) => r.kind === 'branch' && r.current);
   const c = findCommit(repo, sha);
+  // Enter resets, as the button (it did nothing)
+  useEnter(() => reset(sha, mode));
   return (
     <Modal
       title={`Reset ${current?.name ?? 'HEAD'}`}
       width={460}
       icon={<Icon name="undo" size={18} color={t.warn} />}
+      testID="reset-dialog"
       footer={
         <>
           <Button label="Cancel" onPress={closeDialog} />
-          <Button label="Reset" primary={mode !== 'hard'} danger={mode === 'hard'} style={{ marginLeft: 8 }} onPress={() => reset(sha, mode)} />
+          <Button label="Reset" primary={mode !== 'hard'} danger={mode === 'hard'} style={{ marginLeft: 8 }} onPress={() => reset(sha, mode)} testID="reset-run" />
         </>
       }
     >
@@ -937,7 +1030,11 @@ function StashDialog() {
   const [msg, setMsg] = useState('');
   const [keep, setKeep] = useState(false);
   const [untracked, setUntracked] = useState(true);
-  const n = repo.unstaged.length + repo.staged.length;
+  // the files it takes: one staged and edited again is one file; new files only with "include untracked"
+  const n = new Set([...repo.unstaged.filter((f) => untracked || f.status !== '?').map((f) => f.path), ...repo.staged.map((f) => f.path)]).size;
+  const untrackedOnly = n === 0 && repo.unstaged.some((f) => f.status === '?');
+  // Enter stashes wherever the focus is (a checkbox too), as the dialog's default button
+  useEnter(() => stash(msg, keep, untracked), n > 0);
   return (
     <Modal
       title="Stash changes"
@@ -946,19 +1043,19 @@ function StashDialog() {
       footer={
         <>
           <Button label="Cancel" onPress={closeDialog} />
-          <Button label="Stash" primary style={{ marginLeft: 8 }} disabled={n === 0} onPress={() => stash(msg, keep, untracked)} />
+          <Button label="Stash" primary style={{ marginLeft: 8 }} disabled={n === 0} onPress={() => stash(msg, keep, untracked)} testID="stash-go" />
         </>
       }
     >
       <Field label="Message (optional)">
-        <Input value={msg} onChange={setMsg} placeholder="WIP on …" autoFocus onSubmit={() => n > 0 && stash(msg, keep, untracked)} />
+        <Input value={msg} onChange={setMsg} placeholder="WIP on …" autoFocus onSubmit={() => n > 0 && stash(msg, keep, untracked)} testID="stash-message" />
       </Field>
-      <Txt size={FONT.sm} muted style={{ marginTop: 8 }}>
-        {n} changed file{n === 1 ? '' : 's'} will be stashed.
+      <Txt size={FONT.sm} muted style={{ marginTop: 8 }} testID="stash-count">
+        {untrackedOnly ? 'Only new (untracked) files are changed: include them to stash them.' : n ? `${n} changed file${n === 1 ? '' : 's'} will be stashed.` : 'There are no local changes to stash.'}
       </Txt>
       <View style={{ marginTop: 10 }}>
-        <Checkbox checked={keep} onChange={setKeep} label="Keep staged changes (--keep-index)" />
-        <Checkbox checked={untracked} onChange={setUntracked} label="Include untracked files (-u)" />
+        <Checkbox checked={keep} onChange={setKeep} label="Keep staged changes (--keep-index)" testID="stash-keep" />
+        <Checkbox checked={untracked} onChange={setUntracked} label="Include untracked files (-u)" testID="stash-untracked" />
       </View>
     </Modal>
   );
@@ -981,21 +1078,29 @@ function storedName(name: string, refs: Ref[]) {
 
 // ---------- command palette ----------
 
+const PALETTE_ROW = 30;
+const PALETTE_H = 320;
+
 function PaletteDialog() {
   const t = useTheme();
   const repo = useRepo();
   const undoTop = useStore((s) => (s.activeTab ? s.undo[s.activeTab]?.at(-1) : undefined));
   const workspaces = useStore((s) => s.workspaces);
+  const repoPath = useStore((s) => s.repos.find((r) => r.id === s.activeTab && r.live)?.path);
   const [q, setQ] = useState('');
   const [idx, setIdx] = useState(0);
+  // the arrows keep the selected command in view (it used to walk off the bottom of the list)
+  const scroll = useRef<any>(null);
+  const offset = useRef(0);
+  const cur = repo.refs.find((r) => r.kind === 'branch' && r.current);
   const commands: { label: string; icon: IconName; shortcut?: string; run: () => void; group: string }[] = [
     ...(undoTop ? [{ label: `Undo ${undoTop.label}`, icon: 'undo' as IconName, shortcut: '⌘Z', run: () => live.undoLast(), group: 'Repository' }] : []),
     { label: 'Fetch…', icon: 'fetch', shortcut: '⌘⇧F', run: () => openDialog({ type: 'fetch' }), group: 'Remote' },
-    { label: 'Fetch all remotes now', icon: 'fetch', run: () => fetch({}), group: 'Remote' },
+    ...(repo.remotes.length ? [{ label: 'Fetch all remotes now', icon: 'fetch' as IconName, run: () => fetch({}), group: 'Remote' }] : []),
     ...(repo.shallow ? [{ label: 'Fetch the full history (unshallow)', icon: 'history' as IconName, run: () => unshallow(), group: 'Remote' }] : []),
     ...repo.remotes.filter((r) => r.narrow).map((r) => ({ label: `Fetch every branch of ${r.name}`, icon: 'fetch' as IconName, run: () => followAllBranches(r.name), group: 'Remote' })),
-    { label: 'Pull', icon: 'pull', shortcut: '⌘⇧L', run: () => openDialog({ type: 'pull' }), group: 'Remote' },
-    { label: 'Push', icon: 'push', shortcut: '⌘⇧P', run: () => openDialog({ type: 'push' }), group: 'Remote' },
+    { label: 'Pull…', icon: 'pull', shortcut: '⌘⇧L', run: () => openDialog({ type: 'pull' }), group: 'Remote' },
+    { label: 'Push…', icon: 'push', shortcut: '⌘⇧P', run: () => openDialog({ type: 'push' }), group: 'Remote' },
     { label: 'Show local changes', icon: 'edit', shortcut: '⌘1', run: () => (closeDialog(), setSection('changes')), group: 'View' },
     { label: 'Show all commits', icon: 'commit', shortcut: '⌘2', run: () => (closeDialog(), setSection('commits')), group: 'View' },
     { label: 'Next colour scheme', icon: 'sun', run: () => (closeDialog(), toggleTheme()), group: 'View' },
@@ -1010,14 +1115,17 @@ function PaletteDialog() {
     { label: 'New branch…', icon: 'branch', run: () => openDialog({ type: 'branch' }), group: 'Branch' },
     { label: 'Merge…', icon: 'merge', run: () => openDialog({ type: 'merge' }), group: 'Branch' },
     { label: 'Rebase…', icon: 'rebase', run: () => openDialog({ type: 'rebase' }), group: 'Branch' },
-    { label: 'Interactive rebase onto origin/main…', icon: 'rebase', run: () => openDialog({ type: 'rebase', interactive: true, onto: 'origin/main' }), group: 'Branch' },
+    // onto what the branch tracks (it used to be origin/main, which many repositories do not have)
+    ...(cur?.upstream && !cur.gone ? [{ label: `Interactive rebase onto ${cur.upstream}…`, icon: 'rebase' as IconName, run: () => openDialog({ type: 'rebase', interactive: true, onto: cur.upstream }), group: 'Branch' }] : []),
     { label: 'Stash changes…', icon: 'stash', run: () => openDialog({ type: 'stash' }), group: 'Changes' },
     { label: 'New tag…', icon: 'tag', run: () => openDialog({ type: 'tag', sha: repo.head }), group: 'Branch' },
     { label: 'Clone repository…', icon: 'clone', run: () => openDialog({ type: 'clone' }), group: 'Repository' },
     { label: 'Open a repository…', icon: 'folder', shortcut: '⌘T', run: () => (closeDialog(), openRepoPickerCentered()), group: 'Repository' },
     { label: 'Open a folder…', icon: 'folder', run: () => openDialog({ type: 'open' }), group: 'Repository' },
     { label: 'Welcome screen', icon: 'home', run: () => (closeDialog(), goWelcome()), group: 'Repository' },
-    { label: 'Open in Terminal', icon: 'terminal', run: () => (closeDialog(), toast('Opened terminal', 'info')), group: 'Repository' },
+    // what More → Open in Terminal does (this one only said "Opened terminal")
+    { label: 'Open in Terminal', icon: 'terminal', shortcut: '⌃⌥T', run: () => (closeDialog(), repoPath ? live.openTerminalAt(repoPath) : toast('Open a repository first', 'info')), group: 'Repository' },
+    { label: 'Refresh', icon: 'refresh', shortcut: '⌘R', run: () => (closeDialog(), void live.refreshNow()), group: 'Repository' },
     { label: 'Preferences', icon: 'settings', shortcut: '⌘,', run: () => openDialog({ type: 'accounts', tab: 'general' }), group: 'App' },
     { label: 'Accounts', icon: 'github', run: () => openDialog({ type: 'accounts', tab: 'github' }), group: 'App' },
     { label: 'SSH keys', icon: 'key', run: () => openDialog({ type: 'accounts', tab: 'ssh' }), group: 'App' },
@@ -1028,6 +1136,11 @@ function PaletteDialog() {
   ];
   const list = commands.filter((c) => c.label.toLowerCase().includes(q.toLowerCase()));
   const sel = Math.min(idx, list.length - 1);
+  useEffect(() => {
+    const top = sel * PALETTE_ROW;
+    if (top < offset.current) scroll.current?.scrollTo({ y: top, animated: false });
+    else if (top + PALETTE_ROW > offset.current + PALETTE_H) scroll.current?.scrollTo({ y: top + PALETTE_ROW - PALETTE_H, animated: false });
+  }, [sel]);
   useKeyboard((e) => {
     if (e.key === 'ArrowDown') {
       setIdx((i) => Math.min(i + 1, list.length - 1));
@@ -1045,10 +1158,11 @@ function PaletteDialog() {
   return (
     <Modal title="Command palette" width={560}>
       <Input value={q} onChange={(v) => (setQ(v), setIdx(0))} placeholder="type a command" slash autoFocus />
-      <ScrollView style={{ maxHeight: 320, marginTop: 8 }}>
+      <ScrollView ref={scroll} style={{ maxHeight: PALETTE_H, marginTop: 8 }} onScroll={(e) => (offset.current = e.nativeEvent.contentOffset.y)} scrollEventThrottle={16} testID="palette-list">
         {list.map((c, i) => (
-          <Row key={c.label} height={30} selected={i === sel} onPress={c.run} style={{ borderRadius: 0 }}>
-            <Icon name={c.icon} size={14} color={i === sel ? t.accent : t.textMuted} />
+          <Row key={c.label} height={PALETTE_ROW} selected={i === sel} onPress={c.run} style={{ borderRadius: 0 }} testID={i === sel ? 'palette-item-selected' : 'palette-item'}>
+            {/* the selected row is filled with the accent: its icon takes the row's text colour, or it vanishes */}
+            <Icon name={c.icon} size={14} color={i === sel ? t.selectionText : t.textMuted} />
             <Txt style={{ marginLeft: 10, flex: 1 }}>{c.label}</Txt>
             <Txt size={FONT.xs} faint style={{ marginRight: 6 }}>
               {c.group}

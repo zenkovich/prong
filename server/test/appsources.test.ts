@@ -84,6 +84,35 @@ describe('app sources: shadow version log', () => {
     expect(readFileSync(path.join(dir, 'src/Toolbar.tsx'), 'utf8')).toBe('export const theme = false;\n');
   });
 
+  it('a version a later one overlaps cannot be reverted alone: it says why, in words, and changes nothing', async () => {
+    const dir = makeSources('overlap');
+    const app = new AppSources(dir);
+    const b1 = await app.prepare();
+    writeFileSync(path.join(dir, 'src/Toolbar.tsx'), 'export const theme = true;\n// one\n');
+    const v1 = await app.record('first', b1);
+    const b2 = await app.prepare();
+    writeFileSync(path.join(dir, 'src/Toolbar.tsx'), 'export const theme = true;\n// one\n// two\n');
+    await app.record('second', b2);
+    const before = readFileSync(path.join(dir, 'src/Toolbar.tsx'), 'utf8');
+    // git's own last lines were its hints ("run git revert --abort"), which the engine had already done
+    await expect(app.revert(v1!.sha)).rejects.toThrow(/^A later version changed the same lines of src\/Toolbar\.tsx.*Nothing was changed/);
+    expect(readFileSync(path.join(dir, 'src/Toolbar.tsx'), 'utf8')).toBe(before);
+    expect((await app.versions()).map((v) => v.status)).toEqual(['applied', 'applied']);
+    expect((await app.dirty()).size).toBe(0);
+  });
+
+  it('gives the patch of a version: what its details show and Copy diff copies', async () => {
+    const app = new AppSources(path.join(root, 'plain'));
+    const [v1] = await app.versions();
+    const patch = await app.diff(v1.sha);
+    expect(patch).toContain('diff --git a/src/Toolbar.tsx b/src/Toolbar.tsx');
+    expect(patch).toContain('-export const theme = true;');
+    expect(patch).toContain('+export const theme = false;');
+    expect(patch).toContain('+++ b/src/New.tsx');
+    expect(patch).not.toContain('src/Other.tsx'); // the manual edits are not part of the version
+    await expect(app.diff('HEAD --output=/tmp/x')).rejects.toThrow(/Not a version/);
+  });
+
   it("uses the folder's own repository when it has one, without committing unrelated edits", async () => {
     const dir = makeSources('own');
     await runGit(['init', '-q', dir], { cwd: root });

@@ -1,5 +1,5 @@
 import { Platform } from 'react-native';
-import { Commit, FileChange, Hunk, PullOptions, PushOptions, QueueItem, RepoAuth, RepoAuthInfo, RepoSnapshot, Sha, SavedSession, SyncPrefs } from './types';
+import { Commit, FileChange, Hunk, PullOptions, PushOptions, QueueItem, RepoAuth, RepoAuthInfo, RepoSnapshot, Sha, SavedSession, SubmoduleChanges, SyncPrefs } from './types';
 
 /**
  * Everything the UI needs from a git engine. The HTTP implementation talks to the local
@@ -21,6 +21,16 @@ export interface OpEvent {
   error?: string;
 }
 
+export interface GhAccess {
+  kind: 'app' | 'oauth' | 'pat' | 'unknown';
+  installations: { account: string; slug: string; selection: string }[];
+}
+
+export interface AccountCheck {
+  state: 'ok' | 'expired' | 'error';
+  message?: string;
+}
+
 export interface KnownRepo {
   path: string;
   name: string;
@@ -28,10 +38,14 @@ export interface KnownRepo {
   workspaces?: string[];
   lastOpened: number;
   pinned?: boolean;
+  /** the branch it is on (read from its HEAD when listed; '' when detached or unknown) */
+  branch?: string;
 }
 
 export interface OpState {
   kind: 'none' | 'merge' | 'rebase' | 'cherry-pick' | 'revert';
+  /** the message git prepared for the commit that ends a merge, cherry-pick or revert */
+  message?: string;
 }
 
 export interface Submodule {
@@ -41,6 +55,8 @@ export interface Submodule {
   sha: string;
   state: 'ok' | 'uninitialized' | 'modified' | 'conflict';
   describe?: string;
+  /** changes in its own files (edited, new), as the engine last read them */
+  inside?: { modified: number; untracked: number };
 }
 export interface ServerWorkspace {
   id: string;
@@ -105,6 +121,8 @@ export interface UiSettings {
   commitDescOpen: boolean;
   detailsHeaderHeight: number;
   detailsDescOpen: boolean;
+  /** the share of the history's height the commit details take (the splitter under the commit list) */
+  detailsRatio?: number;
   /** the Fetch / Pull / Push dialogs' remembered options */
   sync?: Partial<SyncPrefs>;
 }
@@ -148,27 +166,36 @@ export interface GitClient {
   appRecord(sources: string, message: string, before: Record<string, string>): Promise<{ sha: string; files: string[] } | null>;
   appRevert(sources: string, sha: string): Promise<{ sha: string }>;
   appVersions(sources: string): Promise<AppVersionInfo[]>;
+  /** the patch of one version */
+  appDiff(sources: string, sha: string): Promise<{ diff: string }>;
   appRebuild(sources: string): Promise<{ opId: string | null; skipped?: string }>;
   appFactory(): Promise<void>;
   listRepos(): Promise<KnownRepo[]>;
   openRepo(path: string, workspace: string): Promise<KnownRepo>;
   forgetRepo(path: string): Promise<void>;
-  moveRepo(path: string, workspace: string): Promise<void>;
+  /** `from`: the workspace it is taken out of (its scan stops listing it there) */
+  moveRepo(path: string, workspace: string, from?: string): Promise<void>;
+  pinRepo(path: string, pinned: boolean): Promise<void>;
   initRepo(path: string): Promise<{ path: string }>;
-  clone(url: string, dir: string, name: string | undefined, recursive: boolean, workspace: string): Promise<{ opId: string; path: string }>;
+  /** `auth`: the connection to clone with (the clone is registered with it); not given: the folder's, else git's default */
+  clone(url: string, dir: string, name: string | undefined, recursive: boolean, workspace: string, auth?: RepoAuth | null, partial?: boolean): Promise<{ opId: string; path: string }>;
+  /** the connection the user's other repositories of that owner use (no network) */
+  cloneHint(url: string): Promise<{ auth: RepoAuth; from: string } | null>;
+  /** can the address be read with that connection? (read-only) */
+  cloneTest(url: string, auth: RepoAuth | null): Promise<{ ok: boolean; output: string; describe: string }>;
 
   snapshot(path: string, limit?: number): Promise<RepoSnapshot & { op: OpState; timings?: Record<string, number> }>;
   snapshotCached(path: string): Promise<(RepoSnapshot & { op: OpState; stale: true }) | null>;
   status(path: string): Promise<{ unstaged: FileChange[]; staged: FileChange[] }>;
   commitFiles(path: string, sha: Sha): Promise<FileChange[]>;
   /** one file of a commit or stash (`rev` = sha or "stash@{n}") whose diff was not sent with the list */
-  commitFileDiff(path: string, rev: string, file: string, oldPath?: string, force?: boolean): Promise<FileChange | null>;
+  commitFileDiff(path: string, rev: string, file: string, oldPath?: string, force?: boolean, context?: number): Promise<FileChange | null>;
   /** the log from `skip` down to `sha` plus `after` more, in one pass; index -1 when it is deeper than `max` */
   logUntil(path: string, sha: Sha, skip: number, after: number, revs?: string[], max?: number): Promise<{ index: number; commits: Commit[] }>;
   /** position of a commit in the date-ordered log of `revs` (-1: not among the first `max`) */
   logPosition(path: string, sha: Sha, revs?: string[], max?: number): Promise<number>;
   stashFiles(path: string, index: number): Promise<FileChange[]>;
-  fileDiff(path: string, file: string, area: 'unstaged' | 'staged', force?: boolean): Promise<FileChange | null>;
+  fileDiff(path: string, file: string, area: 'unstaged' | 'staged', force?: boolean, context?: number): Promise<FileChange | null>;
   /** where both sides of a change live (no content); `area` is a working-copy area, a commit sha or a stash ref */
   mediaSides(path: string, file: string, area: string, oldPath?: string): Promise<{ before?: BlobSide; after?: BlobSide }>;
   /** URL of a file's content at a revision (WORKTREE, :0 or any rev), served with byte ranges */
@@ -187,7 +214,8 @@ export interface GitClient {
   unstage(path: string, paths: string[]): Promise<void>;
   unstageAll(path: string): Promise<void>;
   /** `undo`: the engine kept copies of what was discarded (undoDiscard puts them back); null when too large */
-  discard(path: string, paths: string[]): Promise<{ undo: string | null }>;
+  /** `kept`: repositories of their own among the paths, which a discard leaves alone */
+  discard(path: string, paths: string[]): Promise<{ undo: string | null; kept?: string[] }>;
   discardAll(path: string): Promise<{ undo: string | null }>;
   undoDiscard(path: string, token: string): Promise<{ restored: number }>;
   /** the index as a tree (null while files are in conflict), and back */
@@ -204,7 +232,7 @@ export interface GitClient {
   stageHunk(path: string, file: FileChange, hunk: Hunk): Promise<void>;
   unstageHunk(path: string, file: FileChange, hunk: Hunk): Promise<void>;
   discardHunk(path: string, file: FileChange, hunk: Hunk): Promise<{ undo: string | null }>;
-  resolveConflict(path: string, file: string, take: 'ours' | 'theirs'): Promise<void>;
+  resolveConflict(path: string, file: string, take: 'ours' | 'theirs' | 'both'): Promise<void>;
   commit(path: string, message: string, amend: boolean): Promise<{ sha: Sha }>;
 
   fetch(path: string, remote?: string, prune?: boolean, tags?: boolean): Promise<{ opId: string }>;
@@ -232,10 +260,12 @@ export interface GitClient {
   deleteTag(path: string, name: string): Promise<{ sha: string }>;
   merge(path: string, source: string, opts: { noFf?: boolean; squash?: boolean }): Promise<{ conflicts: boolean }>;
   rebase(path: string, onto: string, opts: { preserveMerges?: boolean; autostash?: boolean }): Promise<{ conflicts: boolean }>;
-  rebaseInteractive(path: string, onto: string, todo: RebaseTodoItem[]): Promise<{ conflicts: boolean }>;
+  rebaseInteractive(path: string, onto: string, todo: RebaseTodoItem[], opts?: { autostash?: boolean }): Promise<{ conflicts: boolean }>;
   rebaseContinue(path: string): Promise<void>;
   rebaseAbort(path: string): Promise<void>;
   mergeAbort(path: string): Promise<void>;
+  /** goes on with whichever of merge, rebase, cherry-pick and revert is in progress */
+  continueOp(path: string): Promise<{ kind: string; conflicts: boolean }>;
   cherryPick(path: string, sha: Sha): Promise<{ conflicts: boolean }>;
   revert(path: string, sha: Sha): Promise<{ conflicts: boolean }>;
   reset(path: string, sha: Sha, mode: 'soft' | 'mixed' | 'hard' | 'keep'): Promise<void>;
@@ -243,14 +273,20 @@ export interface GitClient {
   stashPush(path: string, message: string, keepIndex: boolean, includeUntracked: boolean): Promise<{ sha: string | null }>;
   stashApply(path: string, index: number, pop: boolean): Promise<void>;
   stashDrop(path: string, index: number): Promise<{ sha: string; message: string }>;
+  /** a new branch at the stash's commit with the stash applied (`git stash branch`) */
+  stashBranch(path: string, name: string, index: number): Promise<{ name: string }>;
 
   logPage(path: string, skip: number, limit: number, revs?: string[]): Promise<Commit[]>;
   /** history of a file (renames followed), from HEAD or from the commit `from` */
   logFile(path: string, file: string, limit?: number, from?: Sha): Promise<Commit[]>;
+  /** commits of the whole history (of `revs`) matching `q`: message, author, e-mail, id prefix */
+  searchLog(path: string, q: string, revs?: string[], limit?: number): Promise<{ commits: Commit[]; scanned: number; more: boolean }>;
   fileAt(path: string, rev: string, file: string): Promise<string | null>;
   /** blame of the working copy, or of the file in commit `rev` */
   blame(path: string, file: string, rev?: Sha): Promise<{ sha: string; author: string; date: number; line: string }[]>;
   submodules(path: string): Promise<Submodule[]>;
+  /** the submodules with changes in their own files (read a few at a time; a read a moment ago is reused) */
+  submoduleChanges(path: string): Promise<SubmoduleChanges[]>;
   submoduleUpdate(path: string, paths?: string[], recursive?: boolean): Promise<{ opId: string }>;
   submoduleSync(path: string): Promise<void>;
   submoduleCommits(path: string, sub: string, shas: string[]): Promise<Record<string, string>>;
@@ -258,6 +294,7 @@ export interface GitClient {
   submoduleRange(path: string, sub: string, before: string, after: string, limit?: number): Promise<{ added: Commit[]; removed: Commit[]; missing: string[]; uninitialized: boolean; more: boolean }>;
   addRemote(path: string, name: string, url: string): Promise<void>;
   setRemoteUrl(path: string, name: string, url: string): Promise<void>;
+  renameRemote(path: string, oldName: string, newName: string): Promise<void>;
   removeRemote(path: string, name: string): Promise<void>;
   pruneRemote(path: string, name: string): Promise<{ output: string }>;
   pushTag(path: string, tag: string, remote?: string): Promise<{ opId: string }>;
@@ -296,6 +333,8 @@ export interface GitClient {
   addAccount(host: string, token: string): Promise<ServerAccount>;
   removeAccount(id: string): Promise<void>;
   githubRepos(accountId: string, page?: number): Promise<GhRepo[]>;
+  /** what the account's sign-in can see: its kind, and (a GitHub App) where the app is installed */
+  githubAccess(accountId: string): Promise<GhAccess>;
   githubAddKey(accountId: string, title: string, key: string): Promise<{ id: number }>;
   githubDeviceStart(clientId: string, host?: string): Promise<{ device_code: string; user_code: string; verification_uri: string; expires_in: number; interval: number }>;
   githubDevicePoll(clientId: string, deviceCode: string, host?: string): Promise<{ done: boolean; account?: ServerAccount; error?: string }>;
@@ -304,7 +343,8 @@ export interface GitClient {
   agentRun(prompt: string, cwd: string, mode: 'repo' | 'app', apply?: boolean, resume?: string): Promise<{ opId: string }>;
 
   /** subscribe to progress events of long operations; returns unsubscribe */
-  events(listener: (e: OpEvent) => void): () => void;
+  /** `onConnection`: the event stream dropped (the engine stopped) or came back */
+  events(listener: (e: OpEvent) => void, onConnection?: (up: boolean) => void): () => void;
 }
 
 /** Inside the desktop shell the UI is served by the engine itself, so the API lives at the page origin. */
@@ -354,11 +394,18 @@ export class HttpGitClient implements GitClient {
   appVersions(sources: string) {
     return this.post<AppVersionInfo[]>('/api/app/versions', { sources });
   }
+  appDiff(sources: string, sha: string) {
+    return this.post<{ diff: string }>('/api/app/diff', { sources, sha });
+  }
   appRebuild(sources: string) {
     return this.post<{ opId: string | null; skipped?: string }>('/api/app/rebuild', { sources });
   }
   async appFactory() {
     await this.post('/api/app/factory', {});
+  }
+  /** whether each account's sign-in still works ('expired': only signing in again helps) */
+  checkAccounts() {
+    return this.get<Record<string, AccountCheck>>('/api/accounts/check');
   }
   async listRepos(): Promise<KnownRepo[]> {
     const r = await fetch(`${this.baseUrl}/api/repos`);
@@ -367,8 +414,11 @@ export class HttpGitClient implements GitClient {
   openRepo(path: string, workspace: string) {
     return this.post<KnownRepo>('/api/repos/open', { path, workspace });
   }
-  async moveRepo(path: string, workspace: string) {
-    await this.post('/api/repos/move', { path, workspace });
+  async moveRepo(path: string, workspace: string, from?: string) {
+    await this.post('/api/repos/move', { path, workspace, from });
+  }
+  async pinRepo(path: string, pinned: boolean) {
+    await this.post('/api/repos/pin', { path, pinned });
   }
   async forgetRepo(path: string) {
     await this.post('/api/repos/forget', { path });
@@ -376,8 +426,14 @@ export class HttpGitClient implements GitClient {
   initRepo(path: string) {
     return this.post<{ path: string }>('/api/repos/init', { path });
   }
-  clone(url: string, dir: string, name: string | undefined, recursive: boolean, workspace: string) {
-    return this.post<{ opId: string; path: string }>('/api/repos/clone', { url, dir, name, recursive, workspace });
+  clone(url: string, dir: string, name: string | undefined, recursive: boolean, workspace: string, auth?: RepoAuth | null, partial = false) {
+    return this.post<{ opId: string; path: string }>('/api/repos/clone', { url, dir, name, recursive, workspace, partial, ...(auth !== undefined ? { auth } : {}) });
+  }
+  cloneHint(url: string) {
+    return this.post<{ auth: RepoAuth; from: string } | null>('/api/repos/cloneHint', { url });
+  }
+  cloneTest(url: string, auth: RepoAuth | null) {
+    return this.post<{ ok: boolean; output: string; describe: string }>('/api/repos/cloneTest', { url, auth });
   }
 
   snapshot(path: string, limit = 300) {
@@ -392,8 +448,8 @@ export class HttpGitClient implements GitClient {
   commitFiles(path: string, sha: Sha) {
     return this.op<FileChange[]>('commitFiles', path, { sha });
   }
-  commitFileDiff(path: string, rev: string, file: string, oldPath?: string, force = false) {
-    return this.op<FileChange | null>('commitFileDiff', path, { rev, file, oldPath, force });
+  commitFileDiff(path: string, rev: string, file: string, oldPath?: string, force = false, context?: number) {
+    return this.op<FileChange | null>('commitFileDiff', path, { rev, file, oldPath, force, context });
   }
   logUntil(path: string, sha: Sha, skip: number, after: number, revs?: string[], max?: number) {
     return this.op<{ index: number; commits: Commit[] }>('logUntil', path, { sha, skip, after, revs, max });
@@ -404,8 +460,8 @@ export class HttpGitClient implements GitClient {
   stashFiles(path: string, index: number) {
     return this.op<FileChange[]>('stashFiles', path, { index });
   }
-  fileDiff(path: string, file: string, area: 'unstaged' | 'staged', force = false) {
-    return this.op<FileChange | null>('fileDiff', path, { file, area, force });
+  fileDiff(path: string, file: string, area: 'unstaged' | 'staged', force = false, context?: number) {
+    return this.op<FileChange | null>('fileDiff', path, { file, area, force, context });
   }
   mediaSides(path: string, file: string, area: string, oldPath?: string) {
     return this.op<{ before?: BlobSide; after?: BlobSide }>('mediaSides', path, { file, area, oldPath });
@@ -439,7 +495,7 @@ export class HttpGitClient implements GitClient {
     await this.op('unstageAll', path);
   }
   discard(path: string, paths: string[]) {
-    return this.op<{ undo: string | null }>('discard', path, { paths });
+    return this.op<{ undo: string | null; kept?: string[] }>('discard', path, { paths });
   }
   discardAll(path: string) {
     return this.op<{ undo: string | null }>('discardAll', path);
@@ -477,7 +533,7 @@ export class HttpGitClient implements GitClient {
   discardHunk(path: string, file: FileChange, hunk: Hunk) {
     return this.op<{ undo: string | null }>('discardHunk', path, { file: slim(file), hunk });
   }
-  async resolveConflict(path: string, file: string, take: 'ours' | 'theirs') {
+  async resolveConflict(path: string, file: string, take: 'ours' | 'theirs' | 'both') {
     await this.op('resolveConflict', path, { file, take });
   }
   commit(path: string, message: string, amend: boolean) {
@@ -537,14 +593,17 @@ export class HttpGitClient implements GitClient {
   rebase(path: string, onto: string, opts: { preserveMerges?: boolean; autostash?: boolean }) {
     return this.op<{ conflicts: boolean }>('rebase', path, { onto, ...opts });
   }
-  rebaseInteractive(path: string, onto: string, todo: RebaseTodoItem[]) {
-    return this.op<{ conflicts: boolean }>('rebaseInteractive', path, { onto, todo });
+  rebaseInteractive(path: string, onto: string, todo: RebaseTodoItem[], opts: { autostash?: boolean } = {}) {
+    return this.op<{ conflicts: boolean }>('rebaseInteractive', path, { onto, todo, ...opts });
   }
   async rebaseContinue(path: string) {
     await this.op('rebaseContinue', path);
   }
   async rebaseAbort(path: string) {
     await this.op('rebaseAbort', path);
+  }
+  continueOp(path: string) {
+    return this.op<{ kind: string; conflicts: boolean }>('continueOp', path);
   }
   async mergeAbort(path: string) {
     await this.op('mergeAbort', path);
@@ -564,6 +623,9 @@ export class HttpGitClient implements GitClient {
   async stashApply(path: string, index: number, pop: boolean) {
     await this.op('stashApply', path, { index, pop });
   }
+  stashBranch(path: string, name: string, index: number) {
+    return this.op<{ name: string }>('stashBranch', path, { name, index });
+  }
   stashDrop(path: string, index: number) {
     return this.op<{ sha: string; message: string }>('stashDrop', path, { index });
   }
@@ -573,6 +635,9 @@ export class HttpGitClient implements GitClient {
   logFile(path: string, file: string, limit = 200, from?: Sha) {
     return this.op<Commit[]>('logFile', path, { file, limit, from });
   }
+  searchLog(path: string, q: string, revs?: string[], limit = 300) {
+    return this.op<{ commits: Commit[]; scanned: number; more: boolean }>('searchLog', path, { q, revs, limit });
+  }
   async fileAt(path: string, rev: string, file: string) {
     return (await this.op<{ content: string | null }>('fileAt', path, { rev, file })).content;
   }
@@ -581,6 +646,9 @@ export class HttpGitClient implements GitClient {
   }
   submodules(path: string) {
     return this.op<Submodule[]>('submodules', path);
+  }
+  submoduleChanges(path: string) {
+    return this.op<SubmoduleChanges[]>('submoduleChanges', path);
   }
   submoduleUpdate(path: string, paths?: string[], recursive = false) {
     return this.op<{ opId: string }>('submoduleUpdate', path, { paths, recursive });
@@ -599,6 +667,9 @@ export class HttpGitClient implements GitClient {
   }
   async setRemoteUrl(path: string, name: string, url: string) {
     await this.op('setRemoteUrl', path, { name, url });
+  }
+  async renameRemote(path: string, oldName: string, newName: string) {
+    await this.op('renameRemote', path, { oldName, newName });
   }
   async removeRemote(path: string, name: string) {
     await this.op('removeRemote', path, { name });
@@ -712,6 +783,9 @@ export class HttpGitClient implements GitClient {
   async removeAccount(id: string) {
     await this.send('DELETE', '/api/accounts', { id });
   }
+  githubAccess(accountId: string) {
+    return this.post<GhAccess>('/api/github/access', { accountId });
+  }
   githubRepos(accountId: string, page = 1) {
     return this.post<GhRepo[]>('/api/github/repos', { accountId, page });
   }
@@ -731,9 +805,12 @@ export class HttpGitClient implements GitClient {
     return this.post<{ opId: string }>('/api/agent/run', { prompt, cwd, mode, apply, resume });
   }
 
-  events(listener: (e: OpEvent) => void): () => void {
+  events(listener: (e: OpEvent) => void, onConnection?: (up: boolean) => void): () => void {
     if (Platform.OS !== 'web' || typeof EventSource === 'undefined') return () => {};
     const es = new EventSource(`${this.baseUrl}/api/events`);
+    // the browser reconnects by itself; meanwhile the engine is gone (stopped, crashed, restarting)
+    es.onerror = () => onConnection?.(false);
+    es.onopen = () => onConnection?.(true);
     es.onmessage = (m) => {
       try {
         listener(JSON.parse(m.data));

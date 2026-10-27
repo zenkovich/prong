@@ -2,10 +2,10 @@ import React, { useEffect, useState } from 'react';
 import { Animated, Easing, ScrollView, StyleSheet, View } from 'react-native';
 import type { QueueItem } from '../git/types';
 import { cancelOperation, dismissToast, showErrors, useRepo, useStore } from '../state/store';
-import { cancelQueued, mergeAbort, rebaseAbort, rebaseContinue, removeStaleLock, undoLast } from '../state/live';
+import { cancelQueued, continueOp, mergeAbort, rebaseAbort, removeStaleLock, undoLast } from '../state/live';
 import { FONT, useTheme } from '../theme';
 import { Icon } from '../ui/Icon';
-import { Button, PressScale, Spinner, Txt } from '../ui/primitives';
+import { Button, PressScale, Spinner, Txt, useKeyboard } from '../ui/primitives';
 
 const NO_ITEMS: QueueItem[] = [];
 /** a lock unchanged for this long was probably left by a git that crashed (the engine refuses to delete it sooner) */
@@ -14,6 +14,8 @@ const STALE_LOCK_MS = 60_000;
 const SLOW_MS = 700;
 const ago = (ms: number) => (ms < 60_000 ? `${Math.max(1, Math.round(ms / 1000))} s` : `${Math.round(ms / 60_000)} min`);
 const lockName = (p?: string) => p?.split('/').pop() ?? 'a lock';
+/** a merge, rebase, cherry-pick or revert that stopped: short, so its Continue and Abort fit a narrow panel */
+const OP_WORDS: Record<string, string> = { merge: 'merging', rebase: 'rebasing', 'cherry-pick': 'cherry-picking', revert: 'reverting' };
 
 /**
  * The status panel on the right of the toolbar — the one place for status and progress (there is no status bar at
@@ -53,13 +55,31 @@ export function StatusPanel({ welcome }: { welcome?: boolean }) {
   const queued = queue.filter((i) => !(i.state === 'running' && i.label === op?.label));
   const waiting = queued.find((i) => i.state === 'waiting-lock');
   const showQueue = queued.length > 0 && (!!waiting || queued.length > 1 || now - queued[0].since > SLOW_MS);
+  // a long operation that waits for another git's lock says so (it used to sit at "0%" with no reason given)
+  const opWaiting = op ? queue.find((i) => i.state === 'waiting-lock') : undefined;
   const top = undo?.at(-1);
+  // Escape closes the output or the queue list (they have no backdrop to click), and only it
+  useKeyboard((e) => {
+    if (e.key === 'Escape' && pop && !e.consumed) {
+      e.consume();
+      setPop(null);
+    }
+  });
   // a list whose subject is gone closes
   if (pop === 'log' && !op) setPop(null);
-  if (pop === 'queue' && !showQueue) setPop(null);
+  if (pop === 'queue' && !showQueue && !opWaiting) setPop(null);
 
   let body: React.ReactNode;
-  if (op) {
+  if (op && opWaiting) {
+    body = (
+      <PressScale onPress={() => setPop(pop === 'queue' ? null : 'queue')} scaleTo={1} outerStyle={styles.grow} style={styles.row} label="Action queue" testID="queue-status">
+        <Icon name="lock" size={11} color={t.warn} />
+        <Txt size={FONT.sm} color={t.warn} numberOfLines={1} style={{ marginLeft: 7, flexShrink: 1 }}>
+          {`Waiting for ${lockName(opWaiting.lock)} · ${op.label}`}
+        </Txt>
+      </PressScale>
+    );
+  } else if (op) {
     body = (
       <PressScale onPress={() => setPop(pop === 'log' ? null : 'log')} scaleTo={1} outerStyle={styles.grow} style={styles.row} label="Show the output" testID="activity-op">
         <Spinner size={11} />
@@ -124,28 +144,36 @@ export function StatusPanel({ welcome }: { welcome?: boolean }) {
       </View>
     );
   } else {
+    // a merge or rebase that stopped needs its buttons more than the upstream: that line gives way to them, the
+    // branch name shrinks, and nothing is drawn over the error counter (at 1000 px "MERGE IN PR…" was cut off and
+    // Abort sat on the counter)
     body = (
-      <View style={[styles.row, styles.grow]} testID="activity-branch">
-        {cur ? <View style={{ width: 7, height: 7, backgroundColor: t.accent }} /> : <Icon name="commit" size={11} color={t.warn} />}
-        <Txt size={FONT.sm} weight="600" numberOfLines={1} style={{ marginLeft: 7, flexShrink: 1 }}>
-          {cur ? cur.name : repo.head ? `detached at ${repo.head.slice(0, 7)}` : repo.live ? '…' : 'no branch'}
+      <View style={[styles.row, styles.grow, { overflow: 'hidden' }]} testID="activity-branch">
+        {cur ? <View style={{ width: 7, height: 7, backgroundColor: t.accent, flexShrink: 0 }} /> : <View style={{ flexShrink: 0 }}><Icon name="commit" size={11} color={t.warn} /></View>}
+        <Txt size={FONT.sm} weight="600" numberOfLines={1} style={{ marginLeft: 7, flexShrink: 1, minWidth: 0 }}>
+          {cur ? cur.name : repo.head ? `detached at ${repo.head.slice(0, 7)}` : repo.unborn ? repo.unborn : repo.live ? '…' : 'no branch'}
         </Txt>
-        {cur?.upstream ? (
-          <Txt size={FONT.xs} faint numberOfLines={1} style={{ marginLeft: 8, flexShrink: 2 }}>
+        {inOp ? null : !cur && !repo.head && repo.unborn ? (
+          <Txt size={FONT.xs} faint numberOfLines={1} style={{ marginLeft: 8, flexShrink: 3, minWidth: 0 }}>
+            no commits yet
+          </Txt>
+        ) : cur?.upstream ? (
+          <Txt size={FONT.xs} faint numberOfLines={1} style={{ marginLeft: 8, flexShrink: 3, minWidth: 0 }}>
             {[cur.ahead ? `↑${cur.ahead}` : '', cur.behind ? `↓${cur.behind}` : '', cur.gone ? `${cur.upstream} gone` : !cur.ahead && !cur.behind ? `= ${cur.upstream}` : cur.upstream].filter(Boolean).join(' ')}
           </Txt>
         ) : cur ? (
-          <Txt size={FONT.xs} faint style={{ marginLeft: 8 }}>
+          <Txt size={FONT.xs} faint numberOfLines={1} style={{ marginLeft: 8, flexShrink: 3, minWidth: 0 }}>
             not published
           </Txt>
         ) : null}
         {inOp && (
           <>
-            <Txt label size={9.5} color={t.warn} style={{ marginLeft: 8 }} numberOfLines={1}>
-              {inOp} in progress
+            <Txt label size={9.5} color={t.warn} style={{ marginLeft: 8, flexShrink: 0 }} numberOfLines={1} testID="op-state">
+              {OP_WORDS[inOp] ?? `${inOp} in progress`}
             </Txt>
-            {inOp === 'rebase' && <Button small label="Continue" primary style={{ marginLeft: 6, height: 18 }} onPress={rebaseContinue} testID="op-continue" />}
-            <Button small label="Abort" style={{ marginLeft: 4, height: 18 }} onPress={inOp === 'rebase' ? rebaseAbort : mergeAbort} testID="op-abort" />
+            {/* a merge goes on with a commit in Changes; a rebase, cherry-pick or revert with Continue */}
+            {inOp !== 'merge' && <Button small label="Continue" primary style={{ marginLeft: 6, height: 18, flexShrink: 0 }} onPress={continueOp} testID="op-continue" />}
+            <Button small label="Abort" style={{ marginLeft: 4, height: 18, flexShrink: 0 }} onPress={inOp === 'rebase' ? rebaseAbort : mergeAbort} testID="op-abort" />
           </>
         )}
       </View>
@@ -212,7 +240,7 @@ export function StatusPanel({ welcome }: { welcome?: boolean }) {
           </ScrollView>
         </View>
       )}
-      {pop === 'queue' && repoPath && <QueueList items={queued} repoPath={repoPath} now={now} />}
+      {pop === 'queue' && repoPath && <QueueList items={opWaiting ? queue : queued} repoPath={repoPath} now={now} />}
     </View>
   );
 }

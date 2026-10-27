@@ -31,11 +31,12 @@
     "server:test": "npm --prefix server test",
     "test": "vitest run",
     "typecheck": "tsc --noEmit",
-    "e2e": "node tools/e2e.mjs",
+    "e2e": "node tools/e2e/run-all.mjs",
     "test:all": "npm run typecheck && npm run lint && npm test && npm run server:test && npm run e2e",
     "pree2e": "npm --prefix server run build",
     "icons": "node tools/gen-file-icons.mjs",
-    "lint": "expo lint"
+    "lint": "expo lint",
+    "test:affected": "node tools/test-affected.mjs"
   },
   "private": true
 }

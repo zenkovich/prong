@@ -1,5 +1,5 @@
 import React, { memo, useEffect, useMemo, useRef, useState } from 'react';
-import { Pressable, ScrollView, StyleSheet, View } from 'react-native';
+import { Platform, Pressable, ScrollView, StyleSheet, View } from 'react-native';
 import Svg, { Line, Path, Polygon, Rect } from 'react-native-svg';
 import { Commit, Ref, Sha } from '../git/types';
 import {
@@ -29,7 +29,7 @@ import {
 } from '../state/store';
 import { FONT, ROW, useSelected, useTheme } from '../theme';
 import { Icon } from '../ui/Icon';
-import { Avatar, Button, Checkbox, Glass, IconButton, Input, PressScale, ResizeGrip, Row, Segmented, Txt, useViewport, webCursor } from '../ui/primitives';
+import { Avatar, Button, Checkbox, Glass, IconButton, Input, PressScale, ResizeGrip, Row, Segmented, Txt, useKeyboard, useViewport } from '../ui/primitives';
 import { applyCollapse, filterByRefs, GraphLayout, GraphRow, layoutGraph, reachableFrom } from './graphLayout';
 import { RefLabel, refLabels } from './commitRefs';
 import * as live from '../state/live';
@@ -70,11 +70,32 @@ const LANE_W = 14;
 const WIP = '__wip__';
 const MAX_LANES = 12;
 
+/** ⌘F: the commit search of the active repository, focused (from Changes it switches to All Commits first) */
+export function focusCommitSearch() {
+  const s = getState();
+  const r = s.repoStates[s.activeTab ?? ''];
+  if (!r) return;
+  if (r.section !== 'commits') setSection('commits');
+  if (Platform.OS !== 'web') return;
+  const tryFocus = (left: number) => {
+    const el = document.querySelector('[data-testid="commit-search"]') as HTMLInputElement | null;
+    if (el) {
+      el.focus();
+      el.select();
+    } else if (left > 0) setTimeout(() => tryFocus(left - 1), 30);
+  };
+  tryFocus(20);
+}
+
+/** the keys that move the selection in the commit list */
+const NAV_KEYS = new Set(['ArrowUp', 'ArrowDown', 'Home', 'End', 'PageUp', 'PageDown']);
+
 export function CommitList() {
   const t = useTheme();
   const repo = useRepo();
   const { commits, refs, head, search, graphFilter, collapsedMerges, selectedCommit, unstaged, staged } = repo;
-  const changes = unstaged.length + staged.length;
+  // files changed in the working copy: one staged and modified again is one file (it was counted twice)
+  const changes = useMemo(() => new Set([...unstaged, ...staged].map((f) => f.path)).size, [unstaged, staged]);
   const [filterOpen, setFilterOpen] = useState(false);
   const mods = useMods();
 
@@ -85,10 +106,15 @@ export function CommitList() {
   const collapsed = useMemo(() => cachedCollapse(filtered, collapsedMerges), [filtered, collapsedMerges]);
   const q = search.trim().toLowerCase();
   const showGraph = !q && !history;
+  // a live repository's search covers the whole history (the engine's results); until they come, and in a file
+  // history, the loaded commits are filtered
+  const found = repo.live && !history && q && repo.searchResults && repo.searchResults.q.toLowerCase() === q && repo.searchResults.commits ? repo.searchResults : null;
+  const searching = !!q && !!repo.live && !history && !found;
   const visible = useMemo(() => {
     if (!q) return collapsed.commits;
-    return collapsed.commits.filter((c) => c.subject.toLowerCase().includes(q) || c.author.toLowerCase().includes(q) || c.sha.startsWith(q) || c.body.toLowerCase().includes(q));
-  }, [collapsed, q]);
+    if (found?.commits) return found.commits;
+    return collapsed.commits.filter((c) => c.subject.toLowerCase().includes(q) || c.author.toLowerCase().includes(q) || c.email.toLowerCase().includes(q) || c.sha.startsWith(q) || c.body.toLowerCase().includes(q));
+  }, [collapsed, q, found]);
 
   const headVisible = visible.some((c) => c.sha === head);
   const [openedAt] = useState(() => Date.now());
@@ -138,22 +164,88 @@ export function CommitList() {
     scrollRef.current?.scrollTo({ y, animated: Math.abs(y - scrollY.current) < viewH * 2 });
   }, [reveal, list, collapsed.hidden, viewH]);
 
-  const mergeCount = useMemo(() => commits.filter((c) => c.parents.length > 1).length, [commits]);
-  const collapsedCount = Object.keys(collapsedMerges).length;
+  // nothing read yet (the repository is opening, a file history is on its way): say so, not "no commits"
+  const loading = history ? !repo.historyCommits : !!repo.loading && commits.length === 0;
+  // the list the count is "of": the branch-filtered log when the engine reads it, else the loaded log; "+" while
+  // more of it is still unread (a page is 300 commits)
+  const base = history ?? engineFiltered ?? commits;
+  const more = !!repo.live && (history ? history.length >= 300 : engineFiltered ? !repo.filterExhausted : !repo.logExhausted && commits.length >= 300);
+  const empty = q
+    ? `No commits match “${search.trim()}”${searching ? ' in the history read so far (searching the rest…)' : found || !more ? '' : ' in the history read so far'}.`
+    : history
+      ? `No commits change ${repo.historyPath}.`
+      : graphFilter.mode !== 'all' || graphFilter.hideRemotes
+        ? 'No commits match the current filter.'
+        : 'No commits yet.';
+  // ↑ / ↓, Home / End, Page Up / Down move the selection through the list as it is shown (as in Fork); Escape in the
+  // search field clears it
+  useKeyboard((e) => {
+    const s = getState();
+    if (s.dialog || s.contextMenu || s.picker || s.repoPicker || s.errorOpen != null || e.consumed) return;
+    const target = e.target as HTMLElement | null;
+    if (e.key === 'Escape' && target?.getAttribute?.('data-testid') === 'commit-search') {
+      setSearch('');
+      target.blur();
+      e.consume();
+      return;
+    }
+    const typing = !!target && ['INPUT', 'TEXTAREA'].includes(target.tagName);
+    // ⌘⇧C: the selected commit's SHA (the menu shows the shortcut; nothing answered it)
+    if (e.meta && e.shift && e.key.toLowerCase() === 'c' && !typing && repo.selectedArea === 'commit' && selectedCommit && selectedCommit !== WIP) {
+      e.preventDefault();
+      copy(selectedCommit);
+      return;
+    }
+    if (!NAV_KEYS.has(e.key) || e.meta || filterOpen) return;
+    if (typing) return;
+    if (repo.selectedArea !== 'commit') return;
+    const first = list[0]?.sha === WIP ? 1 : 0;
+    if (list.length <= first) return;
+    const page = Math.max(1, Math.floor(viewH / ROW) - 1);
+    const at = selectedIndex >= first ? selectedIndex : -1;
+    const want =
+      e.key === 'Home' ? first
+      : e.key === 'End' ? list.length - 1
+      : at < 0 ? first
+      : at + (e.key === 'ArrowDown' ? 1 : e.key === 'ArrowUp' ? -1 : e.key === 'PageDown' ? page : -page);
+    const next = Math.max(first, Math.min(list.length - 1, want));
+    e.preventDefault();
+    if (next !== at) selectCommit(list[next].sha);
+    // keep it on screen: the list moves just enough
+    const top = next * ROW;
+    if (top < scrollY.current) scrollRef.current?.scrollTo({ y: top, animated: false });
+    else if (top + ROW > scrollY.current + viewH) scrollRef.current?.scrollTo({ y: top + ROW - viewH, animated: false });
+    // near the end of what is read: the next page
+    if (repo.live && next >= list.length - 10) void live.loadMoreCommits();
+  });
+
+  // the merges of the list shown (a branch filter's list too), for Collapse all / Expand all
+  const mergeCount = useMemo(() => filtered.filter((c) => c.parents.length > 1).length, [filtered]);
+  const collapsedCount = useMemo(() => filtered.filter((c) => collapsedMerges[c.sha]).length, [filtered, collapsedMerges]);
   const filterLabel = graphFilter.mode === 'all' ? (graphFilter.hideRemotes ? 'Local branches' : 'All branches') : graphFilter.mode === 'current' ? 'Current branch' : `${graphFilter.refs.length} selected`;
 
   return (
     <View style={{ flex: 1, backgroundColor: t.panel }}>
       <View style={[styles.filterBar, { borderColor: t.border, backgroundColor: t.panelAlt }]}>
-        <Input value={search} onChange={setSearch} placeholder="search commits: message, author, sha" slash small style={{ flex: 1, maxWidth: 380 }} />
+        <Input value={search} onChange={setSearch} placeholder="search commits: message, author, sha" slash small style={{ flex: 1, maxWidth: 380 }} testID="commit-search" />
+        {/* inside the field's right end */}
+        {search ? (
+          <View style={{ marginLeft: -28, width: 26, alignItems: 'center' }}>
+            <IconButton icon="x" size={12} title="Clear the search (Esc)" onPress={() => setSearch('')} testID="commit-search-clear" />
+          </View>
+        ) : null}
         <View style={{ width: 10 }} />
-        <Button small icon="branch" label={filterLabel} iconRight="chevronDown" active={graphFilter.mode !== 'all' || graphFilter.hideRemotes} onPress={() => setFilterOpen((v) => !v)} />
+        <Button small icon="branch" label={filterLabel} iconRight="chevronDown" active={graphFilter.mode !== 'all' || graphFilter.hideRemotes} onPress={() => setFilterOpen((v) => !v)} testID="graph-filter-button" />
         <View style={{ width: 8 }} />
         <IconButton icon="minus" size={13} title="Collapse all merges" onPress={collapseAllMerges} disabled={mergeCount === 0 || collapsedCount === mergeCount} />
         <IconButton icon="plus" size={13} title="Expand all merges" onPress={expandAllMerges} disabled={collapsedCount === 0} />
         <View style={{ flex: 1 }} />
-        <Txt size={FONT.xs} faint>
-          {visible.length} of {commits.length} commits{collapsed.hidden.size ? ` · ${collapsed.hidden.size} collapsed` : ''}
+        <Txt size={FONT.xs} faint testID="commit-count">
+          {found
+            ? `${visible.length}${found.more ? '+' : ''} found`
+            : loading
+              ? 'loading…'
+              : `${visible.length} of ${base.length}${more ? '+' : ''} commits${searching ? ' · searching…' : ''}${!q && collapsed.hidden.size ? ` · ${collapsed.hidden.size} collapsed` : ''}`}
         </Txt>
       </View>
       {graphFilter.mode !== 'all' && !history && (
@@ -180,15 +272,16 @@ export function CommitList() {
         </View>
       )}
       {history && (
-        <View style={[styles.historyBar, { borderColor: t.border, backgroundColor: t.accentSoft }]}>
+        <View style={[styles.historyBar, { borderColor: t.border, backgroundColor: t.accentSoft }]} testID="file-history-bar">
           <Icon name="history" size={12} color={t.accent} />
           <Txt size={FONT.sm} color={t.accent} style={{ marginLeft: 6, flex: 1 }} numberOfLines={1}>
-            History of {repo.historyPath} · {history.length} commits
+            {/* the engine reads a file's first 300 commits: "300+" says there may be more */}
+            History of {repo.historyPath}{loading ? ' · loading…' : ` · ${history.length}${history.length >= 300 ? '+' : ''} commits`}
           </Txt>
-          <Button small label="Close" icon="x" onPress={live.clearFileHistory} />
+          <Button small label="Close" icon="x" onPress={live.clearFileHistory} testID="file-history-close" />
         </View>
       )}
-      <View style={[styles.header, { borderColor: t.border }]}>
+      <View style={[styles.header, { borderColor: t.border }]} testID="commit-header">
         <View style={{ width: graphW }} />
         <Txt label faint size={10} style={{ flex: 1 }}>
           Description
@@ -222,7 +315,7 @@ export function CommitList() {
           {list.slice(win.first, win.last).map((c, k) => {
             const i = win.first + k;
             return (
-            <View key={c.sha} style={rowTop(i, ROW)}>
+            <View key={c.sha} style={rowTop(i, ROW)} testID={c.sha === WIP ? 'commit-row-wip' : `commit-row-${c.sha}`}>
             <CommitRow
               key={c.sha}
               commit={c}
@@ -245,9 +338,10 @@ export function CommitList() {
           {layout && <GraphSvg layout={layout} first={win.first} last={win.last} width={graphW} head={head} wipIndex={list[0]?.sha === WIP ? 0 : -1} selectedIndex={selectedIndex} collapsed={collapsedMerges} gw={mods.graphWidth} />}
         </View>
         <View>
-          {list.length === 0 && (
-            <Txt faint style={{ padding: 16 }}>
-              No commits match the current filter.
+          {/* under the working-copy row too, when the filter leaves no commit */}
+          {visible.length === 0 && (
+            <Txt faint style={{ padding: 16 }} testID={loading ? 'commits-loading' : 'commits-empty'}>
+              {loading ? 'Loading history…' : empty}
             </Txt>
           )}
           {repo.loadingMore && (
@@ -368,6 +462,8 @@ const CommitRow = memo(function CommitRow({ commit, row, graphW, refs, selected,
   const isMerge = commit.parents.length > 1 || isCollapsed;
   const onContext = (x: number, y: number) => {
     if (isWip) return;
+    // as in Fork: the commit right-clicked is the one selected (the details showed another one under its menu)
+    if (!selected) selectCommit(commit.sha);
     const s = getState();
     const repo = s.repoStates[s.activeTab ?? ''];
     const current = repo.refs.find((b) => b.kind === 'branch' && b.current);
@@ -389,7 +485,8 @@ const CommitRow = memo(function CommitRow({ commit, row, graphW, refs, selected,
       { label: `Reset ${current?.name ?? 'HEAD'} to here…`, onPress: () => openDialog({ type: 'reset', sha: commit.sha }), disabled: isHead },
       { separator: true },
       {
-        label: `Rebase ${current?.name ?? ''} onto here`,
+        // detached: HEAD is what moves (it read "Rebase  onto here")
+        label: `Rebase ${current?.name ?? 'HEAD'} onto here`,
         onPress: () => {
           const ref = repo.refs.find((r) => r.sha === commit.sha && r.kind !== 'tag');
           if (ref) openDialog({ type: 'rebase', onto: ref.name });
@@ -427,11 +524,16 @@ const CommitRow = memo(function CommitRow({ commit, row, graphW, refs, selected,
       style={{ paddingLeft: graphW, paddingRight: 8, backgroundColor: selected ? t.selection : 'transparent' }}
     >
       {row && isMerge && !isWip && (
-        <Pressable
+        // a pressable of its own (not a bare Pressable): the row keeps its highlight while the pointer is on it
+        <PressScale
           onPress={() => toggleMerge(commit.sha)}
-          style={[{ position: 'absolute', left: nodeX - 9, top: ROW / 2 - 9, width: 18, height: 18, borderRadius: 0 }, webCursor('pointer')]}
-          {...({ accessibilityLabel: isCollapsed ? 'Expand merge' : 'Collapse merge' } as any)}
-        />
+          scaleTo={1}
+          outerStyle={{ position: 'absolute', left: nodeX - 9, top: ROW / 2 - 9, width: 18, height: 18 }}
+          style={{ width: 18, height: 18 }}
+          label={isCollapsed ? 'Expand merge' : 'Collapse merge'}
+        >
+          {null}
+        </PressScale>
       )}
       <View style={{ flex: 2, minWidth: 120, flexDirection: 'row', alignItems: 'center', overflow: 'hidden' }}>
         {refs && refLabels(refs).map((l) => <RefChip key={l.ref.name} r={l.ref} label={l} />)}
@@ -440,7 +542,7 @@ const CommitRow = memo(function CommitRow({ commit, row, graphW, refs, selected,
             Uncommitted changes ({changes})
           </Txt>
         ) : (
-          <Txt size={FONT.md} weight={isHead ? '700' : '400'} faint={offBranch} numberOfLines={1} style={{ flexShrink: 1 }} testID={isHead ? 'head-commit' : offBranch ? 'off-branch-commit' : undefined}>
+          <Txt size={FONT.md} weight={isHead ? '700' : '400'} faint={offBranch} numberOfLines={1} style={{ flexShrink: 1 }} testID={isHead ? 'head-commit' : offBranch ? 'off-branch-commit' : 'commit-subject'}>
             {commit.subject}
           </Txt>
         )}
@@ -490,10 +592,18 @@ function FilterPopover({ onClose }: { onClose: () => void }) {
     { title: 'Tags', kind: 'tag' },
   ];
   const isOn = (name: string) => (f.mode === 'selected' ? f.refs.includes(name) : f.mode === 'all' ? !(f.hideRemotes && repo.refs.find((r) => r.name === name)?.kind === 'remote') : !!repo.refs.find((r) => r.name === name)?.current);
+  // Escape closes it, as every other popup (it used to stay open)
+  useKeyboard((e) => {
+    if (e.key === 'Escape' && !e.consumed && !getState().dialog) {
+      e.consume();
+      onClose();
+    }
+  });
   return (
     <>
       <Pressable style={StyleSheet.absoluteFill} onPress={onClose} />
       <Glass style={[styles.popover, { width: size.w }]}>
+        <View testID="graph-filter-popover">
         <Segmented
           value={f.mode}
           onChange={(mode) => setGraphFilter({ mode, refs: mode === 'selected' && f.refs.length === 0 ? repo.refs.filter((r) => r.kind === 'branch').map((r) => r.name) : f.refs })}
@@ -519,7 +629,7 @@ function FilterPopover({ onClose }: { onClose: () => void }) {
                   {g.title}
                 </Txt>
                 {items.map((r) => (
-                  <Row key={r.name} height={24} onPress={() => toggleGraphRef(r.name)} style={{ paddingLeft: 2, borderRadius: 0 }}>
+                  <Row key={r.name} height={24} onPress={() => toggleGraphRef(r.name)} style={{ paddingLeft: 2, borderRadius: 0 }} testID={`filter-ref-${r.name}`}>
                     <Checkbox checked={isOn(r.name)} onChange={() => toggleGraphRef(r.name)} />
                     <Icon name={g.kind === 'remote' ? 'cloud' : g.kind === 'tag' ? 'tag' : 'branch'} size={11} color={r.current ? t.accent : t.textFaint} />
                     <Txt size={FONT.sm} style={{ marginLeft: 6, flex: 1 }} numberOfLines={1} weight={r.current ? '600' : '400'}>
@@ -536,6 +646,7 @@ function FilterPopover({ onClose }: { onClose: () => void }) {
           <Button small label="None" style={{ marginLeft: 6 }} onPress={() => setGraphFilter({ mode: 'selected', refs: [] })} />
           <View style={{ flex: 1 }} />
           <Button small primary label="Done" onPress={onClose} />
+        </View>
         </View>
         <ResizeGrip onDelta={(dx, dy) => setSize((s) => ({ w: Math.max(260, Math.min(vp.width - 420, s.w + dx)), listH: Math.max(80, Math.min(vp.height - 260, s.listH + dy)) }))} />
       </Glass>
@@ -568,8 +679,12 @@ export function RefChip({ r, onPress, compact, label }: { r: Ref; onPress?: () =
   const open = r.kind === 'tag' ? '<' : '[';
   const closeB = r.kind === 'tag' ? '>' : ']';
   const name = label?.name ?? r.name;
-  return (
-    <PressScale onPress={onPress} scaleTo={0.96} style={[styles.chip, { backgroundColor: bg, borderColor: isCurrent ? bg : fg }]} testID={`ref-${name}`} label={remote ? (remoteOnly ? `${name} (remote)` : `${name} · also on ${r.upstream ?? 'origin'}`) : name}>
+  const chipStyle = [styles.chip, { backgroundColor: bg, borderColor: isCurrent ? bg : fg }];
+  const a11y = remote ? (remoteOnly ? `${name} (remote)` : `${name} · also on ${r.upstream ?? 'origin'}`) : name;
+  // a label without an action of its own is not a button: a pressable there took the click, and a click on a
+  // branch label in a commit row selected nothing
+  const inner = (
+    <>
       {!isCurrent && (
         <Txt size={10.5} color={fg} style={{ opacity: 0.55 }}>
           {open}
@@ -595,7 +710,16 @@ export function RefChip({ r, onPress, compact, label }: { r: Ref; onPress?: () =
           {closeB}
         </Txt>
       )}
+    </>
+  );
+  return onPress ? (
+    <PressScale onPress={onPress} scaleTo={0.96} style={chipStyle} testID={`ref-${name}`} label={a11y}>
+      {inner}
     </PressScale>
+  ) : (
+    <View style={chipStyle} testID={`ref-${name}`} accessibilityLabel={a11y}>
+      {inner}
+    </View>
   );
 }
 

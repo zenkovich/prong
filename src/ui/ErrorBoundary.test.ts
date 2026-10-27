@@ -8,7 +8,7 @@ vi.mock('react-native', () => ({ View: 'View' }));
 vi.mock('./primitives', () => ({ Txt: () => null, Button: () => null }));
 
 /** Drives the boundary's lifecycle methods directly: no DOM is needed to check the recovery policy. */
-function boundary(onRecover: () => void) {
+function boundary(onRecover: () => void | Promise<unknown>) {
   const b = new ErrorBoundary({ name: 'Panel', children: null, onRecover });
   b.setState = (p: any) => Object.assign(b.state, typeof p === 'function' ? p(b.state) : p);
   return b;
@@ -67,6 +67,23 @@ describe('ErrorBoundary', () => {
     vi.advanceTimersByTime(100);
     expect(b.state.failed).toBe(false);
     expect(recover).toHaveBeenCalledTimes(4);
+  });
+
+  it('a recovery that reads again is waited for: the panel draws once it has the answer (Retry used to draw the same data)', async () => {
+    let answer: () => void = () => {};
+    const b = boundary(() => new Promise<void>((r) => (answer = r)));
+    for (let i = 0; i < 4; i++) {
+      Object.assign(b.state, ErrorBoundary.getDerivedStateFromError(new Error('bad data')));
+      b.componentDidCatch(new Error('bad data'), { componentStack: '' } as any);
+    }
+    // looping: down until Retry
+    b.retry();
+    expect(b.state.failed).toBe(true); // still reading
+    answer();
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(b.state.failed).toBe(false);
+    expect(b.state.crashes).toEqual([]);
   });
 
   it('a throwing recovery callback does not break the boundary', () => {

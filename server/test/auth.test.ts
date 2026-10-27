@@ -3,7 +3,7 @@ import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, wr
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import { accountAuth, resolveAuth, sshAuth, TOKEN_HELPER, validKeyPath } from '../src/auth.js';
+import { accountAuth, hostOwner, resolveAuth, sshAuth, TOKEN_HELPER, validKeyPath } from '../src/auth.js';
 import { Repo } from '../src/git/repo.js';
 
 /** How a repository (and its submodules) signs in to remotes: SSH key or account, inherited downwards. */
@@ -96,5 +96,14 @@ describe('repository connection', () => {
     const calls = existsSync(log) ? readFileSync(log, 'utf8') : '';
     expect(calls).toContain("git-upload-pack '/super.git'");
     expect(calls).toContain("git-upload-pack '/core.git'"); // the submodule clone went through the same command
+  });
+});
+
+describe('repository addresses', () => {
+  it('host and owner of SSH, ssh:// and HTTPS addresses; nothing for a local path', () => {
+    expect(hostOwner('git@github.com:Playrix/township.git')).toEqual({ host: 'github.com', owner: 'Playrix' });
+    expect(hostOwner('ssh://git@GitHub.com:22/Playrix/township.git')).toEqual({ host: 'github.com', owner: 'Playrix' });
+    expect(hostOwner('https://github.com/zenkovich/prong.git')).toEqual({ host: 'github.com', owner: 'zenkovich' });
+    expect(hostOwner('/Users/me/repos/x.git')).toBeNull();
   });
 });

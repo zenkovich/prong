@@ -1,6 +1,7 @@
 import { sshDir } from './auth.js';
+import { STATE_DIR } from './state.js';
 import { spawn } from 'node:child_process';
-import { existsSync, readdirSync, readFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import path from 'node:path';
 
@@ -110,9 +111,20 @@ export async function listSshKeys(): Promise<SshKeyInfo[]> {
   return out;
 }
 
+/** a key file name in the SSH folder: no path, nothing ssh-keygen could read as an option */
+export function sshKeyFile(name: string): string {
+  if (!/^[A-Za-z0-9_@+][A-Za-z0-9._@+-]*$/.test(name) || name.endsWith('.pub')) throw new Error(`Not a key file name: "${name}" (letters, digits, . _ - @ +; no folders)`);
+  return path.join(sshDir(), name);
+}
+
+/**
+ * A new key pair in the SSH folder (~/.ssh, or PRONG_SSH_DIR — the folder the key list reads: a key written to
+ * ~/.ssh while the list read another folder never showed up, and a test run wrote into the user's ~/.ssh).
+ */
 export async function generateSshKey(name: string, type: 'ed25519' | 'rsa' | 'ecdsa', passphrase: string, comment: string) {
-  const file = path.join(homedir(), '.ssh', name);
+  const file = sshKeyFile(name);
   if (existsSync(file)) throw new Error(`${file} already exists`);
+  mkdirSync(sshDir(), { recursive: true, mode: 0o700 });
   const args = ['-q', '-t', type, ...(type === 'rsa' ? ['-b', '4096'] : []), '-C', comment || `${process.env.USER}@prong`, '-N', passphrase, '-f', file];
   const r = await run('ssh-keygen', args);
   if (r.code !== 0) throw new Error(r.stderr.trim());
@@ -120,7 +132,8 @@ export async function generateSshKey(name: string, type: 'ed25519' | 'rsa' | 'ec
 }
 
 export async function addKeyToAgent(name: string, useKeychain = true) {
-  const file = path.join(homedir(), '.ssh', name);
+  const file = sshKeyFile(name);
+  if (!existsSync(file)) throw new Error(`${file} does not exist`);
   const r = await run('ssh-add', [...(useKeychain ? ['--apple-use-keychain'] : []), file]);
   if (r.code !== 0) throw new Error(r.stderr.trim() || 'ssh-add failed (passphrase-protected keys must be added from a terminal once)');
 }
@@ -137,16 +150,43 @@ export async function testSsh(host: string, onLine?: (l: string) => void) {
 
 const SERVICE = 'space.zenkovich.prong';
 
+/**
+ * An engine started for tests (PRONG_TEST_MODE) keeps its secrets in a file of its own state folder: a test run
+ * never reads or writes the user's Keychain (signing in, out, or checking an account there would).
+ */
+const testSecrets = () => (process.env.PRONG_TEST_MODE ? path.join(STATE_DIR(), 'test-secrets.json') : null);
+function readTestSecrets(file: string): Record<string, string> {
+  try {
+    return JSON.parse(readFileSync(file, 'utf8'));
+  } catch {
+    return {};
+  }
+}
+function writeTestSecrets(file: string, all: Record<string, string>) {
+  mkdirSync(path.dirname(file), { recursive: true });
+  writeFileSync(file, JSON.stringify(all, null, 2), { mode: 0o600 });
+}
+
 export async function setSecret(account: string, value: string) {
+  const test = testSecrets();
+  if (test) return writeTestSecrets(test, { ...readTestSecrets(test), [account]: value });
   await run('security', ['delete-generic-password', '-s', SERVICE, '-a', account]).catch(() => null);
   const r = await run('security', ['add-generic-password', '-s', SERVICE, '-a', account, '-w', value, '-U']);
   if (r.code !== 0) throw new Error(r.stderr.trim());
 }
 export async function getSecret(account: string): Promise<string | null> {
+  const test = testSecrets();
+  if (test) return readTestSecrets(test)[account] ?? null;
   const r = await run('security', ['find-generic-password', '-s', SERVICE, '-a', account, '-w']);
   return r.code === 0 ? r.stdout.trim() : null;
 }
 export async function deleteSecret(account: string) {
+  const test = testSecrets();
+  if (test) {
+    const all = readTestSecrets(test);
+    delete all[account];
+    return writeTestSecrets(test, all);
+  }
   await run('security', ['delete-generic-password', '-s', SERVICE, '-a', account]).catch(() => null);
 }
 

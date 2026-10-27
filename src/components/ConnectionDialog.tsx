@@ -7,7 +7,7 @@ import { closeDialog, openDialog, useRepo, useStore } from '../state/store';
 import { FONT, useTheme } from '../theme';
 import { Icon } from '../ui/Icon';
 import { Modal } from '../ui/overlays';
-import { Badge, Button, PressScale, Txt } from '../ui/primitives';
+import { Badge, Button, PressScale, Txt, useKeyboard } from '../ui/primitives';
 
 /** 'inherit' | 'default' | 'ssh:<key>' | 'account:<id>' */
 type Choice = string;
@@ -56,6 +56,13 @@ export function ConnectionDialog() {
     setPicked(value);
     setTest(null);
   };
+  // Enter saves a changed choice, as the dialog's button does
+  useKeyboard((e) => {
+    if (e.key === 'Enter' && !e.meta && !e.shift && !e.consumed && choice && choice !== saved) {
+      e.preventDefault();
+      void save();
+    }
+  });
   return (
     <Modal
       title={`Connection · ${repoName}`}
@@ -65,7 +72,7 @@ export function ConnectionDialog() {
         <>
           <Button small label={test?.running ? 'Testing…' : 'Test connection'} icon="refresh" disabled={!remote || !choice || !!test?.running} onPress={() => void runTest()} testID="conn-test" />
           <View style={{ flex: 1 }} />
-          <Button label="Cancel" onPress={closeDialog} />
+          <Button label="Cancel" onPress={closeDialog} testID="conn-cancel" />
           <Button label="Save" primary style={{ marginLeft: 8 }} disabled={!choice || choice === saved} onPress={() => void save()} testID="conn-save" />
         </>
       }

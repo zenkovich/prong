@@ -13,6 +13,7 @@ import {
   setAgentTab,
   setAgentTarget,
   setAgentWidth,
+  setState,
   setVersionStatus,
   toast,
   toggleAgent,
@@ -23,7 +24,7 @@ import {
 import { FONT, useTheme } from '../theme';
 import * as live from '../state/live';
 import { Icon } from '../ui/Icon';
-import { Badge, Button, Checkbox, Cursor, Input, PressScale, Radio, Row, Segmented, Spinner, Splitter, Txt } from '../ui/primitives';
+import { Badge, Button, Checkbox, Cursor, HoverReveal, Input, PressScale, Radio, Row, Segmented, Spinner, Splitter, Txt } from '../ui/primitives';
 
 export function AgentPanel() {
   const t = useTheme();
@@ -32,20 +33,20 @@ export function AgentPanel() {
   return (
     <View style={{ flexDirection: 'row', alignSelf: 'stretch' }}>
       <Splitter orientation="vertical" onDelta={(d) => setAgentWidth(agent.width - d)} />
-      <View style={[styles.panel, { width: agent.width, backgroundColor: t.panel, borderColor: t.border }]}>
+      <View style={[styles.panel, { width: agent.width, backgroundColor: t.panel, borderColor: t.border }]} testID="agent-panel">
         <View style={[styles.head, { borderColor: t.border, backgroundColor: t.panelAlt }]}>
           <Icon name="agent" size={14} color={t.accent} />
           <Txt label style={{ marginLeft: 6 }}>
             agent
           </Txt>
           <View style={{ width: 6, height: 6, backgroundColor: agent.settings.connected ? t.add : t.del, marginLeft: 8 }} />
-          <Txt size={FONT.xs} faint style={{ marginLeft: 4, flex: 1 }} numberOfLines={1}>
+          <Txt size={FONT.xs} faint style={{ marginLeft: 4, flex: 1 }} numberOfLines={1} testID="agent-connection">
             {agent.settings.connected ? `claude code ${agent.settings.cliVersion} · local` : 'not connected'}
           </Txt>
           <PressScale onPress={() => toggleAgentBar(true)} scaleTo={0.9} style={{ padding: 4 }} hoverStyle={{ backgroundColor: t.hover }} label="Fold into the command line (⌘J)" testID="agent-fold">
             <Icon name="collapse" size={13} />
           </PressScale>
-          <PressScale onPress={() => toggleAgent(false)} scaleTo={0.9} style={{ padding: 4 }} hoverStyle={{ backgroundColor: t.hover }} label="Close agent">
+          <PressScale onPress={() => toggleAgent(false)} scaleTo={0.9} style={{ padding: 4 }} hoverStyle={{ backgroundColor: t.hover }} label="Close agent" testID="agent-close">
             <Icon name="x" size={13} />
           </PressScale>
         </View>
@@ -59,7 +60,7 @@ export function AgentPanel() {
           ).map(([k, label]) => {
             const active = agent.tab === k;
             return (
-              <PressScale key={k} onPress={() => setAgentTab(k)} scaleTo={1} style={[styles.tab, active && { borderBottomColor: t.accent }]} hoverStyle={{ backgroundColor: t.hover }}>
+              <PressScale key={k} onPress={() => setAgentTab(k)} scaleTo={1} style={[styles.tab, active && { borderBottomColor: t.accent }]} hoverStyle={{ backgroundColor: t.hover }} testID={`agent-tab-${k}`}>
                 <Txt label size={10} color={active ? t.accent : t.textMuted}>
                   {label}
                 </Txt>
@@ -112,21 +113,22 @@ function Chat() {
       <View style={[styles.composer, { borderColor: t.border, backgroundColor: t.panelAlt }]}>
         <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={{ paddingBottom: 6 }}>
           {SUGGESTIONS.filter((s) => agent.target === 'auto' || s.target === agent.target).map((s) => (
-            <PressScale key={s.text} onPress={() => setText(s.text)} scaleTo={0.97} style={[styles.chip, { borderColor: t.borderStrong }]} hoverStyle={{ borderColor: t.accent }}>
+            <PressScale key={s.text} onPress={() => setText(s.text)} scaleTo={0.97} style={[styles.chip, { borderColor: t.borderStrong }]} hoverStyle={{ borderColor: t.accent }} testID="agent-suggestion">
               <Txt size={FONT.xs} muted>
                 {s.text}
               </Txt>
             </PressScale>
           ))}
         </ScrollView>
-        <Input value={text} onChange={setText} placeholder={agent.target === 'app' ? 'что изменить в интерфейсе' : agent.target === 'repo' ? 'что сделать в репозитории' : 'команда для репозитория или интерфейса'} slash onSubmit={send} autoFocus />
+        <Input value={text} onChange={setText} placeholder={agent.target === 'app' ? 'что изменить в интерфейсе' : agent.target === 'repo' ? 'что сделать в репозитории' : 'команда для репозитория или интерфейса'} slash onSubmit={send} autoFocus enterSends testID="agent-chat-input" />
         <View style={{ flexDirection: 'row', alignItems: 'center', marginTop: 6 }}>
           <Segmented<AgentTarget> value={agent.target} onChange={setAgentTarget} options={[{ value: 'auto', label: 'auto' }, { value: 'repo', label: 'repo' }, { value: 'app', label: 'app' }]} />
           <View style={{ flex: 1 }} />
-          <PressScale onPress={clearAgentChat} scaleTo={0.9} style={{ padding: 4, marginRight: 4 }} hoverStyle={{ backgroundColor: t.hover }} label="Clear chat">
+          {/* not while a run is going: its answer had nowhere to go and was lost */}
+          <PressScale onPress={clearAgentChat} disabled={agent.busy} scaleTo={0.9} style={{ padding: 4, marginRight: 4, opacity: agent.busy ? 0.4 : 1 }} hoverStyle={{ backgroundColor: t.hover }} label="Clear chat" testID="agent-clear">
             <Icon name="trash" size={12} />
           </PressScale>
-          <Button small primary label="Send" icon="send" onPress={send} disabled={!text.trim() || agent.busy} />
+          <Button small primary label="Send" icon="send" onPress={send} disabled={!text.trim() || agent.busy} testID="agent-chat-send" />
         </View>
       </View>
     </View>
@@ -212,12 +214,12 @@ function VersionChip({ id }: { id: number }) {
   if (!v) return null;
   const on = v.status === 'applied';
   return (
-    <View style={{ flexDirection: 'row', alignItems: 'center', marginTop: 6 }}>
+    <View style={{ flexDirection: 'row', alignItems: 'center', marginTop: 6 }} testID="agent-version-chip">
       <Badge bg={on ? t.accentSoft : t.raised} color={on ? t.accent : t.textFaint}>
         v{v.n} · {on ? 'applied' : 'reverted'}
       </Badge>
-      <Button small label={on ? 'Revert' : 'Re-apply'} style={{ marginLeft: 6 }} onPress={() => setVersionStatus(v.id, on ? 'reverted' : 'applied')} />
-      <Button small label="Log" style={{ marginLeft: 4 }} onPress={() => setAgentTab('changes')} />
+      <Button small label={on ? 'Revert' : 'Re-apply'} style={{ marginLeft: 6 }} onPress={() => setVersionStatus(v.id, on ? 'reverted' : 'applied')} testID="agent-chip-toggle" />
+      <Button small label="Log" style={{ marginLeft: 4 }} onPress={() => setAgentTab('changes')} testID="agent-chip-log" />
     </View>
   );
 }
@@ -233,13 +235,13 @@ function Changes() {
   return (
     <View style={{ flex: 1 }}>
       <View style={[styles.logHead, { borderColor: t.border }]}>
-        <Txt size={FONT.sm} muted style={{ flex: 1 }}>
+        <Txt size={FONT.sm} muted style={{ flex: 1 }} testID="agent-versions-head">
           current: <Txt size={FONT.sm} color={t.accent} weight="700">{current === 0 ? 'factory' : `v${current}`}</Txt> · {applied.length} of {versions.length} applied
         </Txt>
-        <Button small label="Reset to factory" icon="rotate" danger={applied.length > 0} disabled={applied.length === 0} onPress={resetFactory} />
+        <Button small label="Reset to factory" icon="rotate" danger={applied.length > 0} disabled={applied.length === 0} onPress={resetFactory} testID="agent-reset-factory" />
       </View>
       <ScrollView style={{ flex: 1 }}>
-        <VersionRow n={0} title="Factory build" subtitle="sources as shipped · tag factory/1.0.0" status={applied.length === 0 ? 'current' : 'base'} onRollback={() => rollbackTo(0)} />
+        <VersionRow n={0} title="Factory build" subtitle="the sources before the agent's first change" status={applied.length === 0 ? 'current' : 'base'} onRollback={() => rollbackTo(0)} />
         {versions.map((v) => (
           <View key={v.id}>
             <VersionRow
@@ -268,7 +270,7 @@ function VersionRow({ n, title, subtitle, status, onPress, onRollback, onToggle 
   const t = useTheme();
   const color = status === 'current' ? t.accent : status === 'reverted' ? t.textFaint : t.text;
   return (
-    <Row height={44} onPress={onPress} style={{ paddingLeft: 10, borderBottomWidth: 1, borderBottomColor: t.border, opacity: status === 'reverted' ? 0.6 : 1 }}>
+    <Row height={44} onPress={onPress} style={{ paddingLeft: 10, borderBottomWidth: 1, borderBottomColor: t.border, opacity: status === 'reverted' ? 0.6 : 1 }} testID={`agent-version-${n}`}>
       {({ hovered }) => (
         <>
           <Txt size={FONT.sm} mono color={color} weight="700" style={{ width: 34 }}>
@@ -282,19 +284,37 @@ function VersionRow({ n, title, subtitle, status, onPress, onRollback, onToggle 
               {subtitle}
             </Txt>
           </View>
-          {status === 'current' ? (
+          {status === 'current' && !onToggle ? (
             <Txt label size={9} color={t.accent}>
               current
             </Txt>
-          ) : hovered ? (
-            <View style={{ flexDirection: 'row' }}>
-              {onToggle && <Button small label={status === 'reverted' ? 'Re-apply' : 'Revert'} onPress={onToggle} />}
-              <Button small label="Roll back here" style={{ marginLeft: 4 }} onPress={onRollback} />
-            </View>
+          ) : status === 'current' ? (
+            // the latest change is the one most often taken back: its row can revert it too (there is nothing to
+            // roll back to on it)
+            <HoverReveal
+              rowHovered={hovered}
+              rest={
+                <Txt label size={9} color={t.accent}>
+                  current
+                </Txt>
+              }
+            >
+              <Button small label="Revert" onPress={onToggle} testID={`agent-version-toggle-${n}`} />
+            </HoverReveal>
           ) : (
-            <Txt label size={9} faint>
-              {status}
-            </Txt>
+            // the buttons stay while the pointer is on them (a button shown only while its row is hovered vanished
+            // the moment the pointer reached it)
+            <HoverReveal
+              rowHovered={hovered}
+              rest={
+                <Txt label size={9} faint>
+                  {status}
+                </Txt>
+              }
+            >
+              {onToggle && <Button small label={status === 'reverted' ? 'Re-apply' : 'Revert'} onPress={onToggle} testID={`agent-version-toggle-${n}`} />}
+              <Button small label="Roll back here" style={{ marginLeft: 4 }} onPress={onRollback} testID={`agent-version-rollback-${n}`} />
+            </HoverReveal>
           )}
         </>
       )}
@@ -302,35 +322,76 @@ function VersionRow({ n, title, subtitle, status, onPress, onRollback, onToggle 
   );
 }
 
+/** the patch of a version, read from the sources' log when its details open (the list carries only its files) */
+function useVersionDiff(v: AppVersion) {
+  const [diff, setDiff] = useState<string | null>(v.sha ? null : v.diff);
+  useEffect(() => {
+    if (!v.sha || !v.sourcesPath) return;
+    let alive = true;
+    live.client.appDiff(v.sourcesPath, v.sha).then(
+      (r) => alive && setDiff(r.diff),
+      (e) => alive && setDiff(`could not read the diff: ${String(e?.message ?? e)}`),
+    );
+    return () => {
+      alive = false;
+    };
+  }, [v.sha, v.sourcesPath]);
+  return diff;
+}
+
+/** lines of a patch drawn in the panel; Copy diff gives all of it */
+const DIFF_LINES = 300;
+
 function VersionDetails({ v }: { v: AppVersion }) {
   const t = useTheme();
+  const diff = useVersionDiff(v);
+  const lines = diff === null ? [] : diff.replace(/\n$/, '').split('\n');
+  // a file of the version in the editor: the sources folder it was recorded in (offline demo versions have none)
+  const open = (f: string) => v.sourcesPath && live.openInEditor(`${v.sourcesPath.replace(/\/+$/, '')}/${f}`);
   return (
-    <View style={{ padding: 10, backgroundColor: t.bg, borderBottomWidth: 1, borderBottomColor: t.border }}>
+    <View style={{ padding: 10, backgroundColor: t.bg, borderBottomWidth: 1, borderBottomColor: t.border }} testID="agent-version-details">
       <Txt size={FONT.xs} faint>
         prompt
       </Txt>
-      <Txt size={FONT.sm} style={{ marginBottom: 6 }}>
+      <Txt size={FONT.sm} selectable style={{ marginBottom: 6 }}>
         «{v.prompt}»
       </Txt>
       <Txt size={FONT.xs} faint>
         files
       </Txt>
       {v.files.map((f) => (
-        <Txt key={f} size={FONT.sm} mono color={t.info}>
-          {f}
-        </Txt>
+        <PressScale key={f} onPress={() => open(f)} disabled={!v.sourcesPath} scaleTo={1} style={{ alignSelf: 'flex-start' }} hoverStyle={{ backgroundColor: t.hover }} label={`Open ${f} in the editor`} testID="agent-version-file">
+          <Txt size={FONT.sm} mono color={t.info}>
+            {f}
+          </Txt>
+        </PressScale>
       ))}
       <Txt size={FONT.xs} faint style={{ marginTop: 6 }}>
         diff
       </Txt>
-      {v.diff.split('\n').map((l, i) => (
-        <Txt key={i} size={FONT.xs} mono color={l.startsWith('+') ? t.add : l.startsWith('-') ? t.del : t.textMuted} style={{ backgroundColor: l.startsWith('+') ? t.addBg : l.startsWith('-') ? t.delBg : 'transparent' }}>
-          {l}
-        </Txt>
-      ))}
+      <View testID="agent-version-diff">
+        {diff === null ? (
+          <Spinner size={12} />
+        ) : (
+          lines.slice(0, DIFF_LINES).map((l, i) => {
+            const add = l.startsWith('+') && !l.startsWith('+++');
+            const del = l.startsWith('-') && !l.startsWith('---');
+            return (
+              <Txt key={i} size={FONT.xs} mono selectable color={add ? t.add : del ? t.del : t.textMuted} style={{ backgroundColor: add ? t.addBg : del ? t.delBg : 'transparent' }}>
+                {l || ' '}
+              </Txt>
+            );
+          })
+        )}
+        {lines.length > DIFF_LINES && (
+          <Txt size={FONT.xs} faint style={{ marginTop: 2 }}>
+            … {lines.length - DIFF_LINES} more lines (Copy diff has them all)
+          </Txt>
+        )}
+      </View>
       <View style={{ flexDirection: 'row', marginTop: 8 }}>
-        <Button small label="Open in editor" icon="edit" onPress={() => toast(`Opened ${v.files[0]} in VS Code`, 'info')} />
-        <Button small label="Copy diff" icon="copy" style={{ marginLeft: 6 }} onPress={() => toast('Diff copied', 'info')} />
+        <Button small label="Open in editor" icon="edit" disabled={!v.sourcesPath || !v.files.length} onPress={() => open(v.files[0])} testID="agent-version-editor" />
+        <Button small label="Copy diff" icon="copy" style={{ marginLeft: 6 }} disabled={!diff} onPress={() => diff && live.copyText(diff)} testID="agent-version-copy" />
       </View>
     </View>
   );
@@ -342,6 +403,8 @@ function Settings() {
   const t = useTheme();
   const s = useStore((st) => st.agent.settings);
   const engine = useStore((st) => st.engine);
+  // the binary the engine found on PATH (an empty field means that one, not a path of its own)
+  const detected = useStore((st) => st.agentAvailable?.path ?? null);
   const [checking, setChecking] = useState(false);
   const persist = (patch: Partial<typeof s>) => {
     updateAgentSettings(patch);
@@ -360,8 +423,10 @@ function Settings() {
     await live.saveSettings({ agent: { ...toServerAgent(s) } });
     const r = await live.client.agentCheck().catch(() => null);
     setChecking(false);
+    // what decides whether a request goes to Claude Code (it was read once at start: a path fixed here did not count)
+    setState({ agentAvailable: r });
     if (r?.ok) {
-      updateAgentSettings({ connected: true, cliVersion: r.version.replace(/\s*\(Claude Code\)/, ''), cliPath: s.cliPath || r.path || '' });
+      updateAgentSettings({ connected: true, cliVersion: r.version.replace(/\s*\(Claude Code\)/, '') });
       toast(`${r.version}`, 'success', r.path ?? '');
     } else {
       updateAgentSettings({ connected: false });
@@ -374,18 +439,18 @@ function Settings() {
         ── provider
       </Txt>
       <View style={{ marginTop: 4 }}>
-        <Radio checked={s.provider === 'anthropic-claude-code'} onPress={() => persist({ provider: 'anthropic-claude-code' })} label="Anthropic · local Claude Code" hint="Runs `claude -p` on this machine with the repository and the app sources as its working directory. Uses your Claude subscription, nothing leaves the machine except model calls." />
+        <Radio checked={s.provider === 'anthropic-claude-code'} onPress={() => persist({ provider: 'anthropic-claude-code' })} label="Anthropic · local Claude Code" hint="Runs claude -p on this machine with the repository and the app sources as its working directory. Uses your Claude subscription, nothing leaves the machine except model calls." />
         <Radio checked={s.provider === 'anthropic-api'} onPress={() => persist({ provider: 'anthropic-api' })} label="Anthropic API key" hint="Direct Messages API with the built-in tool set. Not implemented yet: the local Claude Code provider is the one that runs." />
         <Radio checked={s.provider === 'openai-compatible'} onPress={() => persist({ provider: 'openai-compatible' })} label="OpenAI-compatible endpoint" hint="Any local or remote server with the chat completions API. Not implemented yet." />
       </View>
       <Field label="Model (empty = Claude Code default)">
-        <Input value={s.model} onChange={(v) => persist({ model: v })} mono placeholder="claude-fable-5-1 / sonnet / opus" />
+        <Input value={s.model} onChange={(v) => persist({ model: v })} mono placeholder="claude-fable-5-1 / sonnet / opus" testID="agent-set-model" />
       </Field>
       {s.provider === 'anthropic-claude-code' && (
         <Field label="Claude Code binary">
           <View style={{ flexDirection: 'row', alignItems: 'center' }}>
-            <Input value={s.cliPath} onChange={(v) => persist({ cliPath: v })} mono style={{ flex: 1 }} placeholder="auto-detect (claude on PATH)" />
-            <PressScale onPress={() => void check()} style={{ marginLeft: 6 }}>
+            <Input value={s.cliPath} onChange={(v) => persist({ cliPath: v })} mono style={{ flex: 1 }} placeholder={!s.cliPath && detected ? `auto-detect: ${detected}` : 'auto-detect (claude on PATH)'} testID="agent-set-cli" />
+            <PressScale onPress={() => void check()} style={{ marginLeft: 6 }} testID="agent-check">
               <View style={{ flexDirection: 'row', alignItems: 'center', height: 26, paddingHorizontal: 8, borderWidth: 1, borderColor: t.borderStrong, backgroundColor: t.raised }}>
                 {checking ? <Spinner size={12} /> : <Icon name="link" size={12} />}
                 <Txt label size={10} style={{ marginLeft: 6 }}>
@@ -400,19 +465,20 @@ function Settings() {
         ── app sources
       </Txt>
       <Field label="Sources folder (git repository the agent edits for app changes)">
-        <Input value={s.sourcesPath} onChange={(v) => persist({ sourcesPath: v })} mono placeholder="path to the Prong sources" />
+        <Input value={s.sourcesPath} onChange={(v) => persist({ sourcesPath: v })} mono placeholder="path to the Prong sources" testID="agent-set-sources" />
       </Field>
-      <View style={{ flexDirection: 'row', marginTop: 6, flexWrap: 'wrap' }}>
-        <Button small label="Reveal folder" icon="folder" disabled={!engine.online || !s.sourcesPath} onPress={() => live.revealPath(s.sourcesPath)} />
-        <Button small label="Open as repository" icon="branch" style={{ marginLeft: 6 }} disabled={!engine.online || !s.sourcesPath} onPress={() => void live.openPath(s.sourcesPath)} />
-        <Button small label="Open in editor" icon="edit" style={{ marginLeft: 6 }} disabled={!engine.online || !s.sourcesPath} onPress={() => live.openInEditor(s.sourcesPath)} />
+      {/* gaps, not margins: a button that wraps to the next line starts at the edge */}
+      <View style={{ flexDirection: 'row', marginTop: 6, flexWrap: 'wrap', gap: 6 } as any}>
+        <Button small label="Reveal folder" icon="folder" disabled={!engine.online || !s.sourcesPath} onPress={() => live.revealPath(s.sourcesPath)} testID="agent-sources-reveal" />
+        <Button small label="Open as repository" icon="branch" disabled={!engine.online || !s.sourcesPath} onPress={() => void live.openPath(s.sourcesPath)} testID="agent-sources-open" />
+        <Button small label="Open in editor" icon="edit" disabled={!engine.online || !s.sourcesPath} onPress={() => live.openInEditor(s.sourcesPath)} testID="agent-sources-editor" />
       </View>
       <View style={{ marginTop: 10 }}>
-        <Checkbox checked={s.askBeforeApply} onChange={(v) => persist({ askBeforeApply: v })} label="Plan only: do not let the agent edit files (review in chat first)" />
-        <Checkbox checked={s.autoRollbackOnBuildError} onChange={(v) => persist({ autoRollbackOnBuildError: v })} label="Ask the agent to run the typecheck after edits and fix errors" />
+        <Checkbox checked={s.askBeforeApply} onChange={(v) => persist({ askBeforeApply: v })} label="Plan only: do not let the agent edit files (review in chat first)" testID="agent-plan-only" />
+        <Checkbox checked={s.autoRollbackOnBuildError} onChange={(v) => persist({ autoRollbackOnBuildError: v })} label="Roll back an interface change whose build fails" testID="agent-auto-rollback" />
       </View>
       <Txt size={FONT.xs} faint style={{ marginTop: 12, lineHeight: 15 }}>
-        Each accepted change is a commit in the sources repository; revert = git revert, reset = checkout of the factory tag. If the app fails to boot after a change it starts in safe mode from the factory sources and offers to roll back.
+        Each change the agent makes to the interface is a commit: in the sources’ own repository, or in Prong’s log of them when the folder has none. Revert and Re-apply are git revert, Roll back here and Reset to factory revert every later change; the log is kept, so any version can be applied again.
       </Txt>
     </ScrollView>
   );

@@ -35,4 +35,8 @@ describe('agent notice summary', () => {
     expect(summarize(['⚠ /p is not a git repository: edits applied, no version recorded.'])).toBe('⚠ /p is not a git repository: edits applied, no version recorded.');
     expect(summarize([])).toBe('');
   });
+  it('does not count the outcome of a run as a step (the card said "1 more step" for the recorded version)', () => {
+    expect(summarize(['Read /repo/src/state/store.ts', 'Bash npx tsc --noEmit', 'Edit src/Toolbar.tsx', 'done', 'version v1 · src/Toolbar.tsx'])).toBe('1 file edited · 1 read · 1 command');
+    expect(summarize(['Read /a', 'cost $0.012'])).toBe('1 read');
+  });
 });

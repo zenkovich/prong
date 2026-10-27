@@ -16,7 +16,9 @@ export function buildTree(files: FileChange[]): TreeNode[] {
   // a lookup per folder: a merge can list 50 000 files, a linear search among siblings made this quadratic
   const index = new Map<TreeNode[], Map<string, TreeNode>>();
   for (const f of files) {
-    const parts = f.path.split('/');
+    // an untracked folder (git lists it as "sdk/AiHelp/") is one entry named for the folder, not a folder holding a
+    // nameless file
+    const parts = f.path.replace(/\/+$/, '').split('/');
     let level = root;
     let p = '';
     for (let i = 0; i < parts.length; i++) {
@@ -53,6 +55,9 @@ export function buildTree(files: FileChange[]): TreeNode[] {
   return root;
 }
 
+
+/** a row's React key: a folder and a file of the same path (an untracked folder) must not share one */
+export const rowKey = (r: { node: TreeNode }) => (r.node.file ? 'f:' : 'd:') + r.node.path;
 
 export interface FlatRow {
   node: TreeNode;

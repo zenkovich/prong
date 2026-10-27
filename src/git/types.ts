@@ -9,6 +9,8 @@ export interface Commit {
   email: string;
   date: number; // unix ms
   files?: FileChange[]; // lazy in a real client
+  /** in a file history: the file's name in this commit (the history follows renames) */
+  fileName?: string;
 }
 
 export type RefKind = 'head' | 'branch' | 'remote' | 'tag' | 'stash';
@@ -55,6 +57,8 @@ export interface SavedSession {
   activeTab?: string | null;
   workspaceTabs?: Record<string, { tabs: string[]; activeTab: string | null }>;
   filters?: Record<string, { mode: 'all' | 'current' | 'selected'; refs: string[]; hideRemotes: boolean }>;
+  /** the sidebar's folded and unfolded groups and folders per repository (what differs from how they start) */
+  folds?: Record<string, Record<string, boolean>>;
 }
 
 /** what Fetch, Pull and Push send to the engine (the options of their dialogs, as in Fork) */
@@ -134,11 +138,43 @@ export interface FileChange {
   binary?: { beforeBytes: number; afterBytes: number };
   submodule?: { before: Sha; after: Sha };
   similarity?: number;
-  conflict?: { ours: string[]; theirs: string[]; base: string[] };
+  /**
+   * A merge conflict: the conflicting regions of each side ("⋯" between regions); `deleted`: one side removed the
+   * file; `binary`: no text to show, only a side to take
+   */
+  conflict?: { ours: string[]; theirs: string[]; base: string[]; deleted?: 'ours' | 'theirs'; binary?: boolean };
   /** listed without its diff (a commit with very many files): the diff is loaded when the file is selected */
   lazy?: boolean;
   /** the diff was cut short (more output than the engine reads at once) */
   truncated?: boolean;
+  /** the file mode changed (e.g. 100644 → 100755: made executable) */
+  mode?: { before: string; after: string };
+  /** lines of context around each change the diff was read with ("Expand context" reads more); 3 when not set */
+  context?: number;
+  /** more context showed nothing new: the diff covers the whole file */
+  contextAll?: boolean;
+  /**
+   * A submodule whose own files have changes (git status's "modified content" / "untracked content"). `only`: its
+   * commit is the recorded one, so it is listed for them alone — nothing to stage or discard here, they are
+   * committed in the submodule
+   */
+  inside?: SubmoduleInside;
+}
+
+/** what a submodule's own working copy has that its commit does not */
+export interface SubmoduleInside {
+  /** tracked files changed (staged or not) in the submodule, nested submodules included */
+  modified: number;
+  /** files (or folders) git does not track in the submodule */
+  untracked: number;
+  /** the first of them, paths inside the submodule (the engine names up to 50; the counts cover them all) */
+  files: { path: string; status: FileStatus }[];
+  only?: boolean;
+}
+
+/** a submodule with changes in its own files (the engine's submoduleChanges) */
+export interface SubmoduleChanges extends Omit<SubmoduleInside, 'only'> {
+  path: string;
 }
 
 export type LineKind = 'ctx' | 'add' | 'del';
@@ -148,6 +184,8 @@ export interface DiffLine {
   oldNo?: number;
   newNo?: number;
   text: string;
+  /** the last line of its side with no newline after it ("\ No newline at end of file"): a patch must say so */
+  noEol?: boolean;
 }
 
 export interface Hunk {
@@ -213,4 +251,6 @@ export interface RepoSnapshot {
   conflictFile?: FileChange;
   /** a shallow clone (`clone --depth`): its history is cut off, and unshallow completes it */
   shallow?: boolean;
+  /** a repository with no commits yet (git init): the branch its first commit will make (no ref names it yet) */
+  unborn?: string;
 }

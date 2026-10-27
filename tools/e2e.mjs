@@ -1,331 +1,20 @@
 #!/usr/bin/env node
 /**
- * End-to-end checks of the real UI against the real engine, headless.
- *
- *   npm run e2e            (needs a web export in macos/build/web and the compiled engine in server/dist,
- *                           i.e. after macos/build.sh; CHROME may point at a chromium binary, otherwise
- *                           Playwright's own chromium is used)
- *
- * The run starts an engine on a free port with a temporary state directory, builds a fixture repository
- * with text and image changes, and drives the exported web UI through Playwright. Nothing touches
- * ~/.prong or the user's repositories.
+ * End-to-end checks of the real UI against the real engine, headless: the main run. The setup (fixtures, engine,
+ * page, helpers) is tools/e2e/harness.mjs; the suites of each part of the UI are in tools/e2e/suites/, and
+ * `npm run e2e` runs this file and all of them (tools/e2e/run-all.mjs).
  */
-import { spawn, execFileSync } from 'node:child_process';
+import { execFileSync } from 'node:child_process';
 import { copyFileSync, mkdtempSync, readFileSync, rmSync, writeFileSync, mkdirSync, existsSync, readdirSync, utimesSync, realpathSync } from 'node:fs';
 import { tmpdir, homedir } from 'node:os';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
-import { chromium } from 'playwright';
-import { deflateSync } from 'node:zlib';
-
-const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-const WEB = process.env.E2E_WEB_DIR ?? path.join(ROOT, 'macos/build/web');
-const ENGINE = path.join(ROOT, 'server/dist/src/index.js');
-if (!existsSync(path.join(WEB, 'index.html')) || !existsSync(ENGINE)) {
-  console.error('e2e: run macos/build.sh first (web export + compiled engine)');
-  process.exit(2);
-}
-/** minimal PNG encoder: solid colour with a diagonal of a second colour, so the two versions differ visibly */
-function makePng(w, h, rgb, rgb2) {
-  const crcTable = [...Array(256)].map((_, n) => {
-    let c = n;
-    for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
-    return c >>> 0;
-  });
-  const crc = (buf) => {
-    let c = 0xffffffff;
-    for (const b of buf) c = crcTable[(c ^ b) & 0xff] ^ (c >>> 8);
-    return (c ^ 0xffffffff) >>> 0;
-  };
-  const chunk = (type, data) => {
-    const len = Buffer.alloc(4);
-    len.writeUInt32BE(data.length);
-    const td = Buffer.concat([Buffer.from(type), data]);
-    const c = Buffer.alloc(4);
-    c.writeUInt32BE(crc(td));
-    return Buffer.concat([len, td, c]);
-  };
-  const raw = Buffer.alloc((w * 3 + 1) * h);
-  for (let y = 0; y < h; y++) {
-    raw[y * (w * 3 + 1)] = 0;
-    for (let x = 0; x < w; x++) {
-      const px = Math.abs(x - y) < 3 ? rgb2 : rgb;
-      raw.set(px, y * (w * 3 + 1) + 1 + x * 3);
-    }
-  }
-  const ihdr = Buffer.alloc(13);
-  ihdr.writeUInt32BE(w, 0);
-  ihdr.writeUInt32BE(h, 4);
-  ihdr[8] = 8;
-  ihdr[9] = 2;
-  return Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), chunk('IHDR', ihdr), chunk('IDAT', deflateSync(raw)), chunk('IEND', Buffer.alloc(0))]);
-}
-const PNG_A = makePng(64, 48, [200, 60, 40], [255, 255, 255]);
-const PNG_B = makePng(80, 48, [40, 90, 200], [255, 230, 0]);
-const SAME_1 = makePng(64, 48, [30, 160, 90], [255, 255, 255]);
-const SAME_2 = makePng(64, 48, [30, 160, 90], [255, 40, 40]);
-/** 16-bit mono PCM WAV with a sine tone */
-function makeWav(freq, seconds, rate = 8000) {
-  const n = Math.round(seconds * rate);
-  const data = Buffer.alloc(n * 2);
-  for (let i = 0; i < n; i++) data.writeInt16LE(Math.round(Math.sin((2 * Math.PI * freq * i) / rate) * 12000 * (1 - i / n)), i * 2);
-  const h = Buffer.alloc(44);
-  h.write('RIFF', 0);
-  h.writeUInt32LE(36 + data.length, 4);
-  h.write('WAVEfmt ', 8);
-  h.writeUInt32LE(16, 16);
-  h.writeUInt16LE(1, 20);
-  h.writeUInt16LE(1, 22);
-  h.writeUInt32LE(rate, 24);
-  h.writeUInt32LE(rate * 2, 28);
-  h.writeUInt16LE(2, 32);
-  h.writeUInt16LE(16, 34);
-  h.write('data', 36);
-  h.writeUInt32LE(data.length, 40);
-  return Buffer.concat([h, data]);
-}
-const FIX = path.join(ROOT, 'tools/fixtures');
-
-const tmp = mkdtempSync(path.join(tmpdir(), 'prong-e2e-'));
-const state = path.join(tmp, 'state');
-const root = path.join(tmp, 'repos');
-const git = (dir, ...args) => execFileSync('git', args, { cwd: dir, stdio: 'pipe', env: { ...process.env, GIT_AUTHOR_NAME: 'E2E Author', GIT_AUTHOR_EMAIL: 'e2e@example.com', GIT_COMMITTER_NAME: 'E2E Author', GIT_COMMITTER_EMAIL: 'e2e@example.com' } }).toString();
-function makeRepo(name) {
-  const dir = path.join(root, name);
-  mkdirSync(path.join(dir, 'img'), { recursive: true });
-  git(dir, 'init', '-q', '-b', 'main');
-  git(dir, 'config', 'commit.gpgsign', 'false');
-  writeFileSync(path.join(dir, 'README.md'), `# ${name}\n`);
-  writeFileSync(path.join(dir, 'src.txt'), 'one\ntwo\n');
-  mkdirSync(path.join(dir, 'src/nested'), { recursive: true });
-  writeFileSync(path.join(dir, 'src/nested/deep.txt'), 'deep\n');
-  writeFileSync(path.join(dir, 'img/pixel.png'), PNG_A);
-  git(dir, 'add', '-A');
-  git(dir, 'commit', '-q', '-m', 'Initial commit');
-  writeFileSync(path.join(dir, 'img/pixel.png'), PNG_B);
-  git(dir, 'add', '-A');
-  git(dir, 'commit', '-q', '-m', 'Change pixel');
-  if (name === 'alpha') {
-    // every kind of media change: modified (same and different size), deleted, added, audio, video, unplayable, binary
-    for (const d of ['media', 'data', 'Assets']) mkdirSync(path.join(dir, d), { recursive: true });
-    writeFileSync(path.join(dir, 'img/same.png'), SAME_1);
-    writeFileSync(path.join(dir, 'img/old.png'), PNG_A);
-    writeFileSync(path.join(dir, 'media/tone.wav'), makeWav(440, 0.5));
-    copyFileSync(path.join(FIX, 'clip-a.webm'), path.join(dir, 'media/clip.webm'));
-    writeFileSync(path.join(dir, 'data/blob.bin'), Buffer.from(Array.from({ length: 1000 }, (_, i) => (i % 7 === 0 ? 0 : i % 251)))); // NUL bytes: git treats it as binary
-    git(dir, 'add', '-A');
-    git(dir, 'commit', '-q', '-m', 'Add media');
-    writeFileSync(path.join(dir, 'img/same.png'), SAME_2);
-    rmSync(path.join(dir, 'img/old.png'));
-    writeFileSync(path.join(dir, 'media/tone.wav'), makeWav(660, 0.8));
-    copyFileSync(path.join(FIX, 'clip-b.webm'), path.join(dir, 'media/clip.webm'));
-    copyFileSync(path.join(FIX, 'legacy.avi'), path.join(dir, 'media/legacy.avi'));
-    writeFileSync(path.join(dir, 'data/blob.bin'), Buffer.from(Array.from({ length: 1500 }, (_, i) => (i % 5 === 0 ? 0 : i % 241))));
-    writeFileSync(path.join(dir, 'Assets/scene.meta'), 'guid: 1\n');
-    git(dir, 'add', '-A');
-    git(dir, 'commit', '-q', '-m', 'Media changes');
-    // a TypeScript module, branches, a tag and an origin: sidebar, commit list and line staging checks
-    writeFileSync(path.join(dir, 'src/app.ts'), Array.from({ length: 10 }, (_, i) => `const v${i} = ${i};`).join('\n') + '\nexport default v0;\n');
-    git(dir, 'add', '-A');
-    git(dir, 'commit', '-q', '-m', 'Add app module');
-    git(dir, 'branch', 'feature/login');
-    git(dir, 'branch', 'bugfix/crash');
-    git(dir, 'tag', 'v1.0');
-    git(dir, 'checkout', '-q', '-b', 'feature/search');
-    writeFileSync(path.join(dir, 'search.txt'), 'search\n');
-    git(dir, 'add', '-A');
-    git(dir, 'commit', '-q', '-m', 'Search feature work');
-    git(dir, 'checkout', '-q', 'main');
-    // branches for the batch actions: three merged ones and one with a commit of its own
-    for (const b of ['batch/a', 'batch/b', 'batch/c']) git(dir, 'branch', b);
-    for (const b of ['batch/wip', 'batch/wip2']) {
-      git(dir, 'checkout', '-q', '-b', b, 'main');
-      writeFileSync(path.join(dir, `${b.split('/')[1]}.txt`), 'wip\n');
-      git(dir, 'add', '-A');
-      git(dir, 'commit', '-q', '-m', b === 'batch/wip' ? 'Batch wip' : 'Batch wip two');
-    }
-    git(dir, 'checkout', '-q', 'main');
-    const origin = path.join(tmp, 'origins/alpha.git');
-    mkdirSync(path.dirname(origin), { recursive: true });
-    git(tmp, 'init', '-q', '--bare', origin);
-    git(dir, 'remote', 'add', 'origin', origin);
-    git(dir, 'push', '-q', '-u', 'origin', 'main', 'feature/search');
-    // two neighbouring edits: one hunk, two changed line pairs
-    writeFileSync(path.join(dir, 'src/app.ts'), Array.from({ length: 10 }, (_, i) => (i === 3 ? 'const v3 = 30;' : i === 4 ? 'const v4 = 40;' : `const v${i} = ${i};`)).join('\n') + '\nexport default v0;\n');
-    writeFileSync(path.join(dir, 'img/new.png'), PNG_B); // untracked: a new image with no previous version
-  }
-  // working-copy changes: a text edit, a nested new file and an image edit
-  writeFileSync(path.join(dir, 'src.txt'), 'one\ntwo\nthree\n');
-  writeFileSync(path.join(dir, 'src/nested/new.txt'), 'new\n');
-  writeFileSync(path.join(dir, 'img/pixel.png'), PNG_A);
-  return dir;
-}
-mkdirSync(root, { recursive: true });
-makeRepo('alpha');
-makeRepo('beta');
-{
-  // beta gets a long history (650 empty commits on main): a branch click has to read more pages of the log.
-  // old-start sits on the very first commit, mid-way 50 commits under the tip.
-  const beta = path.join(root, 'beta');
-  const head = git(beta, 'rev-parse', 'HEAD').trim();
-  const t0 = Math.floor(Date.now() / 1000) + 60;
-  let stream = '';
-  for (let i = 1; i <= 650; i++) {
-    const msg = `Filler ${i}`;
-    stream += `commit refs/heads/main\nmark :${i}\ncommitter E2E Author <e2e@example.com> ${t0 + i * 60} +0000\ndata ${Buffer.byteLength(msg)}\n${msg}\n${i === 1 ? `from ${head}\n` : ''}\n`;
-  }
-  execFileSync('git', ['fast-import', '--quiet'], { cwd: beta, input: stream });
-  git(beta, 'branch', 'old-start', git(beta, 'rev-list', '--max-parents=0', 'HEAD').trim());
-  git(beta, 'branch', 'mid-way', 'main~50');
-  // a commit with more files than the engine sends diffs for at once (on its own branch, newest in the history)
-  git(beta, 'checkout', '-q', '-b', 'wide');
-  for (let i = 0; i < 400; i++) {
-    mkdirSync(path.join(beta, `wide/part${i % 5}`), { recursive: true });
-    writeFileSync(path.join(beta, `wide/part${i % 5}/file${i}.txt`), `wide line ${i}\n`);
-  }
-  git(beta, 'add', 'wide');
-  execFileSync('git', ['commit', '-q', '-m', 'Wide commit', '--date', new Date((t0 + 700 * 60) * 1000).toISOString()], { cwd: beta, env: { ...process.env, GIT_AUTHOR_NAME: 'E2E Author', GIT_AUTHOR_EMAIL: 'e2e@example.com', GIT_COMMITTER_NAME: 'E2E Author', GIT_COMMITTER_EMAIL: 'e2e@example.com', GIT_COMMITTER_DATE: new Date((t0 + 700 * 60) * 1000).toISOString() } });
-  git(beta, 'checkout', '-q', 'main');
-  // and 2000 new files in the index (git would list a wholly untracked folder as one entry)
-  for (let i = 0; i < 2000; i++) {
-    mkdirSync(path.join(beta, `gen/batch${i % 10}`), { recursive: true });
-    writeFileSync(path.join(beta, `gen/batch${i % 10}/gen${i}.txt`), `${i}\n`);
-  }
-  git(beta, 'add', 'gen');
-}
-for (const n of ['payments-service-backend-api', 'customer-analytics-dashboard', 'mobile-client-ios-and-android']) makeRepo(n);
-// a repository with a submodule (the submodule's origin lives outside the scanned folder)
-const subOrigin = path.join(tmp, 'origins/core-lib');
-mkdirSync(subOrigin, { recursive: true });
-git(subOrigin, 'init', '-q', '-b', 'main');
-git(subOrigin, 'config', 'commit.gpgsign', 'false');
-writeFileSync(path.join(subOrigin, 'core.txt'), 'core\n');
-git(subOrigin, 'add', '-A');
-git(subOrigin, 'commit', '-q', '-m', 'core');
-const sup = makeRepo('superproject');
-git(sup, '-c', 'protocol.file.allow=always', 'submodule', 'add', '-q', subOrigin, 'libs/core');
-git(sup, 'commit', '-q', '-m', 'Add core submodule');
-// two commits in the submodule, then a commit in the superproject that moves the pointer to them
-const coreClone = path.join(sup, 'libs/core');
-git(coreClone, 'config', 'commit.gpgsign', 'false');
-writeFileSync(path.join(coreClone, 'core.txt'), 'core\none\n');
-git(coreClone, 'commit', '-qam', 'core: one');
-const coreOne = git(coreClone, 'rev-parse', 'HEAD').trim();
-writeFileSync(path.join(coreClone, 'core.txt'), 'core\none\ntwo\n');
-git(coreClone, 'commit', '-qam', 'core: two');
-git(sup, 'add', 'libs/core');
-git(sup, 'commit', '-q', '-m', 'Bump core');
-// and one more in the submodule that the superproject has not recorded: a submodule change in Changes
-writeFileSync(path.join(coreClone, 'core.txt'), 'core\none\ntwo\nthree\n');
-git(coreClone, 'commit', '-qam', 'core: three');
-mkdirSync(path.join(root, 'home-root'), { recursive: true });
-makeRepo('home-root/gamma');
-
-// Prong's own sources for the agent's interface changes: a small plain folder (no .git: the engine keeps a shadow log)
-const appSources = path.join(tmp, 'app-sources');
-mkdirSync(path.join(appSources, 'src'), { recursive: true });
-writeFileSync(path.join(appSources, 'src/Toolbar.tsx'), 'export const themeButton = true;\n');
-
-// SSH keys for the connection settings: a folder of its own, never the user's ~/.ssh
-const sshKeys = path.join(tmp, 'ssh');
-mkdirSync(sshKeys, { recursive: true });
-for (const k of ['e2e_work', 'e2e_personal']) execFileSync('ssh-keygen', ['-q', '-t', 'ed25519', '-N', '', '-C', k, '-f', path.join(sshKeys, k)]);
-
-/*
- * The engine for this run. Ports stay away from the app's own (8790–8799), and the run only trusts an engine that
- * says it listens on the chosen port: once a taken port let the health check reach the user's running Prong, and
- * the run rewrote the user's workspaces and settings.
- */
-let engine;
-let engineLog = '';
-let port = 0;
-/** what the fake agent was asked, and where (tools/fake-claude.sh appends there) */
-const agentLog = path.join(tmp, 'agent-prompts.log');
-async function spawnEngine(p) {
-  const child = spawn(process.execPath, [ENGINE], {
-    env: { ...process.env, PRONG_TEST_MODE: '1', PRONG_FAKE_AGENT_LOG: agentLog, PRONG_PORT: String(p), PRONG_STATE_DIR: state, PRONG_SSH_DIR: sshKeys, PRONG_WEB_DIR: WEB, PRONG_SOURCES_DEFAULT: '', PRONG_UI_BUILD_CMD: `sh ${JSON.stringify(path.join(ROOT, 'tools/fake-ui-build.sh'))} {out}` },
-    stdio: ['ignore', 'pipe', 'pipe'],
-  });
-  const ok = await new Promise((resolve) => {
-    const onData = (b) => {
-      engineLog += b;
-      if (engineLog.includes(`listening on http://127.0.0.1:${p}`)) resolve(true);
-    };
-    child.stdout.on('data', onData);
-    child.stderr.on('data', onData);
-    child.on('exit', () => resolve(false));
-    setTimeout(() => resolve(false), 20000);
-  });
-  if (!ok) child.kill('SIGKILL');
-  return ok ? child : null;
-}
-for (let attempt = 0; attempt < 10 && !engine; attempt++) {
-  port = 18700 + Math.floor(Math.random() * 1000);
-  engine = await spawnEngine(port);
-}
-if (!engine) throw new Error('the engine did not start:\n' + engineLog);
-// a crash of this script must not leave the engine running
-process.on('exit', () => {
-  try {
-    engine.kill('SIGKILL');
-  } catch {}
-});
-const base = `http://127.0.0.1:${port}`;
-// the agent is a stand-in that prints Claude Code's stream events (no network, no cost)
-await fetch(base + '/api/settings', { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ agent: { cliPath: path.join(ROOT, 'tools/fake-claude.sh'), sourcesPath: appSources } }) });
-// workspaces: work and home both scan `root` (alpha, beta; home-root/gamma is one level deeper), lab scans home-root
-await fetch(base + '/api/workspaces', { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify([{ id: 'work', name: 'work', rootPath: root, scanDepth: 1 }, { id: 'home', name: 'home', rootPath: root, scanDepth: 1 }, { id: 'lab', name: 'lab', rootPath: path.join(root, 'home-root'), scanDepth: 1 }]) });
-
-const exe = process.env.CHROME ?? (() => {
-  const cache = path.join(homedir(), 'Library/Caches/ms-playwright');
-  try {
-    const d = readdirSync(cache).filter((x) => x.startsWith('chromium_headless_shell-')).sort().pop();
-    const p = d && path.join(cache, d, 'chrome-headless-shell-mac-arm64/chrome-headless-shell');
-    return p && existsSync(p) ? p : undefined;
-  } catch {
-    return undefined;
-  }
-})();
-const browser = await chromium.launch({ executablePath: exe, headless: true });
-const page = await browser.newPage({ viewport: { width: 1440, height: 900 } });
-await page.addInitScript((b) => {
-  window.__PRONG_SERVER__ = b;
-}, base);
-const pageErrors = [];
-page.on('pageerror', (e) => pageErrors.push(e.message));
-// avatar lookups answer 404 for unknown authors by design (the UI falls back to initials): not an error
-page.on('console', (m) => m.type() === 'error' && !/Failed to load resource.*404/.test(m.text()) && pageErrors.push('console: ' + m.text().slice(0, 200)));
-
-const results = [];
-let failed = 0;
-const SHOTS = process.env.E2E_SHOTS; // folder for a screenshot after every check (debugging the UI)
-async function check(name, fn) {
-  try {
-    await fn();
-    results.push(`  ok   ${name}`);
-    console.log(results[results.length - 1]);
-    if (SHOTS) await page.screenshot({ path: path.join(SHOTS, `${String(results.length).padStart(2, '0')}.png`) }).catch(() => {});
-  } catch (e) {
-    failed++;
-    // the first line, plus Playwright's call log (which locator it was waiting for, what blocked it)
-    const lines = String(e?.message ?? e).split('\n');
-    const log = lines.filter((l) => /waiting for|intercepts pointer|not stable|not visible|retrying/.test(l)).slice(0, 4);
-    results.push(`  FAIL ${name}\n       ${[lines[0], ...log.map((l) => l.trim())].join('\n       ')}`);
-    console.log(results[results.length - 1]);
-    try {
-      await page.screenshot({ path: path.join(tmp, `fail-${results.length}.png`) });
-    } catch {}
-  }
-}
-const expect = (cond, msg) => {
-  if (!cond) throw new Error(msg);
-};
-const text = () => page.evaluate(() => document.body.innerText);
-// innerText applies CSS text-transform (labels are upper-case), so text checks ignore case
-const visible = async (s) => (await text()).toLowerCase().includes(s.toLowerCase());
-const waitText = (s, t = 15000) => page.waitForFunction((s) => document.body.innerText.toLowerCase().includes(s.toLowerCase()), s, { timeout: t });
-
-await page.goto(base + '/', { waitUntil: 'load', timeout: 60000 });
+import {
+  ROOT, FIX, PNG_A, PNG_B, SAME_1, SAME_2, makePng, makeWav,
+  tmp, state, root, git, makeRepo, sup, coreClone, coreOne, appSources, sshKeys, agentLog,
+  base, port, engineLog, browser, page, pageErrors, results,
+  check, expect, text, visible, waitText, SHOTS,
+  tabBoxesNow, openRepo, gitOut, statusHas, refreshUi, until, post, undoLabel, freshRepo, finish,
+} from './e2e/harness.mjs';
 
 await check('welcome: work workspace lists the scanned top-level repositories only', async () => {
   await waitText('alpha');
@@ -562,12 +251,6 @@ await check('preferences: list/tree choice is remembered across a reload', async
   expect(s2.ui.fileView === 'list', 'still list after reload');
 });
 
-const tabBoxesNow = () => page.evaluate(() => [...document.querySelectorAll('[data-testid^="tab-"]')].filter((e) => !/^tab-(group|arrow)-/.test(e.getAttribute('data-testid'))));
-const openRepo = async (name) => {
-  await page.getByTestId('home-button').click();
-  await page.getByText(name, { exact: true }).first().click();
-  await waitText('All Commits');
-};
 
 await check('agent bar: without a repository it says so in a notice', async () => {
   // a launch with no tabs (tabs now come back from the saved session, so start from an empty one)
@@ -654,7 +337,7 @@ await check('shortcuts work while typing: ⌘K from the commit message, ⌘⇧J 
   expect(!(await page.locator('input[placeholder="type a command"]').count()), 'Esc closes the palette from its input');
   await page.keyboard.press('Meta+Shift+J');
   await waitText('Prong поставляется');
-  await page.locator('input[placeholder*="команда для репозитория"]').first().click();
+  await page.locator('[placeholder*="команда для репозитория"]').first().click();
   await page.keyboard.press('Meta+Shift+J');
   await page.waitForTimeout(300);
   expect(!(await visible('Prong поставляется')), 'the chat window closes from its own input');
@@ -737,7 +420,6 @@ await check('crash containment: an error thrown outside React opens the error di
   await page.getByTestId('error-dialog').waitFor({ state: 'detached', timeout: 3000 });
 });
 
-const gitOut = (...a) => git(path.join(root, 'alpha'), ...a);
 
 await check('header: the workspace button has no frame, its menu is short, no colour-scheme button', async () => {
   const border = await page.evaluate(() => getComputedStyle(document.querySelector('[data-testid="workspace-button"]')).borderTopWidth);
@@ -914,7 +596,7 @@ const waitSelectedInView = (subject) =>
     subject,
     { timeout: 15000 },
   );
-const commitCount = async () => Number((await text()).match(/of (\d+) commits/)?.[1] ?? 0);
+const commitCount = async () => Number((await text()).match(/of (\d+)\+? commits/)?.[1] ?? 0);
 const funnelShown = (name) =>
   page.evaluate((name) => {
     const el = document.querySelector(`[data-testid="funnel-${name}"]`);
@@ -1365,14 +1047,7 @@ await check('a double click switches branches: in the branch list, and on a comm
   expect(head() === 'main', 'back on main: ' + head());
 });
 
-const statusHas = (re) => page.waitForFunction((src) => new RegExp(src).test(document.querySelector('[data-testid="status-bar"]')?.textContent ?? ''), re.source, { timeout: 15000 });
 const headNow = () => gitOut('rev-parse', '--abbrev-ref', 'HEAD').trim();
-/** branches made from the command line show up after a refresh (More → Refresh) */
-const refreshUi = async () => {
-  await page.getByText('More', { exact: true }).first().click();
-  await page.getByText('Refresh', { exact: true }).first().click();
-  await page.waitForTimeout(600);
-};
 // the batch check deleted most branches at main's commit: these are fresh ones (alpha has local changes, so the
 // switches stay on one commit)
 gitOut('checkout', '-q', 'main');
@@ -1702,7 +1377,8 @@ await check('Undo (⌘Z, the toolbar button): staging, a commit, a discard and a
     await page.getByTestId('file-unstaged-undo-stage.txt').click();
     await page.keyboard.press(' ');
     await page.getByTestId('file-staged-undo-stage.txt').waitFor({ timeout: 5000 });
-    expect(/Undo Stage undo-stage\.txt/.test((await page.getByTestId('undo-button').getAttribute('aria-label')) ?? ''), 'the button says what it undoes');
+    // the step is recorded once the lists are read again (a moment after the row moved)
+    await until(async () => /Undo Stage undo-stage\.txt/.test((await page.getByTestId('undo-button').getAttribute('aria-label')) ?? ''), 'the button says what it undoes: ' + (await page.getByTestId('undo-button').getAttribute('aria-label')), 3000);
     await page.keyboard.press('Meta+z');
     await page.getByTestId('file-unstaged-undo-stage.txt').waitFor({ timeout: 5000 });
     expect(!gitOut('diff', '--cached', '--name-only').includes('undo-stage.txt'), 'unstaged again');
@@ -1833,6 +1509,277 @@ await check('one status panel, on the right of the toolbar where the palette fie
   await openRepo('alpha');
 });
 
+await check('an account whose sign-in no longer works says so: on the start screen, in Clone and in Accounts, with Sign in again', async () => {
+  // a stored account without a sign-in (as after GitHub stops accepting a token): a made-up id, never a real one
+  const accountsFile = path.join(state, 'accounts.json');
+  const before = existsSync(accountsFile) ? readFileSync(accountsFile, 'utf8') : '[]';
+  writeFileSync(accountsFile, JSON.stringify([{ id: 'github.com:prong-e2e-nobody-5c1d', host: 'github.com', login: 'prong-e2e-nobody-5c1d', name: 'Nobody', orgs: [] }]));
+  try {
+    await page.reload({ waitUntil: 'load' });
+    // the session brings the tabs back first: the start screen after that
+    await page.getByTestId('activity-branch').waitFor({ timeout: 20000 });
+    await page.getByTestId('home-button').click();
+    await page.getByTestId('account-prong-e2e-nobody-5c1d').waitFor({ timeout: 10000 });
+    await page.waitForFunction(() => /sign in again/i.test(document.querySelector('[data-testid="account-prong-e2e-nobody-5c1d"]')?.textContent ?? ''), null, { timeout: 10000 });
+    // Clone: the account's list is not asked for; the notice and the way out instead
+    await page.getByText('Clone', { exact: true }).first().click();
+    await page.getByTestId('clone-signin-expired').waitFor({ timeout: 5000 });
+    expect((await page.getByTestId('error-dialog').count()) === 0, 'no error dialog');
+    await page.getByTestId('clone-signin-expired').getByText('Sign in again…', { exact: true }).click();
+    await page.getByTestId('resign-prong-e2e-nobody-5c1d').waitFor({ timeout: 5000 });
+    await page.getByTestId('accounts-expired-note').waitFor({ timeout: 3000 });
+    await page.keyboard.press('Escape');
+  } finally {
+    writeFileSync(accountsFile, before);
+    await page.reload({ waitUntil: 'load' });
+    await page.getByTestId('activity-branch').waitFor({ timeout: 20000 }).catch(() => {});
+  }
+});
+
+await check('Clone from GitHub: every page of repositories, what an app sign-in cannot see, and the list grows with the dialog', async () => {
+  // GitHub stands in: one account, 150 repositories over two pages, a sign-in through a GitHub App installed nowhere
+  const repos = Array.from({ length: 150 }, (_, i) => ({ fullName: `mock-user/repo-${String(i).padStart(3, '0')}`, sshUrl: `git@github.com:mock-user/repo-${i}.git`, httpsUrl: '', private: false, pushedAt: '', description: '' }));
+  const fake = { id: 'github.com:mock-user', host: 'github.com', login: 'mock-user', name: 'Mock User', orgs: [] };
+  await page.route('**/api/accounts', (r) => (r.request().method() === 'GET' ? r.fulfill({ json: [fake] }) : r.continue()));
+  await page.route('**/api/accounts/check', (r) => r.fulfill({ json: { [fake.id]: { state: 'ok' } } }));
+  await page.route('**/api/github/repos', (r) => {
+    const page_ = JSON.parse(r.request().postData() ?? '{}').page ?? 1;
+    return r.fulfill({ json: repos.slice((page_ - 1) * 100, page_ * 100) });
+  });
+  await page.route('**/api/github/access', (r) => r.fulfill({ json: { kind: 'app', installations: [] } }));
+  let navs = 0;
+  const onNav = (f) => f === page.mainFrame() && navs++;
+  page.on('framenavigated', onNav);
+  const errorsBefore = pageErrors.length;
+  try {
+    await page.reload({ waitUntil: 'load' });
+    // the session brings the tabs back after the start: the start screen after that, not before (or it is left again)
+    await page.getByTestId('activity-branch').waitFor({ timeout: 20000 }).catch(() => {});
+    await page.getByTestId('home-button').click();
+    await page.getByTestId('account-mock-user').waitFor({ timeout: 20000 });
+    expect(navs === 1 && pageErrors.length === errorsBefore, `one load, no page errors: ${navs}, ${pageErrors.slice(errorsBefore).join(' | ')}`);
+    await page.getByText('From GitHub or any URL', { exact: true }).click({ force: true });
+    await page.getByTestId('clone-count').waitFor({ timeout: 10000 });
+    expect(/150 repositories/.test(await page.getByTestId('clone-count').innerText()), 'both pages: ' + (await page.getByTestId('clone-count').innerText()));
+    const note = await page.getByTestId('clone-app-note').innerText();
+    expect(/GitHub App/.test(note) && /none yet/.test(note), 'says what the sign-in cannot see: ' + note);
+    // the list takes the height the dialog is given
+    const list = () => page.evaluate(() => [...document.querySelectorAll('div')].find((d) => d.textContent?.startsWith('mock-user/repo-000') && getComputedStyle(d).overflowY !== 'visible')?.getBoundingClientRect().height ?? 0);
+    const before = await list();
+    const grip = await page.getByTestId('resize-grip').last().boundingBox();
+    await page.mouse.move(grip.x + grip.width / 2, grip.y + grip.height / 2);
+    await page.mouse.down();
+    await page.mouse.move(grip.x + grip.width / 2, grip.y + grip.height / 2 + 120, { steps: 6 });
+    await page.mouse.up();
+    await page.waitForTimeout(200);
+    const after = await list();
+    // the dialog is tall already: the drag stops at the window's height, the list takes what it gets
+    expect(after > before + 40, `the list grew: ${before} → ${after}`);
+    // the token way in, straight from the note
+    await page.getByTestId('clone-use-token').click();
+    await page.getByPlaceholder('ghp_… / github_pat_…').waitFor({ timeout: 5000 });
+    await page.keyboard.press('Escape');
+  } finally {
+    page.off('framenavigated', onNav);
+    await page.unroute('**/api/accounts');
+    await page.unroute('**/api/accounts/check');
+    await page.unroute('**/api/github/repos');
+    await page.unroute('**/api/github/access');
+    await page.reload({ waitUntil: 'load' });
+    await page.getByTestId('activity-box').waitFor({ timeout: 20000 });
+  }
+});
+
+await check('Clone with a connection: the owner’s key suggested, the address tested, the clone keeps the connection', async () => {
+  const beta = path.join(root, 'beta');
+  const post = (p, body) => fetch(base + p, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) }).then((r) => r.json());
+  // beta stands for an organization's repository with its own key
+  git(beta, 'remote', 'add', 'origin', 'git@github.com:e2e-org/beta.git');
+  await post('/api/repo/setAuth', { path: beta, auth: { kind: 'ssh', key: 'e2e_work' } });
+  const into = path.join(tmp, 'clone-into');
+  mkdirSync(into, { recursive: true });
+  try {
+    await page.getByTestId('home-button').click();
+    await page.getByText('From GitHub or any URL', { exact: true }).click({ force: true });
+    await page.getByText('URL', { exact: true }).first().click();
+    // an address of the same owner: its key is suggested, and why
+    await page.getByTestId('clone-url').fill('git@github.com:e2e-org/another.git');
+    await page.getByTestId('clone-connection-hint').waitFor({ timeout: 5000 });
+    expect(/SSH key e2e_work/.test(await page.getByTestId('clone-connection').innerText()), 'the owner’s key');
+    expect(/as beta/.test(await page.getByTestId('clone-connection-hint').innerText()), 'says where it comes from');
+    // a readable address, tested with the chosen connection before cloning
+    const src = path.join(tmp, 'origins/alpha.git');
+    await page.getByTestId('clone-url').fill(src);
+    await page.getByTestId('clone-connection').click();
+    await page.getByTestId('pick-ssh:e2e_work').click();
+    await page.getByTestId('clone-test').click();
+    await page.waitForFunction(() => /Readable with this connection/.test(document.querySelector('[data-testid="clone-test-result"]')?.textContent ?? ''), null, { timeout: 15000 });
+    await page.getByTestId('clone-dir').fill(into);
+    await page.getByTestId('clone-go').click();
+    await statusHas(/Cloning alpha: done/);
+    const entry = JSON.parse(readFileSync(path.join(state, 'repos.json'), 'utf8')).find((x) => x.path === path.join(into, 'alpha'));
+    expect(entry && JSON.stringify(entry.auth) === JSON.stringify({ kind: 'ssh', key: 'e2e_work' }), 'registered with the connection: ' + JSON.stringify(entry));
+  } finally {
+    git(beta, 'remote', 'remove', 'origin');
+    await post('/api/repo/setAuth', { path: beta, auth: null });
+  }
+});
+
+await check('several Changes files at once: ⌘ and Shift pick them, the bar stages them (one Undo), ⌘ on a folder, ⌘A, Escape; a new folder opens with its files; closed folders keep the tree right', async () => {
+  const alpha = path.join(root, 'alpha');
+  // tracked files with changes (an untracked folder is listed as one entry)
+  mkdirSync(path.join(alpha, 'ms'), { recursive: true });
+  for (const n of ['a', 'b', 'c']) writeFileSync(path.join(alpha, `ms/${n}.txt`), `${n}\n`);
+  gitOut('add', 'ms');
+  gitOut('commit', '-q', '-m', 'ms files');
+  for (const n of ['a', 'b', 'c']) writeFileSync(path.join(alpha, `ms/${n}.txt`), `${n} changed\n`);
+  mkdirSync(path.join(alpha, 'untracked-dir'), { recursive: true });
+  writeFileSync(path.join(alpha, 'untracked-dir/inside.txt'), 'x\n');
+  try {
+    await openRepo('alpha');
+    await refreshUi();
+    await page.getByText('Changes', { exact: true }).first().click();
+    // a new (untracked) folder opens like any other: git names it once, Changes lists its files with their counts
+    await page.getByTestId('folder-unstaged-untracked-dir').waitFor({ timeout: 5000 });
+    await page.getByTestId('file-unstaged-untracked-dir/inside.txt').waitFor({ timeout: 5000 });
+    expect((await page.getByTestId('file-unstaged-untracked-dir/inside.txt').innerText()).includes('+1'), 'a new file counts its lines');
+    await page.getByTestId('folder-toggle-unstaged-untracked-dir').click();
+    await page.waitForFunction(() => !document.querySelector('[data-testid="file-unstaged-untracked-dir/inside.txt"]'), null, { timeout: 3000 });
+    await page.getByTestId('folder-toggle-unstaged-untracked-dir').click();
+    await page.getByTestId('file-unstaged-untracked-dir/inside.txt').waitFor({ timeout: 3000 });
+    // ⌘ adds, Shift runs in the order shown
+    await page.getByTestId('file-unstaged-ms/a.txt').click();
+    await page.getByTestId('file-unstaged-ms/c.txt').click({ modifiers: ['Meta'] });
+    await page.getByTestId('picked-bar-unstaged').waitFor({ timeout: 3000 });
+    expect(/2 selected/.test(await page.getByTestId('picked-bar-unstaged').innerText()), 'two picked');
+    // the anchor is c (the last ⌘-click): Shift on a takes the run a…c
+    await page.getByTestId('file-unstaged-ms/a.txt').click({ modifiers: ['Shift'] });
+    await page.waitForFunction(() => /3 selected/.test(document.querySelector('[data-testid="picked-bar-unstaged"]')?.textContent ?? ''), null, { timeout: 3000 });
+    // the bar stages them all; one Undo takes them back
+    await page.getByTestId('picked-stage').click();
+    await page.getByTestId('file-staged-ms/b.txt').waitFor({ timeout: 5000 });
+    expect(['ms/a.txt', 'ms/b.txt', 'ms/c.txt'].every((p) => gitOut('diff', '--cached', '--name-only').includes(p)), 'all three staged');
+    await page.keyboard.press('Meta+z');
+    await page.getByTestId('file-unstaged-ms/b.txt').waitFor({ timeout: 5000 });
+    expect(!gitOut('diff', '--cached', '--name-only').includes('ms/'), 'unstaged again by one Undo');
+    // ⌘ on a folder picks its files; Escape drops the pick; ⌘A picks the whole list
+    await page.getByTestId('folder-unstaged-ms').click({ modifiers: ['Meta'] });
+    await page.waitForFunction(() => /\b[34] selected/.test(document.querySelector('[data-testid="picked-bar-unstaged"]')?.textContent ?? ''), null, { timeout: 3000 });
+    await page.keyboard.press('Escape');
+    await page.waitForFunction(() => !document.querySelector('[data-testid="picked-bar-unstaged"]'), null, { timeout: 3000 });
+    await page.getByTestId('file-unstaged-ms/a.txt').click();
+    await page.keyboard.press('Meta+a');
+    const all = await page.evaluate(() => document.querySelectorAll('[data-testid^="file-unstaged-"]').length);
+    await page.waitForFunction((n) => new RegExp(`${n} selected`).test(document.querySelector('[data-testid="picked-bar-unstaged"]')?.textContent ?? ''), all, { timeout: 3000 });
+    await page.keyboard.press('Escape');
+    // a closed folder leaves no rows of it behind (duplicate row keys used to keep stale ones on screen)
+    await page.getByTestId('folder-toggle-unstaged-ms').click();
+    await page.waitForFunction(() => !document.querySelector('[data-testid="file-unstaged-ms/a.txt"]'), null, { timeout: 3000 });
+    const rowsAt = await page.evaluate(() => {
+      const tops = [...document.querySelectorAll('[data-testid^="file-unstaged-"], [data-testid^="folder-unstaged-"]')].map((e) => Math.round(e.getBoundingClientRect().top));
+      return tops.length - new Set(tops).size;
+    });
+    expect(rowsAt === 0, 'no two rows drawn at the same place: ' + rowsAt);
+    await page.getByTestId('folder-toggle-unstaged-ms').click();
+  } finally {
+    gitOut('reset', '-q', '--', 'ms');
+    gitOut('checkout', '-q', '--', 'ms');
+    gitOut('rm', '-r', '-q', 'ms');
+    gitOut('commit', '-q', '-m', 'drop ms files');
+    rmSync(path.join(alpha, 'untracked-dir'), { recursive: true, force: true });
+  }
+});
+
+await check('a Changes folder does what a file does, to everything inside: a click picks it, Space and a double click stage it (one Undo), its buttons and menu unstage and discard it, its arrow closes it', async () => {
+  const alpha = path.join(root, 'alpha');
+  const names = ['fold/a.txt', 'fold/sub/b.txt', 'fold/sub/c.txt'];
+  mkdirSync(path.join(alpha, 'fold/sub'), { recursive: true });
+  for (const n of [...names, 'outside.txt']) writeFileSync(path.join(alpha, n), `${n}\n`);
+  gitOut('add', 'fold', 'outside.txt');
+  gitOut('commit', '-q', '-m', 'fold files');
+  for (const n of [...names, 'outside.txt']) writeFileSync(path.join(alpha, n), `${n} changed\n`);
+  const staged = () => gitOut('diff', '--cached', '--name-only').split('\n').filter(Boolean).sort();
+  const until = async (fn, what) => {
+    for (let i = 0; i < 100 && !fn(); i++) await new Promise((r) => setTimeout(r, 100));
+    expect(fn(), what);
+  };
+  try {
+    await openRepo('alpha');
+    await refreshUi();
+    await page.getByText('Changes', { exact: true }).first().click();
+    await page.getByTestId('folder-unstaged-fold').waitFor({ timeout: 5000 });
+    expect((await page.getByTestId('folder-count-unstaged-fold').innerText()).trim() === '3', 'the folder counts its files');
+    // a plain click picks the folder: all its files, the subfolder's too
+    await page.getByTestId('folder-unstaged-fold').click();
+    await page.waitForFunction(() => /\b3 selected/.test(document.querySelector('[data-testid="picked-bar-unstaged"]')?.textContent ?? ''), null, { timeout: 3000 });
+    // Space stages them, as one action Undo takes back
+    await page.keyboard.press(' ');
+    await until(() => JSON.stringify(staged()) === JSON.stringify(names), 'Space staged the folder: ' + staged());
+    await page.keyboard.press('Meta+z');
+    await until(() => staged().length === 0, 'one Undo unstaged it all');
+    // a double click on the subfolder stages just it
+    await page.getByTestId('folder-unstaged-fold/sub').dblclick();
+    await until(() => JSON.stringify(staged()) === JSON.stringify(['fold/sub/b.txt', 'fold/sub/c.txt']), 'the double click staged fold/sub: ' + staged());
+    // the action is named for the folder
+    await page.waitForFunction(() => document.querySelector('[data-testid="undo-button"]')?.getAttribute('aria-label') === 'Undo Stage fold/sub/ (⌘Z)', null, { timeout: 5000 });
+    // in Staged its button unstages it
+    await page.getByTestId('folder-staged-fold/sub').hover();
+    await page.getByTestId('folder-unstage-fold/sub').click();
+    await until(() => staged().length === 0, 'its button unstaged it');
+    // the menu discards it all (Prong keeps a copy: Undo puts it back); a file outside stays — once the list shows
+    // all three back in Unstaged (git changes before the list does)
+    await page.waitForFunction(() => document.querySelector('[data-testid="folder-count-unstaged-fold"]')?.textContent?.trim() === '3', null, { timeout: 5000 });
+    await page.getByTestId('folder-unstaged-fold').click({ button: 'right' });
+    await page.getByText('Discard all 3 files inside…', { exact: true }).click();
+    await waitText('Discard the changes in fold/?');
+    await page.getByText('Discard', { exact: true }).last().click();
+    await until(() => readFileSync(path.join(alpha, 'fold/a.txt'), 'utf8') === 'fold/a.txt\n' && readFileSync(path.join(alpha, 'fold/sub/c.txt'), 'utf8') === 'fold/sub/c.txt\n', 'the folder is discarded');
+    expect(readFileSync(path.join(alpha, 'outside.txt'), 'utf8') === 'outside.txt changed\n', 'a file outside it is not touched');
+    await page.keyboard.press('Meta+z');
+    await statusHas(/Undone: Discard fold\//);
+    expect(names.every((n) => readFileSync(path.join(alpha, n), 'utf8') === `${n} changed\n`), 'Undo put the folder back');
+    // the folder and a file beside it: its menu acts on the whole pick
+    await page.getByTestId('folder-unstaged-fold').waitFor({ timeout: 5000 });
+    await page.getByTestId('folder-unstaged-fold').click();
+    await page.getByTestId('file-unstaged-outside.txt').click({ modifiers: ['Meta'] });
+    await page.waitForFunction(() => /\b4 selected/.test(document.querySelector('[data-testid="picked-bar-unstaged"]')?.textContent ?? ''), null, { timeout: 3000 });
+    await page.getByTestId('folder-unstaged-fold').click({ button: 'right' });
+    expect(await page.getByText('Stage 4 files', { exact: true }).isVisible(), 'the menu of the whole pick');
+    await page.keyboard.press('Escape');
+    // ⌘ on the folder takes its files out again
+    await page.getByTestId('folder-unstaged-fold').click({ modifiers: ['Meta'] });
+    await page.waitForFunction(() => !document.querySelector('[data-testid="picked-bar-unstaged"]'), null, { timeout: 3000 });
+    // the arrow closes and opens it; the click on it picks nothing
+    await page.getByTestId('folder-toggle-unstaged-fold').click();
+    await page.waitForFunction(() => !document.querySelector('[data-testid="file-unstaged-fold/a.txt"]'), null, { timeout: 3000 });
+    expect(!(await page.getByTestId('picked-bar-unstaged').count()), 'the arrow does not pick');
+    await page.getByTestId('folder-toggle-unstaged-fold').click();
+    await page.getByTestId('file-unstaged-fold/a.txt').waitFor({ timeout: 3000 });
+    // a file's own hover button stays under the pointer (hover buttons used to vanish the moment it reached them)
+    await page.getByTestId('file-unstaged-outside.txt').hover();
+    await page.getByTestId('file-stage-outside.txt').click();
+    await until(() => staged().includes('outside.txt'), 'the file button staged it: ' + staged());
+  } finally {
+    gitOut('reset', '-q');
+    gitOut('checkout', '-q', '--', 'fold', 'outside.txt');
+    gitOut('rm', '-r', '-q', 'fold', 'outside.txt');
+    gitOut('commit', '-q', '-m', 'drop fold files');
+  }
+});
+
+await check('a submodule change in Changes shows its pointers (its preview used to crash before the diff was read)', async () => {
+  const supDir = path.join(root, 'superproject');
+  // the submodule checked out at a commit the superproject does not record: a change in Changes
+  const core = path.join(supDir, 'libs/core');
+  expect(git(core, 'rev-parse', 'HEAD').trim() !== git(supDir, 'rev-parse', 'HEAD:libs/core').trim(), 'the fixture has the submodule moved');
+  await openRepo('superproject');
+  await refreshUi();
+  await page.getByText('Changes', { exact: true }).first().click();
+  await page.getByTestId('file-unstaged-libs/core').click();
+  await waitText('Submodule pointer changed');
+  expect(!(await visible('Preview failed')) && !(await visible('crashed')), 'no crash');
+});
+
 const versionsNow = async () => (await fetch(base + '/api/app/versions', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ sources: appSources }) })).json();
 const buildMark = () => page.evaluate(() => document.querySelector('meta[name="prong-build"]')?.getAttribute('content') ?? null);
 
@@ -1884,11 +1831,4 @@ await check('a change that does not build is rolled back, the window stays as it
   await page.getByTestId('agent-notice-close').first().click();
 });
 
-await browser.close();
-engine.kill('SIGTERM');
-if (failed) {
-  console.log(`\n${failed} failed · screenshots in ${tmp}\n--- engine log ---\n${engineLog.slice(-2000)}`);
-  process.exit(1);
-}
-rmSync(tmp, { recursive: true, force: true });
-console.log(`\ne2e: ${results.length} checks passed`);
+await finish();

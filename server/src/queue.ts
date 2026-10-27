@@ -43,9 +43,12 @@ export class RepoQueue {
     return this.jobs.map(({ id, label, state, since, lock, lockSince }) => ({ id, label, state, since, lock, lockSince }));
   }
 
-  run<T>(label: string, fn: () => Promise<T>): Promise<T> {
+  /** `signal`: the user stopped it — still waiting (its turn, a lock), it leaves the queue as cancelled */
+  run<T>(label: string, fn: () => Promise<T>, signal?: AbortSignal): Promise<T> {
     return new Promise<T>((resolve, reject) => {
-      this.jobs.push({ id: ++seq, label, state: 'queued', since: Date.now(), fn, resolve: resolve as (v: unknown) => void, reject });
+      const id = ++seq;
+      this.jobs.push({ id, label, state: 'queued', since: Date.now(), fn, resolve: resolve as (v: unknown) => void, reject });
+      signal?.addEventListener('abort', () => this.cancel(id), { once: true });
       this.changed();
       void this.pump();
     });

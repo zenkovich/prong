@@ -20,6 +20,15 @@ export interface NetAuth {
 
 export const sshDir = () => process.env.PRONG_SSH_DIR ?? path.join(homedir(), '.ssh');
 
+/** host and owner of a repository address: git@host:owner/repo, ssh://git@host[:port]/owner/repo, https://host/owner/repo */
+export function hostOwner(url: string): { host: string; owner: string } | null {
+  const scp = /^[\w.-]+@([\w.-]+):\/?([^/]+)\//.exec(url);
+  if (scp) return { host: scp[1].toLowerCase(), owner: scp[2] };
+  const u = /^[a-z+]+:\/\/(?:[^@/]+@)?([\w.-]+)(?::\d+)?\/([^/]+)\//i.exec(url);
+  if (u) return { host: u[1].toLowerCase(), owner: u[2] };
+  return null;
+}
+
 /** the setting for `dir`: its own, or the nearest registered folder above it that has one */
 export function resolveAuth(repos: { path: string; auth?: RepoAuth }[], dir: string): { auth: RepoAuth; from: string } | null {
   let best: { auth: RepoAuth; from: string } | null = null;

@@ -1,8 +1,8 @@
 import React, { useEffect, useRef, useState } from 'react';
-import { ScrollView, StyleSheet, TextInput, View } from 'react-native';
+import { Platform, ScrollView, StyleSheet, TextInput, View } from 'react-native';
 import { elapsed, summarize } from '../agent/status';
 import { AgentTarget } from '../agent/types';
-import { agentSend, agentStop, dismissAgentNotice, setAgentTarget, setVersionStatus, toggleAgent, toggleAgentBar, useStore } from '../state/store';
+import { agentSend, agentStop, dismissAgentNotice, openAgentChat, setAgentTarget, setVersionStatus, toggleAgent, toggleAgentBar, useStore } from '../state/store';
 import { FONT, TABS_H, useTheme } from '../theme';
 import { Icon } from '../ui/Icon';
 import { Glass, PressScale, Spinner, Txt } from '../ui/primitives';
@@ -29,8 +29,18 @@ export function AgentBar() {
     const id = setInterval(() => setNow(Date.now()), 1000);
     return () => clearInterval(id);
   }, [agent.busy]);
+  const wasBusy = useRef(agent.busy);
   useEffect(() => {
-    if (agent.bar && !agent.busy) setTimeout(() => input.current?.focus(), 30);
+    const finished = wasBusy.current && !agent.busy;
+    wasBusy.current = agent.busy;
+    if (!agent.bar || agent.busy) return;
+    // unfolded: the cursor goes into the line; when a run ends, only if the user is not typing somewhere else
+    // meanwhile (the commit message, a search): the line used to take the cursor out of it mid-word
+    setTimeout(() => {
+      const a: any = Platform.OS === 'web' && typeof document !== 'undefined' ? document.activeElement : null;
+      if (finished && a && ['INPUT', 'TEXTAREA'].includes(a.tagName) && a !== input.current) return;
+      input.current?.focus();
+    }, 30);
   }, [agent.bar, agent.busy]);
   const send = () => {
     if (!text.trim() || agent.busy) return;
@@ -42,7 +52,7 @@ export function AgentBar() {
     return (
       <View testID="agent-bar" style={[styles.line, { borderColor: t.accent, backgroundColor: t.panel, width: 380 }]}>
         <Spinner size={12} />
-        <PressScale onPress={() => toggleAgent(true)} scaleTo={1} style={{ flex: 1, marginLeft: 8, minWidth: 0 }} label="Open the agent chat">
+        <PressScale onPress={openAgentChat} scaleTo={1} style={{ flex: 1, marginLeft: 8, minWidth: 0 }} label="Open the agent chat" testID="agent-status-open">
           <Txt size={FONT.sm} numberOfLines={1} testID="agent-status">
             {agent.status ?? 'Working…'}
           </Txt>
@@ -53,7 +63,7 @@ export function AgentBar() {
         <PressScale onPress={agentStop} scaleTo={0.9} style={styles.icon} hoverStyle={{ backgroundColor: t.hover }} label="Stop the agent" testID="agent-stop">
           <Icon name="stop" size={11} color={t.del} />
         </PressScale>
-        <PressScale onPress={() => toggleAgent(true)} scaleTo={0.9} style={styles.icon} hoverStyle={{ backgroundColor: t.hover }} label="Open the full agent window">
+        <PressScale onPress={() => toggleAgent(true)} scaleTo={0.9} style={styles.icon} hoverStyle={{ backgroundColor: t.hover }} label="Open the full agent window" testID="agent-busy-expand">
           <Icon name="expand" size={12} />
         </PressScale>
       </View>
@@ -79,7 +89,7 @@ export function AgentBar() {
   return (
     <View testID="agent-bar" style={[styles.line, { borderColor: t.accent, backgroundColor: t.bg, width: 460 }]}>
       <Icon name="agent" size={13} color={t.accent} />
-      <PressScale onPress={() => setAgentTarget(NEXT[agent.target])} scaleTo={0.95} style={[styles.target, { borderColor: t.borderStrong }]} hoverStyle={{ borderColor: t.accent }} label="Where the request runs: auto, repository or Prong's own interface (click to change)">
+      <PressScale onPress={() => setAgentTarget(NEXT[agent.target])} scaleTo={0.95} style={[styles.target, { borderColor: t.borderStrong }]} hoverStyle={{ borderColor: t.accent }} label="Where the request runs: auto, repository or Prong's own interface (click to change)" testID="agent-target">
         <Txt label size={9.5} color={agent.target === 'auto' ? t.textMuted : t.accent}>
           {agent.target}
         </Txt>
@@ -91,7 +101,7 @@ export function AgentBar() {
         placeholder="ask the agent: repository or interface…"
         placeholderTextColor={t.textFaint}
         onSubmitEditing={send}
-        onKeyPress={(e: any) => e.nativeEvent?.key === 'Escape' && toggleAgentBar(false)}
+        // Escape folds the line through the window's keys (App), which let a menu or a dropdown above take it first
         testID="agent-input"
         style={{ flex: 1, minWidth: 0, color: t.text, fontFamily: t.fontFor('400'), fontSize: FONT.sm, paddingVertical: 0, ...({ outlineStyle: 'none' } as any) }}
       />
@@ -101,7 +111,7 @@ export function AgentBar() {
       <PressScale onPress={() => toggleAgent(true)} scaleTo={0.9} style={styles.icon} hoverStyle={{ backgroundColor: t.hover }} label="Open the full agent window (⌘⇧J)" testID="agent-expand">
         <Icon name="expand" size={12} />
       </PressScale>
-      <PressScale onPress={() => toggleAgentBar(false)} scaleTo={0.9} style={styles.icon} hoverStyle={{ backgroundColor: t.hover }} label="Fold (Esc)">
+      <PressScale onPress={() => toggleAgentBar(false)} scaleTo={0.9} style={styles.icon} hoverStyle={{ backgroundColor: t.hover }} label="Fold (Esc)" testID="agent-fold-bar">
         <Icon name="x" size={12} />
       </PressScale>
     </View>
@@ -122,7 +132,7 @@ export function AgentNotices() {
         const v = n.versionId ? versions.find((x) => x.id === n.versionId) : undefined;
         const color = n.title === 'No changes' || n.title === 'Stopped' ? t.warn : n.ok ? t.add : t.del;
         return (
-          <Glass key={n.id} style={[styles.card, { borderLeftColor: color }]}>
+          <Glass key={n.id} style={[styles.card, { borderLeftColor: color }]} testID="agent-notice-card">
             <View testID="agent-notice" style={{ flexDirection: 'row', alignItems: 'center' }}>
               <Icon name={n.ok && n.title !== 'No changes' ? 'check' : 'warning'} size={13} color={color} />
               <Txt label size={10} color={color} style={{ marginLeft: 6 }}>
@@ -144,14 +154,14 @@ export function AgentNotices() {
               </Txt>
             )}
             <View style={{ flexDirection: 'row', alignItems: 'center', marginTop: 8, gap: 6 } as any}>
-              <PressScale onPress={() => toggleAgent(true)} scaleTo={0.96} style={[styles.chip, { borderColor: t.borderStrong }]} hoverStyle={{ borderColor: t.accent }}>
+              <PressScale onPress={openAgentChat} scaleTo={0.96} style={[styles.chip, { borderColor: t.borderStrong }]} hoverStyle={{ borderColor: t.accent }} testID="agent-notice-open">
                 <Txt label size={9.5}>open chat</Txt>
               </PressScale>
-              <PressScale onPress={() => toggleAgentBar(true)} scaleTo={0.96} style={[styles.chip, { borderColor: t.borderStrong }]} hoverStyle={{ borderColor: t.accent }}>
+              <PressScale onPress={() => toggleAgentBar(true)} scaleTo={0.96} style={[styles.chip, { borderColor: t.borderStrong }]} hoverStyle={{ borderColor: t.accent }} testID="agent-notice-reply">
                 <Txt label size={9.5}>reply</Txt>
               </PressScale>
               {v && (
-                <PressScale onPress={() => setVersionStatus(v.id, v.status === 'applied' ? 'reverted' : 'applied')} scaleTo={0.96} style={[styles.chip, { borderColor: t.borderStrong }]} hoverStyle={{ borderColor: t.accent }}>
+                <PressScale onPress={() => setVersionStatus(v.id, v.status === 'applied' ? 'reverted' : 'applied')} scaleTo={0.96} style={[styles.chip, { borderColor: t.borderStrong }]} hoverStyle={{ borderColor: t.accent }} testID="agent-notice-version">
                   <Txt label size={9.5} color={t.accent}>
                     {v.status === 'applied' ? `revert v${v.n}` : `re-apply v${v.n}`}
                   </Txt>
@@ -162,7 +172,7 @@ export function AgentNotices() {
         );
       })}
       {notices.length > 3 && (
-        <Txt size={FONT.xs} faint style={{ textAlign: 'right', marginTop: 4 }}>
+        <Txt size={FONT.xs} faint style={{ textAlign: 'right', marginTop: 4 }} testID="agent-notice-more">
           +{notices.length - 3} more · open chat to see all
         </Txt>
       )}

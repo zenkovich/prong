@@ -64,9 +64,11 @@ export interface UiSettings {
   commitDescOpen: boolean;
   detailsHeaderHeight: number;
   detailsDescOpen: boolean;
+  /** the share of the history's height the commit details take (the splitter under the commit list) */
+  detailsRatio: number;
 }
 
-export const DEFAULT_UI: UiSettings = { theme: 'amber', uiScale: 1, fileView: 'tree', diffMode: 'unified', sidebarWidth: 230, submoduleView: 'tree', commitAction: 'commit', commitBoxHeight: 170, commitDescOpen: true, detailsHeaderHeight: 130, detailsDescOpen: true };
+export const DEFAULT_UI: UiSettings = { theme: 'amber', uiScale: 1, fileView: 'tree', diffMode: 'unified', sidebarWidth: 230, submoduleView: 'tree', commitAction: 'commit', commitBoxHeight: 170, commitDescOpen: true, detailsHeaderHeight: 130, detailsDescOpen: true, detailsRatio: 0.46 };
 
 export const DEFAULT_SETTINGS: Settings = {
   editor: 'Visual Studio Code',

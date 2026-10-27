@@ -42,7 +42,7 @@ export function DeleteBranchesDialog({ names }: { names: string[] }) {
   const count = locals.length + remotes.length + (withRemote ? tracked.length : 0);
   return (
     <Modal
-      title={`Delete ${locals.length + remotes.length} branches`}
+      title={`Delete ${locals.length + remotes.length} branch${locals.length + remotes.length === 1 ? '' : 'es'}`}
       width={520}
       icon={<Icon name="trash" size={14} color={t.del} />}
       footer={

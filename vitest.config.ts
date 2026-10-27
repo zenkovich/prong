@@ -5,5 +5,5 @@ import { defineConfig } from 'vitest/config';
 export default defineConfig({
   esbuild: { tsconfigRaw: { compilerOptions: { target: 'es2022', jsx: 'react-jsx' } } },
   resolve: { alias: { 'react-native': 'react-native-web' } },
-  test: { include: ['src/**/*.test.ts'], environment: 'node', server: { deps: { inline: [/react-native/] } } },
+  test: { include: ['src/**/*.test.ts'], environment: 'node', setupFiles: ['src/test-setup.ts'], server: { deps: { inline: [/react-native/] } } },
 });
