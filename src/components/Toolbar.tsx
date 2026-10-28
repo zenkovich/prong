@@ -403,6 +403,8 @@ export function Toolbar() {
             { label: repo.shallow ? 'Unshallow the whole repository' : 'Unshallow — not a shallow clone', disabled: !repo.shallow, onPress: () => unshallow({ allBranches: true }) },
             { label: noSubmodules ? 'Submodules → Update — none here' : 'Submodules → Update all', disabled: noSubmodules, onPress: () => (isLive ? live.updateSubmodules(undefined, false) : toast('Submodules updated (mock)', 'success')) },
             { label: 'Submodules → Update recursively', disabled: noSubmodules, onPress: () => (isLive ? live.updateSubmodules(undefined, true) : toast('Submodules updated (mock)', 'success')) },
+            // files left as pointers (cloned without LFS, or left out by .lfsconfig's fetchexclude)
+            { label: 'Restore Git LFS files…', disabled: !isLive, onPress: () => openDialog({ type: 'lfs' }) },
             { label: 'Refresh', shortcut: '⌘R', onPress: () => (isLive ? void live.refreshNow() : toast('Refreshed (mock)', 'info')) },
             { label: undoTop ? `Undo ${undoTop.label}` : 'Undo — nothing to undo', shortcut: '⌘Z', disabled: !undoTop, onPress: () => live.undoLast() },
             { separator: true },

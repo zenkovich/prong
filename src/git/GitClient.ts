@@ -108,6 +108,28 @@ export interface BlobSide {
   /** object id, or mtime+size for the working copy: part of the URL so a changed file is refetched */
   version: string;
   oid?: string;
+  /**
+   * A Git LFS file: `bytes` is the real file's size, `oid` the LFS object; `local`: its content is on this machine
+   * (otherwise the preview offers to download it); `pointerFile`: the working copy holds the pointer, not the file.
+   */
+  lfs?: { oid: string; size: number; local: boolean; pointerFile?: boolean };
+}
+/** the working copy's Git LFS files still held as pointers (engine `lfsFiles`) */
+export interface LfsFiles {
+  installed: boolean;
+  version?: string;
+  /** LFS files in HEAD */
+  total: number;
+  /** `downloaded`: the object is on this machine, only the checkout is missing */
+  missing: { path: string; size: number; downloaded: boolean }[];
+  /** patterns the repository leaves out of downloads (lfs.fetchexclude, from its config and .lfsconfig) */
+  excluded: string[];
+}
+/** what to restore from Git LFS: everything, or folders (with all below them) and single files */
+export interface LfsPick {
+  all?: boolean;
+  folders?: string[];
+  files?: string[];
 }
 export interface UiSettings {
   theme: string;
@@ -202,6 +224,12 @@ export interface GitClient {
   blobUrl(repo: string, rev: string, file: string, version?: string): string;
   /** a file on disk with that content (the working copy, or the blob extracted into the engine's cache) */
   blobFile(path: string, rev: string, file: string): Promise<{ path: string; bytes: number }>;
+  /** the working copy's Git LFS files that are still pointers (reads every LFS file of HEAD: seconds when big) */
+  lfsFiles(path: string): Promise<LfsFiles>;
+  /** puts the real files of the pick in place of their pointers (`git lfs pull`), as a long operation */
+  lfsRestore(path: string, pick: LfsPick, count?: number): Promise<{ opId: string }>;
+  /** downloads the LFS object of one preview side (the working copy is not touched), as a long operation */
+  lfsDownload(path: string, rev: string, file: string): Promise<{ opId: string }>;
   /** OS icon for a file extension, served by the engine */
   fileIconUrl(ext: string): string;
   /** stops a running long operation (the agent) */
@@ -472,6 +500,15 @@ export class HttpGitClient implements GitClient {
   }
   blobFile(path: string, rev: string, file: string) {
     return this.op<{ path: string; bytes: number }>('blobFile', path, { rev, file });
+  }
+  lfsFiles(path: string) {
+    return this.op<LfsFiles>('lfsFiles', path);
+  }
+  lfsRestore(path: string, pick: LfsPick, count?: number) {
+    return this.op<{ opId: string }>('lfsRestore', path, { ...pick, count });
+  }
+  lfsDownload(path: string, rev: string, file: string) {
+    return this.op<{ opId: string }>('lfsDownload', path, { rev, file });
   }
   fileIconUrl(ext: string) {
     return `${this.baseUrl}/api/fileicon?ext=${encodeURIComponent(ext)}`;

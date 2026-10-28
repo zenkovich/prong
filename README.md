@@ -23,11 +23,13 @@ Prong is an experiment. It runs on macOS, the app is signed ad hoc (you build it
   - Unified or split, with syntax highlighting.
   - Images before and after; audio and video players.
   - Binary files, renames and submodule pointers.
+  - Git LFS files show as the files they point to; an object not on your machine is downloaded for the preview.
 - **Everyday git.**
   - Fetch, pull and push with progress.
   - Stashes, branches, tags, remotes.
   - Submodules: update, sync, open.
   - Blame, file history, undo.
+  - Git LFS files left as pointers (cloned without LFS, or left out by `.lfsconfig`) are restored by folder.
 - **Accounts.**
   - GitHub sign-in (Device Flow or a token); clone from your repository list.
   - SSH keys: generate, add to ssh-agent, upload to GitHub.

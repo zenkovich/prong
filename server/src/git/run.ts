@@ -1,5 +1,6 @@
 import { spawn } from 'node:child_process';
 import { AsyncLocalStorage } from 'node:async_hooks';
+import { createWriteStream, rmSync } from 'node:fs';
 
 /**
  * The stop signal of the long operation (fetch, pull, push, clone, submodule update…) whose work is running: every
@@ -33,6 +34,8 @@ export interface RunOptions {
   maxBytes?: number;
   /** git is killed when this aborts (default: the running long operation's stop signal, see withStop) */
   signal?: AbortSignal;
+  /** stdout lines go to `onLine` too: git-lfs writes its progress there when not run from a terminal */
+  stdoutLines?: boolean;
 }
 
 export interface RunResult {
@@ -110,8 +113,12 @@ function baseEnv(extra?: Record<string, string>): NodeJS.ProcessEnv {
  * Paths as they are: by default git writes a name with non-ASCII letters ("файл.txt", "фото.png") in quotes with octal
  * escapes in diffs and --raw lists, which the parsers do not read (a Cyrillic file came out as `"a/\321\204…"`,
  * an image as a binary). Errors still name the command as it was asked.
+ *
+ * Git LFS files are diffed as binaries: git stores a three-line pointer for them ("version … / oid sha256:… / size
+ * …"), and its text diff was shown instead of the image or sound (the previews read the real file through the
+ * pointer, see Repo.blobInfo). `diff=lfs` is what `git lfs track` writes for every pattern.
  */
-const PLAIN_PATHS = ['-c', 'core.quotepath=false'];
+const PLAIN_PATHS = ['-c', 'core.quotepath=false', '-c', 'diff.lfs.binary=true'];
 
 export function runGit(args: string[], opts: RunOptions): Promise<RunResult> {
   const signal = opts.signal ?? stopSignal.getStore();
@@ -132,10 +139,17 @@ export function runGit(args: string[], opts: RunOptions): Promise<RunResult> {
     const out: Buffer[] = [];
     const err: Buffer[] = [];
     let pending = '';
+    let pendingOut = '';
     const timer = opts.timeoutMs ? setTimeout(() => child.kill('SIGTERM'), opts.timeoutMs) : null;
     let bytes = 0;
     let truncated = false;
     child.stdout.on('data', (b: Buffer) => {
+      if (opts.stdoutLines && opts.onLine) {
+        pendingOut += b.toString('utf8');
+        const parts = pendingOut.split(/\r\n|\r|\n/);
+        pendingOut = parts.pop() ?? '';
+        for (const p of parts) if (p.trim()) opts.onLine(p);
+      }
       if (truncated) return;
       if (opts.maxBytes !== undefined && bytes + b.length > opts.maxBytes) {
         out.push(b.subarray(0, opts.maxBytes - bytes));
@@ -179,6 +193,64 @@ export function runGit(args: string[], opts: RunOptions): Promise<RunResult> {
     });
     if (opts.input !== undefined) child.stdin.write(opts.input);
     child.stdin.end();
+  });
+}
+
+/**
+ * git with its stdout written to a file (a blob, a Git LFS object): large files never sit in memory. Resolves once
+ * git has exited and the file is flushed; the file is removed when git fails or is stopped.
+ */
+export function runGitToFile(args: string[], file: string, opts: Pick<RunOptions, 'cwd' | 'env' | 'onLine' | 'signal'> & { input?: Buffer }): Promise<{ stderr: string }> {
+  const signal = opts.signal ?? stopSignal.getStore();
+  if (signal?.aborted) return Promise.reject(new StoppedError());
+  return new Promise<{ stderr: string }>((resolve, reject) => {
+    const child = spawn(GIT_BIN, [...PLAIN_PATHS, ...args], { cwd: opts.cwd, env: baseEnv(opts.env), stdio: ['pipe', 'pipe', 'pipe'] });
+    const sink = createWriteStream(file);
+    child.stdout.pipe(sink);
+    let err = '';
+    let pending = '';
+    let exit: number | null | undefined;
+    let written = false;
+    let stopped = false;
+    const onStop = () => {
+      stopped = true;
+      child.kill('SIGTERM');
+    };
+    signal?.addEventListener('abort', onStop, { once: true });
+    // done only when git has exited and the file is flushed
+    const settle = () => {
+      if (exit === undefined || !written) return;
+      signal?.removeEventListener('abort', onStop);
+      if (stopped) reject(new StoppedError());
+      else if (exit === 0) resolve({ stderr: err });
+      else reject(new GitError(args, exit ?? -1, err, ''));
+    };
+    child.stderr.on('data', (b: Buffer) => {
+      const s = b.toString('utf8');
+      err += s;
+      if (!opts.onLine) return;
+      pending += s;
+      const parts = pending.split(/\r\n|\r|\n/);
+      pending = parts.pop() ?? '';
+      for (const p of parts) if (p.trim()) opts.onLine(p);
+    });
+    child.on('error', reject);
+    sink.on('error', reject);
+    sink.on('finish', () => {
+      written = true;
+      settle();
+    });
+    child.on('close', (code) => {
+      if (opts.onLine && pending.trim()) opts.onLine(pending);
+      exit = code;
+      settle();
+    });
+    child.stdin.on('error', () => {}); // git may exit before reading all of it (a bad pointer)
+    if (opts.input) child.stdin.write(opts.input);
+    child.stdin.end();
+  }).catch((e) => {
+    rmSync(file, { force: true });
+    throw e;
   });
 }
 

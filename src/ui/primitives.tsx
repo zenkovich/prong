@@ -369,10 +369,10 @@ export function ToolButton({ icon, label, onPress, badge, badgeColor, disabled, 
 
 // ---------- badge / pill ----------
 
-export function Badge({ children, color, bg, mono, style }: { children: React.ReactNode; color?: string; bg?: string; mono?: boolean; style?: StyleProp<ViewStyle> }) {
+export function Badge({ children, color, bg, mono, style, testID }: { children: React.ReactNode; color?: string; bg?: string; mono?: boolean; style?: StyleProp<ViewStyle>; testID?: string }) {
   const t = useTheme();
   return (
-    <View style={[styles.badge, { backgroundColor: bg ?? t.raised }, style]}>
+    <View style={[styles.badge, { backgroundColor: bg ?? t.raised }, style]} testID={testID}>
       <Txt size={10} color={color ?? t.textMuted} weight="600" mono={mono}>
         {children}
       </Txt>
@@ -493,12 +493,15 @@ export function Input({ value, onChange, placeholder, mono, multiline, style, au
   );
 }
 
-export function Checkbox({ checked, onChange, label, disabled, testID }: { checked: boolean; onChange: (v: boolean) => void; label?: string; disabled?: boolean; testID?: string }) {
+/** `mixed`: some of what it stands for is picked (a folder with some of its files): a dash, and a press picks all */
+export function Checkbox({ checked, onChange, label, disabled, testID, mixed }: { checked: boolean; onChange: (v: boolean) => void; label?: string; disabled?: boolean; testID?: string; mixed?: boolean }) {
   const t = useTheme();
+  const part = mixed && !checked;
   return (
-    <PressScale onPress={() => onChange(!checked)} disabled={disabled} scaleTo={0.96} style={{ flexDirection: 'row', alignItems: 'center', paddingVertical: 3 }} testID={testID}>
-      <View style={[styles.checkbox, { borderColor: checked ? t.accent : t.borderStrong, backgroundColor: checked ? t.accent : 'transparent' }]}>
+    <PressScale onPress={() => onChange(part ? true : !checked)} disabled={disabled} scaleTo={0.96} style={{ flexDirection: 'row', alignItems: 'center', paddingVertical: 3 }} testID={testID}>
+      <View style={[styles.checkbox, { borderColor: checked || part ? t.accent : t.borderStrong, backgroundColor: checked ? t.accent : 'transparent' }]}>
         {checked && <Icon name="check" size={10} color={t.accentText} strokeWidth={3} />}
+        {part && <Icon name="minus" size={10} color={t.accent} strokeWidth={3} />}
       </View>
       {label ? <Txt style={{ marginLeft: 7 }}>{label}</Txt> : null}
     </PressScale>

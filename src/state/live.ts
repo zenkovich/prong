@@ -10,7 +10,7 @@ import { partialHunk } from '../git/lineStaging';
 import { CONTEXT_STEP, coversWholeFile, diffLines } from '../git/diffContext';
 import { filterRevs } from '../components/branchFilter';
 import { remoteTwin } from '../components/branchNames';
-import type { BlobSide, UiSettings } from '../git/GitClient';
+import type { BlobSide, LfsPick, UiSettings } from '../git/GitClient';
 import { GhRepo, HttpGitClient, OpEvent, RebaseTodoItem, ServerSettings, Submodule } from '../git/GitClient';
 import { Commit, FetchOptions, FileChange, GitHubAccount, Hunk, PullOptions, PushOptions, QueueItem, RepoAuth, RepoInfo, SavedSession, Sha, SshKey, Workspace } from '../git/types';
 import { AgentMessage, AppVersion } from '../agent/types';
@@ -558,6 +558,43 @@ export async function revealBlob(side: MediaSide) {
   await guard('Reveal', async () => {
     const f = await client.blobFile(side.repo, side.rev, side.file);
     await client.systemReveal(f.path);
+  });
+}
+
+// ---------- Git LFS ----------
+
+/**
+ * Downloads the LFS objects of a preview's sides that are not on this machine (one at a time: the status panel shows
+ * one operation). True when all of them came; the working copy is not touched.
+ */
+export async function downloadLfs(sides: MediaSide[]): Promise<boolean> {
+  for (const s of sides.filter((x) => x.lfs && !x.lfs.local)) {
+    const ok = await new Promise<boolean>((resolve) => {
+      void guard('Download from Git LFS', async () => {
+        track(await client.lfsDownload(s.repo, s.rev, s.file), `Downloading ${baseName(s.file)} from Git LFS`, resolve);
+        return true;
+      }).then((started) => started || resolve(false));
+    });
+    if (!ok) return false;
+  }
+  return true;
+}
+
+/** the working copy's Git LFS files still held as pointers (seconds on a big repository) */
+export function lfsFiles(id = liveId()) {
+  if (!id || !engineOnline()) return Promise.reject(new Error('Git LFS files need the git engine'));
+  return client.lfsFiles(pathOf(id));
+}
+
+/** puts the real files of the pick in place of their pointers: a long operation in the repository's queue */
+export async function restoreLfs(pick: LfsPick, count: number, id = liveId()) {
+  if (!id) return;
+  const what = pick.all ? 'all Git LFS files' : `${count} Git LFS file${count === 1 ? '' : 's'}`;
+  await guard('Restore Git LFS files', async () => {
+    track(await client.lfsRestore(pathOf(id), pick, count), `Restoring ${what}`, (ok) => {
+      if (ok) toast(`Restored ${what}`, 'success');
+    });
+    return true;
   });
 }
 

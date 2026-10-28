@@ -2,13 +2,13 @@ import { createServer, IncomingMessage, ServerResponse } from 'node:http';
 import { createReadStream, existsSync, mkdirSync, readFileSync, statSync, writeFileSync, unlinkSync } from 'node:fs';
 import { homedir } from 'node:os';
 import path from 'node:path';
-import { mimeOf, Repo, RebaseTodoItem, safeRelPath, WORKTREE } from './git/repo.js';
+import { LfsNotDownloaded, type LfsPick, lfsPatterns, mimeOf, Repo, RebaseTodoItem, safeRelPath, WORKTREE } from './git/repo.js';
 import { accountAuth, hostOwner, NetAuth, RepoAuth, resolveAuth, sshAuth, sshDir, validKeyPath } from './auth.js';
 import { allQueues, cancelQueued, LOCK_FILES, onQueueChange, QueueItem, queueFor } from './queue.js';
 import { restoreFromUndo, saveForUndo } from './undo.js';
 import { serveFile } from './http-file.js';
 import { systemFileIcon } from './fileicons.js';
-import { runGit, withStop } from './git/run.js';
+import { progressOf, runGit, withStop } from './git/run.js';
 import { scanRepos } from './scan.js';
 import { loadSession, loadSettings, loadWorkspaces, readJson as readState, saveSession, saveSettings, saveWorkspaces, writeJson, Workspace } from './state.js';
 import { addKeyToAgent, deleteSecret, generateSshKey, getSecret, listSshKeys, openTerminal, openWith, reveal, setSecret, testSsh, which } from './system.js';
@@ -35,7 +35,9 @@ import type { FileChange, Hunk } from './types.js';
  *   POST /api/system/{open,reveal,terminal}; /api/ssh/{keys,generate,agentAdd,test}
  *   GET/POST/DELETE /api/accounts (GitHub, tokens in Keychain); POST /api/github/{repos,addKey,deviceStart,devicePoll}
  *   GET /api/agent/check; POST /api/agent/run { prompt, cwd, mode } → long op streaming text; POST /api/ops/cancel { opId }
- *   GET  /api/blob?repo&rev&file   → file content at a revision (WORKTREE, :0 or any rev), byte ranges
+ *   GET  /api/blob?repo&rev&file   → file content at a revision (WORKTREE, :0 or any rev), byte ranges; a Git LFS
+ *        file is its LFS object (404 while it is not downloaded: POST /api/repo/lfsDownload)
+ *   POST /api/repo/{lfsFiles,lfsRestore,lfsDownload} → LFS files left as pointers, restoring them, one preview's object
  *   GET  /api/fileicon?ext         → the OS icon for a file extension (png/svg)
  *   POST /api/app/{prepare,record,revert,versions,diff,rebuild,factory} { sources } → agent versions of Prong's own
  *        sources (shadow git repository) and the interface build the desktop app serves
@@ -147,10 +149,12 @@ async function asAccount<T>(acc: TokenAccount, call: (token: string) => Promise<
  * themselves, see longOp), and removing a stale lock (the queue is what waits for it).
  */
 const UNQUEUED = new Set([
-  'snapshot', 'snapshotCached', 'status', 'log', 'commitFiles', 'commitFileDiff', 'logUntil', 'logPosition', 'stashFiles', 'fileDiff', 'mediaSides', 'blobFile', 'blame',
+  'snapshot', 'snapshotCached', 'status', 'log', 'commitFiles', 'commitFileDiff', 'logUntil', 'logPosition', 'stashFiles', 'fileDiff', 'mediaSides', 'blobFile', 'blame', 'lfsFiles', 'lfsRestore', 'lfsDownload',
   'config', 'globalConfig', 'logPage', 'logFile', 'searchLog', 'fileAt', 'submodules', 'submoduleChanges', 'submoduleCommits', 'submoduleRange', 'changedSubmodules', 'authInfo', 'setAuth', 'testAuth',
   'fetch', 'unshallow', 'followAllBranches', 'pull', 'push', 'pushTag', 'submoduleUpdate', 'pushBranches', 'removeLock',
 ]);
+/** a list of strings from a request (anything else in it is dropped), at most `max` */
+const strings = (v: unknown, max = 200_000): string[] => (Array.isArray(v) ? v.filter((x): x is string => typeof x === 'string').slice(0, max) : []);
 /** what the queue shows for an operation: "Checkout ver/925", "Stage hunk" */
 function opLabel(op: string, b: any): string {
   const words = op.replace(/([A-Z])/g, ' $1').toLowerCase();
@@ -325,6 +329,25 @@ export function createApi(opts: { log?: (s: string) => void } = {}) {
       const f = await repoOf(b).materializeBlob(String(b.rev), String(b.file));
       if (!f) throw new HttpError(404, `${b.file} does not exist at ${b.rev}`);
       return f;
+    },
+    // ---------- Git LFS ----------
+    /** the working copy's LFS files still held as pointers (reads every LFS file of HEAD: seconds on a big repository) */
+    lfsFiles: async (b) => repoOf(b).lfsFiles(),
+    /** restore picked folders / files (or all) from Git LFS into the working copy: a long operation in the queue */
+    lfsRestore: async (b) => {
+      const r = repoOf(b);
+      const pick: LfsPick = { all: b.all === true, folders: strings(b.folders), files: strings(b.files) };
+      if (!pick.all && !lfsPatterns(pick).length) throw new HttpError(400, 'Nothing picked to restore');
+      const n = Number(b.count) || 0;
+      return longOp(`Restoring ${pick.all ? 'all Git LFS files' : n ? `${n} Git LFS file${n === 1 ? '' : 's'}` : 'Git LFS files'}`, (p) => r.lfsRestore(pick, p), r.dir);
+    },
+    /** download one side's LFS object for its preview; the working copy is not touched (so: no queue) */
+    lfsDownload: async (b) => {
+      const r = repoOf(b);
+      const file = String(b.file ?? '');
+      if (!safeRelPath(file)) throw new HttpError(400, 'Bad path');
+      const rev = String(b.rev ?? WORKTREE);
+      return longOp(`Downloading ${path.basename(file)} from Git LFS`, (p) => r.lfsDownload(rev, file, (l) => p(l, progressOf(l))));
     },
     blame: async (b) => {
       if (b.rev !== undefined && !/^[0-9a-f]{40,64}$/.test(String(b.rev))) throw new HttpError(400, 'bad revision');
@@ -631,7 +654,9 @@ export function createApi(opts: { log?: (s: string) => void } = {}) {
         const rev = url.searchParams.get('rev') ?? WORKTREE;
         if (!repo || !Repo.isRepo(repo)) throw new HttpError(400, `Not a git repository: ${repo}`);
         if (!safeRelPath(file)) throw new HttpError(400, 'Bad path');
-        const blob = await new Repo(repo).materializeBlob(rev, file);
+        const blob = await new Repo(repo).materializeBlob(rev, file).catch((e) => {
+          throw e instanceof LfsNotDownloaded ? new HttpError(404, e.message) : e;
+        });
         if (!blob) throw new HttpError(404, `${file} does not exist at ${rev}`);
         serveFile(req, res, blob.path, mimeOf(file));
         return;

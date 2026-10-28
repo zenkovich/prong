@@ -29,7 +29,7 @@ const explicit = args.filter((a, i) => !a.startsWith('--') && !['--base', '--sui
 
 /** area → e2e suite (the main run, tools/e2e.mjs, is "main": its checks depend on each other, so it runs whole) */
 const AREAS = [
-  [/src\/components\/(FileList|ChangesPanel|DiffView|fileTree)|src\/components\/media\/|src\/git\/(lineStaging|diffContext|gitignore)/, 'changes'],
+  [/src\/components\/(FileList|ChangesPanel|DiffView|fileTree|LfsDialog|lfsTree)|src\/components\/media\/|src\/git\/(lineStaging|diffContext|gitignore)/, 'changes'],
   [/src\/components\/(CommitList|CommitDetails|graphLayout|commitRefs|branchFilter)|src\/state\/(deepHistory|history)/, 'history'],
   [/src\/components\/(Sidebar|BranchBatchDialog|refSelection|refName|branchNames|pathTree)/, 'sidebar'],
   [/src\/components\/(Toolbar|StatusPanel|ErrorDialog)|src\/state\/(errorHints|longOps)/, 'toolbar'],

@@ -110,6 +110,41 @@ export function kindOf(path: string): ContentKind {
   return IMAGE_RX.test(path) ? 'image' : AUDIO_RX.test(path) ? 'audio' : VIDEO_RX.test(path) ? 'video' : 'text';
 }
 
+// ---------- Git LFS ----------
+
+/** What git stores for a Git LFS file: the object's id (sha256) and the real file's size. */
+export interface LfsPointer {
+  oid: string;
+  size: number;
+}
+/** git-lfs reads nothing bigger than this as a pointer */
+export const LFS_POINTER_MAX = 1024;
+const LFS_VERSION = /^version https:\/\/(git-lfs|hawser)\.github\.com\/spec\/v1$/;
+const LFS_LINE = /^(version https:\/\/(git-lfs|hawser)\.github\.com\/spec\/v1|oid sha256:[0-9a-f]{64}|size \d+|ext-\d+-[a-z0-9]+ sha256:[0-9a-f]{64})$/;
+
+/** The pointer in a file's content, or null when it is not one (a real file, or too long to be one). */
+export function parseLfsPointer(content: string | Buffer): LfsPointer | null {
+  if (content.length > LFS_POINTER_MAX) return null;
+  const text = typeof content === 'string' ? content : content.toString('utf8');
+  const lines = text.replace(/\n$/, '').split('\n');
+  if (!LFS_VERSION.test(lines[0] ?? '') || !lines.every((l) => LFS_LINE.test(l))) return null;
+  const oid = lines.find((l) => l.startsWith('oid sha256:'))?.slice(11);
+  const size = lines.find((l) => l.startsWith('size '));
+  return oid && size ? { oid, size: parseInt(size.slice(5), 10) } : null;
+}
+
+/**
+ * The hunks of a pointer's text diff: a file in Git LFS whose .gitattributes has `filter=lfs` but not `diff=lfs`
+ * (the engine diffs `diff=lfs` paths as binaries). Its preview is the real file, not three lines of hashes.
+ */
+export function isLfsPointerDiff(hunks: Hunk[]): boolean {
+  const lines = hunks.flatMap((h) => h.lines);
+  return lines.length > 0 && lines.every((l) => LFS_LINE.test(l.text)) && lines.some((l) => LFS_VERSION.test(l.text));
+}
+
+/** what a file in Git LFS is previewed as: a picture, a sound or a video by its name, otherwise a binary */
+export const lfsKindOf = (path: string): ContentKind => (isMediaKind(kindOf(path)) ? kindOf(path) : 'binary');
+
 function statusChar(c: string): FileStatus {
   switch (c) {
     case 'A':
@@ -237,6 +272,12 @@ export function parseDiff(out: string, opts: { largeThreshold?: number } = {}): 
   const finish = () => {
     if (!cur) return;
     if (cur.kind === 'text' && cur.hunks && cur.hunks.length === 0) cur.hunks = undefined;
+    if (cur.kind === 'text' && cur.hunks && isLfsPointerDiff(cur.hunks)) {
+      cur.kind = lfsKindOf(cur.path);
+      cur.hunks = undefined;
+      cur.additions = 0;
+      cur.deletions = 0;
+    }
     if (cur.kind === 'text' && (cur.hunks?.length ?? 0) === 0 && cur.additions + cur.deletions === 0 && !cur.binary && !cur.submodule) {
       // mode-only change or empty
     }

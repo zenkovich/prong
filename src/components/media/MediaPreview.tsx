@@ -5,7 +5,7 @@ import { FONT, useTheme } from '../../theme';
 import { Icon } from '../../ui/Icon';
 import { Spinner, Txt } from '../../ui/primitives';
 import { AVCompare } from './AVCompare';
-import { SideBanner, useMediaSides } from './common';
+import { LfsNotHere, SideBanner, useMediaSides } from './common';
 import { fmtBytes, sideState, signedBytes } from './mediaMath';
 import { ImageCompare } from './ImageCompare';
 
@@ -17,6 +17,8 @@ import { ImageCompare } from './ImageCompare';
 export function MediaPreview({ file, area, rev }: { file: FileChange; area: 'unstaged' | 'staged' | 'commit' | 'stash'; rev: string }) {
   const sides = useMediaSides(file, area, rev);
   const kind = file.kind === 'image' || file.kind === 'audio' || file.kind === 'video' ? file.kind : 'binary';
+  // a Git LFS side not on this machine: nothing to show until it is downloaded
+  if (!sides.loading && [sides.before, sides.after].some((s) => s?.lfs && !s.lfs.local)) return <LfsNotHere before={sides.before} after={sides.after} onDownloaded={sides.reload} />;
   if (Platform.OS !== 'web' && kind !== 'binary') return <BinaryInfo {...sides} />;
   if (kind === 'image') return <ImageCompare before={sides.before} after={sides.after} loading={sides.loading} error={sides.error} />;
   if (kind === 'audio' || kind === 'video') return <AVCompare kind={kind} before={sides.before} after={sides.after} loading={sides.loading} error={sides.error} />;

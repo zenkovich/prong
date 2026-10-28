@@ -127,6 +127,8 @@ export type Dialog =
   | { type: 'remote'; name?: string; url?: string }
   | { type: 'connection' }
   | { type: 'deleteBranches'; names: string[] }
+  /** Git LFS files the working copy holds as pointers, to restore (`focus`: open with that file's folder picked) */
+  | { type: 'lfs'; focus?: string }
   | { type: 'confirm'; title: string; message: string; confirmLabel?: string; danger?: boolean; onConfirm: () => void };
 
 export interface Toast {

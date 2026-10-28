@@ -8,7 +8,8 @@
  * the check reads what was asked.
  */
 import path from 'node:path';
-import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
+import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { page, check, expect, waitText, until, git, root, tmp, post, finish, text, visible, refreshUi, pageErrors, undoLabel, PNG_A, PNG_B, makeWav, SHOTS } from '../harness.mjs';
 
 // ---------- repositories of this suite ----------
@@ -188,6 +189,49 @@ const SUBS = repo('chg-subs', { 'app.txt': 'app\n' }, (d) => {
   write(d, 'libs/edited/core.txt', 'core\nedited inside\n');
   write(d, 'libs/fresh/new.txt', 'new\n');
 });
+
+/**
+ * Git LFS: a picture, two sounds and a sound bank pushed to a local remote with their LFS objects, and a clone made
+ * without LFS (as township's fmod/Assets: pointers in the working copy, .wav left out of downloads by .lfsconfig).
+ */
+let LFS_OK = true;
+try {
+  execFileSync('git', ['lfs', 'version'], { stdio: 'ignore' });
+} catch {
+  LFS_OK = false;
+}
+const LFS_ORIGIN = path.join(tmp, 'origins/chg-lfs.git');
+const LFS = dirOf('chg-lfs');
+if (LFS_OK) {
+  git(tmp, 'init', '-q', '--bare', LFS_ORIGIN);
+  const src = path.join(tmp, 'origins/chg-lfs-src');
+  mkdirSync(src, { recursive: true });
+  git(src, 'init', '-q', '-b', 'main');
+  git(src, 'config', 'commit.gpgsign', 'false');
+  git(src, 'lfs', 'install', '--local');
+  write(src, '.gitattributes', ['*.png', '*.wav', '*.bank'].map((p) => `${p} filter=lfs diff=lfs merge=lfs -text`).join('\n') + '\n');
+  write(src, 'img/logo.png', PNG_A);
+  write(src, 'Assets/Music/m1.wav', makeWav(330, 0.2));
+  write(src, 'Assets/Music/m2.wav', makeWav(550, 0.2));
+  write(src, 'Assets/sfx.bank', Buffer.from('BANK sound bank'));
+  write(src, 'readme.txt', 'assets\n');
+  git(src, 'add', '-A');
+  git(src, 'commit', '-q', '-m', 'Assets in LFS');
+  write(src, 'img/logo.png', PNG_B);
+  write(src, '.lfsconfig', '[lfs]\n\tfetchexclude = **/*.wav\n');
+  git(src, 'add', '-A');
+  git(src, 'commit', '-q', '-m', 'Second logo');
+  git(src, 'remote', 'add', 'origin', LFS_ORIGIN);
+  git(src, 'push', '-q', 'origin', 'main');
+  execFileSync('git', ['clone', '-q', LFS_ORIGIN, LFS], { env: { ...process.env, GIT_LFS_SKIP_SMUDGE: '1' }, stdio: 'ignore' });
+}
+const isPointer = (file) => /^version https:\/\/git-lfs/.test(readFileSync(path.join(LFS, file), 'latin1'));
+const lfsObjects = () => {
+  const out = [];
+  const walk = (d) => existsSync(d) && readdirSync(d, { withFileTypes: true }).forEach((e) => (e.isDirectory() ? walk(path.join(d, e.name)) : out.push(e.name)));
+  walk(path.join(LFS, '.git/lfs/objects'));
+  return out;
+};
 
 // registered as a scan of the workspaces would, then one reload lists them all
 for (const ws of ['work', 'home']) await post('/api/scan', { path: root, depth: 1, register: true, workspace: ws });
@@ -1331,6 +1375,73 @@ await check('narrow window: the commit box row, the diff header and the hunk hea
   } finally {
     await page.setViewportSize({ width: 1440, height: 900 });
   }
+  expect(pageErrors.length === 0, 'page errors: ' + pageErrors.join(' | '));
+});
+
+// ---------- Git LFS ----------
+
+await check('a Git LFS picture in a commit is the picture, not its pointer’s text; one not downloaded is downloaded for the preview, the file left as it is', async () => {
+  if (!LFS_OK) return;
+  await openChanges('chg-lfs');
+  await page.getByText('All Commits', { exact: true }).first().click();
+  await page.getByText('Second logo', { exact: true }).first().click();
+  await page.getByTestId('file-commit-img/logo.png').click();
+  // the objects are on the server only: said so, with both sizes and a download
+  await page.getByTestId('lfs-not-here').waitFor({ timeout: 15000 });
+  if (SHOTS) await page.screenshot({ path: path.join(SHOTS, 'lfs-not-here.png') });
+  expect(!(await visible('oid sha256')), 'no pointer text');
+  await waitText(`${PNG_B.length} B`);
+  await page.getByTestId('lfs-download').click();
+  // both versions downloaded: the compare view, marked as Git LFS
+  await page.getByTestId('media-lfs').waitFor({ timeout: 20000 });
+  await page.waitForFunction(() => [...document.querySelectorAll('[data-pane] img')].filter((i) => i.naturalWidth > 0).length >= 2, null, { timeout: 15000 });
+  await waitText('Swipe');
+  expect(lfsObjects().length === 2, 'both objects kept by git-lfs: ' + lfsObjects().join(', '));
+  expect(isPointer('img/logo.png'), 'the working copy still holds the pointer');
+  // the working copy's own pointer is offered for restoring
+  expect((await page.getByTestId('media-lfs-restore').count()) === 0, 'a commit has no working-copy side');
+});
+
+await check('Restore Git LFS files: what is a pointer, by folder with sizes, .lfsconfig’s exclusions said; the picked folder restored, then all', async () => {
+  if (!LFS_OK) return;
+  await openChanges('chg-lfs');
+  await page.getByTestId('toolbar-more').click();
+  await page.getByText('Restore Git LFS files…', { exact: true }).click();
+  await page.getByTestId('lfs-summary').waitFor({ timeout: 20000 });
+  expect(/4 files of 4 in Git LFS are pointers/.test(await page.getByTestId('lfs-summary').innerText()), 'summary: ' + (await page.getByTestId('lfs-summary').innerText()));
+  expect((await page.getByTestId('lfs-excluded').innerText()).includes('**/*.wav'), 'the exclusion is named');
+  // everything picked at first; none picked: nothing to restore
+  expect(/^Restore 4 files/i.test((await page.getByTestId('lfs-restore').innerText()).trim()), 'all picked: ' + (await page.getByTestId('lfs-restore').innerText()));
+  await page.getByTestId('lfs-all').click();
+  expect((await page.getByTestId('lfs-restore').innerText()).trim().toLowerCase() === 'restore', 'none picked');
+  // Assets opens on its Music folder and its own bank file
+  await page.getByTestId('lfs-open-Assets').click();
+  await page.getByTestId('lfs-folder-Assets/Music').waitFor({ timeout: 5000 });
+  await page.getByTestId('lfs-file-Assets/sfx.bank').waitFor({ timeout: 5000 });
+  await page.getByTestId('lfs-folder-Assets/Music').click();
+  if (SHOTS) await page.screenshot({ path: path.join(SHOTS, 'lfs-dialog.png') });
+  expect(/^Restore 2 files · .* to download$/i.test((await page.getByTestId('lfs-restore').innerText()).trim()), 'two sounds: ' + (await page.getByTestId('lfs-restore').innerText()));
+  await page.getByTestId('lfs-restore').click();
+  await waitText('Restored 2 Git LFS files', 20000);
+  expect(!isPointer('Assets/Music/m1.wav') && !isPointer('Assets/Music/m2.wav'), 'the sounds restored (left out of downloads by .lfsconfig, picked here)');
+  expect(isPointer('Assets/sfx.bank') && isPointer('img/logo.png'), 'the rest left as it was');
+  // again: what is left, the picture already here (downloaded for its preview), then all of it
+  await page.getByTestId('toolbar-more').click();
+  await page.getByText('Restore Git LFS files…', { exact: true }).click();
+  await page.getByTestId('lfs-summary').waitFor({ timeout: 20000 });
+  expect(/2 files of 4/.test(await page.getByTestId('lfs-summary').innerText()), 'two left');
+  await waitText('already on this machine');
+  await page.getByTestId('lfs-restore').click();
+  // the operation's end, not the first file written: git-lfs writes the files, then refreshes the index
+  await waitText('Restored all Git LFS files', 20000);
+  expect(!isPointer('Assets/sfx.bank') && !isPointer('img/logo.png'), 'all restored');
+  expect(readFileSync(path.join(LFS, 'img/logo.png')).equals(PNG_B), 'the real picture');
+  const diag = () => ['status --porcelain', 'diff -- Assets/sfx.bank', 'check-attr -a Assets/sfx.bank', 'config --get-regexp filter', 'lfs ls-files'].map((c) => `${c}: ${git(LFS, ...c.split(' ')).trim()}`).join(' ¶ ').replace(/\n/g, ' ⏎ ') + ` ¶ disk: ${JSON.stringify(readFileSync(path.join(LFS, 'Assets/sfx.bank'), 'latin1').slice(0, 160))}`;
+  expect(git(LFS, 'status', '--porcelain') === '', 'restoring is not a change: ' + diag());
+  await page.getByTestId('toolbar-more').click();
+  await page.getByText('Restore Git LFS files…', { exact: true }).click();
+  await page.getByTestId('lfs-all-here').waitFor({ timeout: 20000 });
+  await page.keyboard.press('Escape');
   expect(pageErrors.length === 0, 'page errors: ' + pageErrors.join(' | '));
 });
 

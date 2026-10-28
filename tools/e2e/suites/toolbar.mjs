@@ -1068,7 +1068,7 @@ await step('toolbar · more: every item is there, with its shortcut; off items s
     await closeMenu();
     await page.waitForTimeout(250);
   }
-  const want = ['Open in Terminal', 'Open in Finder', 'Open in editor', 'Fetch every branch — all followed', 'Fetch the full history — complete', 'Unshallow — not a shallow clone', 'Submodules → Update — none here', 'Submodules → Update recursively', 'Refresh', 'Undo — nothing to undo', 'Connection (SSH key / account)…', 'Preferences…', 'Keyboard shortcuts'];
+  const want = ['Open in Terminal', 'Open in Finder', 'Open in editor', 'Fetch every branch — all followed', 'Fetch the full history — complete', 'Unshallow — not a shallow clone', 'Submodules → Update — none here', 'Submodules → Update recursively', 'Restore Git LFS files…', 'Refresh', 'Undo — nothing to undo', 'Connection (SSH key / account)…', 'Preferences…', 'Keyboard shortcuts'];
   expect(labels(items.map((i) => ({ ...i, disabled: false }))) === want.join(' | '), 'the items: ' + labels(items));
   const off = items.filter((i) => i.disabled).map((i) => i.label);
   expect(off.join(' | ') === 'Fetch every branch — all followed | Fetch the full history — complete | Unshallow — not a shallow clone | Submodules → Update — none here | Submodules → Update recursively | Undo — nothing to undo', 'off: ' + off.join(' | '));

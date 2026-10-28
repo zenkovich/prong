@@ -1,12 +1,11 @@
-import { appendFileSync, createWriteStream, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { appendFileSync, copyFileSync, existsSync, linkSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { homedir, tmpdir } from 'node:os';
 import path from 'node:path';
 import type { Commit, FileChange, FileStatus, Hunk, RepoSnapshot, Sha, Stash, SubmoduleChanges } from '../types.js';
-import { hunkPatch, joinSubmoduleChanges, kindOf, LOG_FORMAT, parseDiff, parseLog, parseNumstat, parseRaw, parseRefs, parseRemotes, parseStashList, parseStatus, REC, REF_FORMAT, STASH_FORMAT } from './parse.js';
-import { GIT_BIN, inRuns, progressOf, runGit, runGitLines, RunOptions } from './run.js';
+import { hunkPatch, joinSubmoduleChanges, kindOf, LFS_POINTER_MAX, type LfsPointer, LOG_FORMAT, parseLfsPointer, parseDiff, parseLog, parseNumstat, parseRaw, parseRefs, parseRemotes, parseStashList, parseStatus, REC, REF_FORMAT, STASH_FORMAT } from './parse.js';
+import { inRuns, progressOf, runGit, runGitLines, runGitToFile, RunOptions, withoutProgress } from './run.js';
 import type { NetAuth } from '../auth.js';
-import { spawn } from 'node:child_process';
 
 export type Progress = (line: string, progress: number | null) => void;
 
@@ -101,6 +100,67 @@ export interface BlobSide {
   /** changes whenever the content does: object id, or mtime+size for the working copy (cache-busting) */
   version: string;
   oid?: string;
+  /**
+   * The file is in Git LFS: git holds a pointer to an object by its sha256. `bytes` is the real file's size;
+   * `local`: the object is on this machine (otherwise the preview offers to download it); `pointerFile`: the working
+   * copy still holds the pointer, not the file.
+   */
+  lfs?: { oid: string; size: number; local: boolean; pointerFile?: boolean };
+}
+/** what `lfsFiles` reports: the Git LFS files of HEAD the working copy holds as pointers */
+export interface LfsFiles {
+  installed: boolean;
+  version?: string;
+  /** LFS files in HEAD */
+  total: number;
+  /** still pointers in the working copy; `downloaded`: the object is here, only the checkout is missing */
+  missing: { path: string; size: number; downloaded: boolean }[];
+  /** what the repository leaves out of downloads (`lfs.fetchexclude`, its own config and .lfsconfig) */
+  excluded: string[];
+}
+/**
+ * What to restore: every LFS file, or folders (with everything below them) and single files. Paths are
+ * repository-relative. A folder's own files without its subfolders are named one by one: git-lfs reads `dir/*` as
+ * gitignore does, and that takes in the subfolders too.
+ */
+export interface LfsPick {
+  all?: boolean;
+  folders?: string[];
+  files?: string[];
+}
+/** a path as a git-lfs include pattern: its glob characters escaped; a comma (the list separator) matches as `?` */
+const lfsGlob = (p: string) => p.replace(/[\\*?[\]!#]/g, (c) => `\\${c}`).replace(/,/g, '?');
+/** the --include patterns of a pick: `dir/**` and `file` */
+export function lfsPatterns(pick: LfsPick): string[] {
+  const ok = (p: unknown): p is string => typeof p === 'string' && safeRelPath(p) && !p.startsWith('-') && !/[\n\r]/.test(p);
+  return [
+    ...(pick.folders ?? []).filter(ok).map((f) => `${lfsGlob(f.replace(/\/+$/, ''))}/**`),
+    ...(pick.files ?? []).filter(ok).map((f) => lfsGlob(f)),
+  ];
+}
+/** paths in groups that fit on a command line */
+function chunkPaths(paths: string[], limit = 60_000): string[][] {
+  const out: string[][] = [];
+  let len = 0;
+  for (const p of paths) {
+    if (!out.length || len + p.length > limit) {
+      out.push([]);
+      len = 0;
+    }
+    out[out.length - 1].push(p);
+    len += p.length + 1;
+  }
+  return out;
+}
+/** a preview's copy of an LFS object: by its id, with the file's extension so other apps know the type */
+const lfsCachePath = (oid: string, file: string) => path.join(stateDir(), 'cache', 'blobs', `lfs-${oid}${path.extname(file).toLowerCase()}`);
+/** what each repository's git-lfs store is (rev-parse once per repository, not on every preview) */
+const lfsStores = new Map<string, Promise<string>>();
+/** a preview of an LFS file whose object is not on this machine */
+export class LfsNotDownloaded extends Error {
+  constructor(file: string) {
+    super(`${file} is in Git LFS and not downloaded yet`);
+  }
 }
 const MIME: Record<string, string> = {
   svg: 'image/svg+xml', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif', webp: 'image/webp', bmp: 'image/bmp', ico: 'image/x-icon', avif: 'image/avif', heic: 'image/heic', png: 'image/png',
@@ -883,13 +943,22 @@ export class Repo {
     return { ...(before ? { before } : {}), ...(after ? { after } : {}) };
   }
 
-  /** Size and identity of a file at a revision (`WORKTREE`, `:0` = index, or any revision); null when absent. */
+  /**
+   * Size and identity of a file at a revision (`WORKTREE`, `:0` = index, or any revision); null when absent. A file
+   * in Git LFS is described by the pointer git keeps for it: the real size, the LFS object id, and whether that object
+   * is on this machine (`lfs.local`). In the working copy the file itself may still be its pointer (`pointerFile`: it
+   * was never restored, e.g. left out by `lfs.fetchexclude`).
+   */
   async blobInfo(rev: string, file: string): Promise<BlobSide | null> {
     if (!safeRelPath(file)) return null;
     if (rev === WORKTREE) {
+      const abs = path.join(this.dir, file);
       try {
-        const st = statSync(path.join(this.dir, file));
-        return st.isFile() ? { rev, file, bytes: st.size, version: `w${Math.round(st.mtimeMs)}-${st.size}` } : null;
+        const st = statSync(abs);
+        if (!st.isFile()) return null;
+        const side: BlobSide = { rev, file, bytes: st.size, version: `w${Math.round(st.mtimeMs)}-${st.size}` };
+        const ptr = st.size <= LFS_POINTER_MAX ? parseLfsPointer(readFileSync(abs)) : null;
+        return ptr ? this.lfsSide(side, ptr, true) : side;
       } catch {
         return null;
       }
@@ -897,17 +966,80 @@ export class Repo {
     const spec = rev === ':0' ? `:0:${file}` : `${rev}:${file}`;
     const r = await this.git(['cat-file', '--batch-check'], { input: `${spec}\n`, allowFail: true });
     const m = r.stdout.trim().match(/^([0-9a-f]{40,64}) blob (\d+)$/);
-    return m ? { rev, file, bytes: parseInt(m[2], 10), version: m[1], oid: m[1] } : null;
+    if (!m) return null;
+    const side: BlobSide = { rev, file, bytes: parseInt(m[2], 10), version: m[1], oid: m[1] };
+    if (side.bytes > LFS_POINTER_MAX) return side;
+    const blob = await this.git(['cat-file', 'blob', m[1]], { binary: true, allowFail: true });
+    const ptr = blob.code === 0 && blob.raw ? parseLfsPointer(blob.raw) : null;
+    return ptr ? this.lfsSide(side, ptr, false) : side;
+  }
+
+  /** a side whose content is a Git LFS object: its real size, and a version that changes once it is downloaded */
+  private async lfsSide(side: BlobSide, ptr: LfsPointer, pointerFile: boolean): Promise<BlobSide> {
+    const local = await this.lfsLocal(ptr, side.file);
+    return { ...side, bytes: ptr.size, version: `lfs-${ptr.oid.slice(0, 16)}${local ? '' : '-missing'}`, lfs: { oid: ptr.oid, size: ptr.size, local, ...(pointerFile ? { pointerFile } : {}) } };
+  }
+
+  /** where git-lfs keeps this repository's objects: <git common dir>/lfs/objects, or under `lfs.storage` */
+  async lfsObjectsDir(): Promise<string> {
+    let dir = lfsStores.get(this.dir);
+    if (!dir) {
+      dir = (async () => {
+        const common = path.resolve(this.dir, (await this.git(['rev-parse', '--git-common-dir'])).stdout.trim());
+        const storage = (await this.git(['config', '--get', 'lfs.storage'], { allowFail: true })).stdout.trim();
+        return path.join(storage ? path.resolve(common, storage) : path.join(common, 'lfs'), 'objects');
+      })();
+      dir.catch(() => lfsStores.delete(this.dir));
+      lfsStores.set(this.dir, dir);
+    }
+    return dir;
+  }
+
+  /** the object's content on this machine: in git-lfs's store, or already copied into the blob cache */
+  private async lfsLocalPath(ptr: LfsPointer, file: string): Promise<string | null> {
+    const sized = (p: string) => {
+      try {
+        return statSync(p).size === ptr.size;
+      } catch {
+        return false;
+      }
+    };
+    const cached = lfsCachePath(ptr.oid, file);
+    if (sized(cached)) return cached;
+    const obj = path.join(await this.lfsObjectsDir().catch(() => ''), ptr.oid.slice(0, 2), ptr.oid.slice(2, 4), ptr.oid);
+    return sized(obj) ? obj : null;
+  }
+  private async lfsLocal(ptr: LfsPointer, file: string) {
+    return !!(await this.lfsLocalPath(ptr, file));
   }
 
   /**
    * A file on disk with the content of `file` at `rev`: the working copy itself, or the blob extracted once into
    * the content-addressed cache (named by object id, keeping the extension so other apps recognise the type).
-   * Streams through git, so large videos never sit in memory.
+   * Streams through git, so large videos never sit in memory. A Git LFS file is its LFS object (linked into the
+   * cache under its name's extension); one not downloaded yet is an LfsNotDownloaded error.
    */
   async materializeBlob(rev: string, file: string): Promise<{ path: string; bytes: number } | null> {
     const info = await this.blobInfo(rev, file);
     if (!info) return null;
+    if (info.lfs) {
+      const ptr = { oid: info.lfs.oid, size: info.lfs.size };
+      const at = await this.lfsLocalPath(ptr, file);
+      if (!at) throw new LfsNotDownloaded(file);
+      const out = lfsCachePath(ptr.oid, file);
+      if (at !== out) {
+        mkdirSync(path.dirname(out), { recursive: true });
+        const tmp = `${out}.${process.pid}.${Date.now()}.${++blobSeq}.part`;
+        // a hard link costs nothing (LFS objects never change); another volume gets a copy
+        try {
+          linkSync(at, tmp);
+        } catch {
+          copyFileSync(at, tmp);
+        }
+        renameSync(tmp, out);
+      }
+      return { path: out, bytes: info.bytes };
+    }
     if (rev === WORKTREE) return { path: path.join(this.dir, file), bytes: info.bytes };
     const dir = path.join(stateDir(), 'cache', 'blobs');
     const out = path.join(dir, `${info.oid}${path.extname(file).toLowerCase()}`);
@@ -916,36 +1048,110 @@ export class Repo {
     // a name of its own per read: two requests for the same blob in the same millisecond (the before and after
     // panes, a range request) wrote one file, and the second rename failed ("ENOENT … .part", a 500)
     const tmp = `${out}.${process.pid}.${Date.now()}.${++blobSeq}.part`;
-    await new Promise<void>((resolve, reject) => {
-      const child = spawn(GIT_BIN, ['cat-file', 'blob', info.oid!], { cwd: this.dir, stdio: ['ignore', 'pipe', 'pipe'] });
-      const sink = createWriteStream(tmp);
-      child.stdout.pipe(sink);
-      let err = '';
-      let exit: number | null | undefined;
-      let written = false;
-      // done only when git has exited and the file is flushed
-      const settle = () => {
-        if (exit === undefined || !written) return;
-        if (exit === 0) resolve();
-        else reject(new Error(err.trim() || `git cat-file failed (${exit})`));
-      };
-      child.stderr.on('data', (b: Buffer) => (err += b.toString()));
-      child.on('error', reject);
-      sink.on('error', reject);
-      sink.on('finish', () => {
-        written = true;
-        settle();
-      });
-      child.on('close', (code) => {
-        exit = code;
-        settle();
-      });
-    }).catch((e) => {
-      rmSync(tmp, { force: true });
-      throw e;
-    });
+    await runGitToFile(['cat-file', 'blob', info.oid!], tmp, { cwd: this.dir });
     renameSync(tmp, out);
     return { path: out, bytes: info.bytes };
+  }
+
+  /**
+   * Downloads the Git LFS object of `file` at `rev` for its preview (`git lfs smudge` of its pointer, which keeps the
+   * object in git-lfs's store too); the working copy is left as it is. Patterns the repository leaves out of downloads
+   * (`lfs.fetchexclude`, often in .lfsconfig) do not apply: the file was asked for by name.
+   */
+  async lfsDownload(rev: string, file: string, onLine?: (line: string) => void): Promise<BlobSide> {
+    const info = await this.blobInfo(rev, file);
+    if (!info?.lfs) throw new Error(`${file} is not a Git LFS file at ${rev === WORKTREE ? 'the working copy' : rev}`);
+    if (info.lfs.local) return info;
+    const pointer = rev === WORKTREE ? readFileSync(path.join(this.dir, file)) : (await this.git(['cat-file', 'blob', info.oid!], { binary: true })).raw!;
+    const out = lfsCachePath(info.lfs.oid, file);
+    mkdirSync(path.dirname(out), { recursive: true });
+    const tmp = `${out}.${process.pid}.${Date.now()}.${++blobSeq}.part`;
+    const a = Repo.auth ? await Repo.auth(this.dir) : null;
+    const { stderr } = await runGitToFile([...(a?.config ?? []).flatMap((c) => ['-c', c]), '-c', 'lfs.fetchexclude=', '-c', 'lfs.fetchinclude=', 'lfs', 'smudge', '--', file], tmp, { cwd: this.dir, input: pointer, onLine, env: { ...(a?.env ?? {}), GIT_LFS_FORCE_PROGRESS: '1' } });
+    // smudge writes the pointer back when it did not download (no endpoint, refused): that is not the file
+    if (statSync(tmp).size !== info.lfs.size) {
+      rmSync(tmp, { force: true });
+      throw new Error(`Git LFS did not download ${file}${withoutProgress(stderr).trim() ? `: ${withoutProgress(stderr).trim().split('\n').slice(-2).join(' ')}` : ''}`);
+    }
+    renameSync(tmp, out);
+    return (await this.blobInfo(rev, file)) ?? info;
+  }
+
+  /**
+   * The working copy's Git LFS files that are still pointers (never restored: cloned without LFS, or left out by
+   * `lfs.fetchexclude`), with the patterns the repository leaves out of downloads. `git lfs ls-files` reads every
+   * LFS file of HEAD: seconds on a big repository (township: 66 000 files, 9 s).
+   */
+  async lfsFiles(): Promise<LfsFiles> {
+    const ver = await this.git(['lfs', 'version'], { allowFail: true });
+    if (ver.code !== 0) return { installed: false, total: 0, missing: [], excluded: [] };
+    const r = await this.git(['lfs', 'ls-files', '--json'], { maxBytes: 1024 * 1024 * 1024, env: { GIT_OPTIONAL_LOCKS: '0' } });
+    let files: { name: string; size: number; checkout: boolean; downloaded: boolean }[] = [];
+    try {
+      files = JSON.parse(r.stdout || '{}').files ?? [];
+    } catch {
+      throw new Error('git lfs ls-files gave an answer Prong does not read: ' + r.stdout.slice(0, 120));
+    }
+    const excluded = (await this.git(['config', '--get-all', 'lfs.fetchexclude'], { allowFail: true })).stdout;
+    const fromFile = existsSync(path.join(this.dir, '.lfsconfig')) ? (await this.git(['config', '-f', '.lfsconfig', '--get-all', 'lfs.fetchexclude'], { allowFail: true })).stdout : '';
+    const patterns = [...new Set(`${excluded}\n${fromFile}`.split(/[\n,]/).map((p) => p.trim()).filter(Boolean))];
+    return {
+      installed: true,
+      version: ver.stdout.trim().split(' ')[0]?.replace('git-lfs/', ''),
+      total: files.length,
+      missing: files.filter((f) => !f.checkout).map((f) => ({ path: f.name, size: f.size, downloaded: !!f.downloaded })),
+      excluded: patterns,
+    };
+  }
+
+  /**
+   * Puts the real files in place of their pointers: `git lfs pull` (downloads what is not on this machine, then checks
+   * out) for the folders and files picked, or for every LFS file of HEAD. What the repository leaves out of downloads
+   * is restored too: the user asked for it.
+   */
+  async lfsRestore(pick: LfsPick, onProgress?: Progress) {
+    const base = ['-c', 'lfs.fetchexclude=', '-c', 'lfs.fetchinclude=', 'lfs', 'pull', '--exclude='];
+    const env = { GIT_LFS_FORCE_PROGRESS: '1' };
+    const patterns = pick.all ? [] : lfsPatterns(pick);
+    if (!pick.all && !patterns.length) return;
+    // a long list goes in parts: the command line has a limit
+    const parts: string[][] = pick.all ? [[]] : [];
+    for (const p of patterns) {
+      const last = parts[parts.length - 1];
+      if (last && last.join(',').length + p.length < 60_000) last.push(p);
+      else parts.push([p]);
+    }
+    for (let i = 0; i < parts.length; i++) {
+      const part = parts[i];
+      const scale = (p: number | null) => (p === null ? null : (i + p) / parts.length);
+      await this.net([...base, ...(part.length ? [`--include=${part.join(',')}`] : [])], { env, stdoutLines: true, onLine: (l) => onProgress?.(l, scale(progressOf(l))) });
+    }
+    await this.lfsSettleIndex();
+  }
+
+  /**
+   * After LFS files were put in place: the index still has their pointers' sizes when git-lfs could not update it
+   * (another git held index.lock, e.g. a status read at that moment), and git then calls them modified without
+   * reading them (a size change is a change). Those whose content is what the index has (`git diff` finds nothing)
+   * are added again, which only updates the index's record of the file; files really edited are left alone.
+   */
+  async lfsSettleIndex() {
+    const st = await this.git(['status', '--porcelain=v1', '-z', '--untracked-files=no', '--no-renames']);
+    const modified = st.stdout
+      .split('\0')
+      .filter((r) => r.length > 3 && r[1] === 'M')
+      .map((r) => r.slice(3));
+    if (!modified.length) return;
+    const attrs = await this.git(['check-attr', '-z', '--stdin', 'filter'], { input: modified.join('\0') + '\0' });
+    const parts = attrs.stdout.split('\0');
+    const lfs: string[] = [];
+    for (let i = 0; i + 2 < parts.length; i += 3) if (parts[i + 2] === 'lfs') lfs.push(parts[i]);
+    if (!lfs.length) return;
+    // names as they are (a "[hd]" folder is not a pattern); diff takes them on its command line, in parts
+    const differ = new Set<string>();
+    for (const part of chunkPaths(lfs)) for (const f of (await this.git(['--literal-pathspecs', 'diff', '--name-only', '-z', '--no-renames', '--', ...part])).stdout.split('\0')) if (f) differ.add(f);
+    const same = lfs.filter((f) => !differ.has(f));
+    if (same.length) await this.git(['--literal-pathspecs', 'add', '--pathspec-from-file=-', '--pathspec-file-nul'], { input: same.join('\0') + '\0' });
   }
 
   /** blame of the working copy, or of the file as it is in commit `rev` */
@@ -1055,7 +1261,8 @@ export class Repo {
    */
   private async mergeStages(st: Record<number, string>, mode: 'diff3' | 'union'): Promise<Buffer | null> {
     const sides = await Promise.all([st[2], st[1], st[3]].map(async (sha) => (sha ? (await this.git(['cat-file', 'blob', sha], { binary: true })).raw ?? Buffer.alloc(0) : Buffer.alloc(0))));
-    if (sides.some((b) => b.subarray(0, 8000).includes(0))) return null;
+    // a Git LFS file conflicts as two pointers: lines of hashes to merge are no help, it is a side to take
+    if (sides.some((b) => b.subarray(0, 8000).includes(0) || !!parseLfsPointer(b))) return null;
     const tmp = mkdtempSync(path.join(tmpdir(), 'prong-merge-'));
     try {
       const files = ['ours', 'base', 'theirs'].map((n, i) => {

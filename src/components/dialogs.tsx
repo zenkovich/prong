@@ -50,6 +50,7 @@ import { AccountsDialog, CloneDialog, Field, InitDialog, OpenDialog } from './ac
 import { Select } from './Select';
 import { ConnectionDialog } from './ConnectionDialog';
 import { DeleteBranchesDialog } from './BranchBatchDialog';
+import { LfsDialog } from './LfsDialog';
 import { branchNameProblem } from './branchNames';
 import * as live from '../state/live';
 import { desktop, pickFolder } from '../desktop';
@@ -103,6 +104,8 @@ export function DialogHost() {
       return <ConnectionDialog />;
     case 'deleteBranches':
       return <DeleteBranchesDialog names={d.names} />;
+    case 'lfs':
+      return <LfsDialog focus={d.focus} />;
   }
 }
 
@@ -1126,6 +1129,7 @@ function PaletteDialog() {
     // what More → Open in Terminal does (this one only said "Opened terminal")
     { label: 'Open in Terminal', icon: 'terminal', shortcut: '⌃⌥T', run: () => (closeDialog(), repoPath ? live.openTerminalAt(repoPath) : toast('Open a repository first', 'info')), group: 'Repository' },
     { label: 'Refresh', icon: 'refresh', shortcut: '⌘R', run: () => (closeDialog(), void live.refreshNow()), group: 'Repository' },
+    { label: 'Restore Git LFS files…', icon: 'cloud', run: () => openDialog({ type: 'lfs' }), group: 'Repository' },
     { label: 'Preferences', icon: 'settings', shortcut: '⌘,', run: () => openDialog({ type: 'accounts', tab: 'general' }), group: 'App' },
     { label: 'Accounts', icon: 'github', run: () => openDialog({ type: 'accounts', tab: 'github' }), group: 'App' },
     { label: 'SSH keys', icon: 'key', run: () => openDialog({ type: 'accounts', tab: 'ssh' }), group: 'App' },
