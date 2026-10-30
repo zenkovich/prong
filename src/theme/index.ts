@@ -90,10 +90,46 @@ interface Spec {
   kw: string; str: string; tagColor: string;
 }
 
-function rgba(hex: string, a: number) {
+export function rgba(hex: string, a: number) {
   const h = hex.replace('#', '');
   const n = parseInt(h.length === 3 ? h.split('').map((c) => c + c).join('') : h, 16);
   return `rgba(${(n >> 16) & 255},${(n >> 8) & 255},${n & 255},${a})`;
+}
+const rgbOf = (hex: string) => {
+  const h = hex.replace('#', '');
+  const n = parseInt(h.length === 3 ? h.split('').map((c) => c + c).join('') : h, 16);
+  return [(n >> 16) & 255, (n >> 8) & 255, n & 255];
+};
+/** WCAG relative luminance */
+function luminance(hex: string) {
+  const lin = (c: number) => (c <= 0.03928 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4);
+  const [r, g, b] = rgbOf(hex).map((c) => lin(c / 255));
+  return 0.2126 * r + 0.7152 * g + 0.0722 * b;
+}
+const INK_DARK = '#101214';
+const INK_LIGHT = '#ffffff';
+const contrastOf = (a: string, b: string) => {
+  const [x, y] = [luminance(a), luminance(b)].sort((p, q) => q - p);
+  return (x + 0.05) / (y + 0.05);
+};
+/** text on a fill of `hex`: near-black or white, whichever contrasts more */
+export function inkOn(hex: string): string {
+  return contrastOf(hex, INK_DARK) >= contrastOf(hex, INK_LIGHT) ? INK_DARK : INK_LIGHT;
+}
+/**
+ * A fill of `hex` its ink reads on at 4.5:1 (WCAG AA for small text): the colour itself when it does, else nudged
+ * a little toward white (dark ink) or black (white ink) until it does — still recognisably the same colour.
+ */
+export function badgeFill(hex: string): string {
+  const ink = inkOn(hex);
+  const [r, g, b] = rgbOf(hex);
+  const to = ink === INK_DARK ? 255 : 0;
+  for (let k = 0; k <= 0.5; k += 0.02) {
+    const mix = (c: number) => Math.round(c + (to - c) * k).toString(16).padStart(2, '0');
+    const out = `#${mix(r)}${mix(g)}${mix(b)}`;
+    if (contrastOf(out, ink) >= 4.5) return out;
+  }
+  return hex;
 }
 
 function build(sp: Spec): Theme {

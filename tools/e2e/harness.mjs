@@ -13,7 +13,7 @@ import { copyFileSync, mkdtempSync, readFileSync, rmSync, writeFileSync, mkdirSy
 import { tmpdir, homedir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { chromium } from 'playwright';
+import { chromium, webkit } from 'playwright';
 import { deflateSync } from 'node:zlib';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
@@ -308,7 +308,8 @@ const exe = process.env.CHROME ?? (() => {
     return undefined;
   }
 })();
-const browser = await chromium.launch({ executablePath: exe, headless: true });
+// E2E_BROWSER=webkit: the engine Prong.app draws with (WKWebView), headless as well; Chromium otherwise
+const browser = process.env.E2E_BROWSER === 'webkit' ? await webkit.launch({ headless: true }) : await chromium.launch({ executablePath: exe, headless: true });
 const page = await browser.newPage({ viewport: { width: 1440, height: 900 } });
 await page.addInitScript((b) => {
   window.__PRONG_SERVER__ = b;

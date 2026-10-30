@@ -18,8 +18,10 @@ import {
   followAllBranches,
   getState,
   MenuItem,
+  openCheckout,
   openDialog,
-  push,
+  pullBranch,
+  pushBranch,
   pushBranchesBatch,
   revealCommit,
   selectStash,
@@ -28,6 +30,7 @@ import {
   setSubmoduleView,
   showContextMenu,
   showOnlyRef,
+  syncBranch,
   toast,
   toggleBranchFilter,
   toggleGroup,
@@ -41,7 +44,7 @@ import { FONT, useTheme } from '../theme';
 import { Icon, IconName } from '../ui/Icon';
 import { Badge, Button, Chevron, Collapsible, HoverReveal, IconButton, Input, PressScale, Row, Segmented, Txt, useKeyboard, usePulse } from '../ui/primitives';
 import { inFilter } from './branchFilter';
-import { remoteTwin } from './branchNames';
+import { mainBranch, remoteTwin, remoteTwins } from './branchNames';
 import { VersionGroup, versionGroups } from './versions';
 import * as live from '../state/live';
 
@@ -136,6 +139,9 @@ export function Sidebar() {
   const versions = useMemo(() => versionGroups(refs), [refs]);
   const submodules = useMemo(() => (q ? repo.submodules?.filter((s) => s.path.toLowerCase().includes(q)) : repo.submodules), [repo.submodules, q]);
   const submoduleView = useStore((s) => s.submoduleView);
+  // master (or main) and origin/master, under All Commits: among thousands of branches in folders they are a click away
+  const main = useMemo(() => mainBranch(repo.refs, repo.remotes), [repo.refs, repo.remotes]);
+  const twins = useMemo(() => remoteTwins(repo.refs, repo.remotes), [repo.refs, repo.remotes]);
   const pulse = usePulse(changes);
   // the order rows are shown in, for Shift runs of the multi-selection
   const order = useMemo(() => ({ branch: leafNames(branches), remote: remotes.flatMap((x) => leafNames(x.tree)) }), [branches, remotes]);
@@ -158,6 +164,7 @@ export function Sidebar() {
 
   return (
     <RefOrder.Provider value={order}>
+    <Twins.Provider value={twins}>
     <FilterFolds.Provider value={foldCtx}>
     <View style={[styles.sidebar, { backgroundColor: t.panel, borderColor: t.border }]} testID="sidebar">
       <ScrollView style={{ flex: 1 }} contentContainerStyle={{ paddingBottom: 20 }}>
@@ -187,6 +194,12 @@ export function Sidebar() {
             All Commits
           </Txt>
         </Row>
+        {main && (
+          <View testID="main-branch">
+            {main.local && <BranchLeaf r={main.local} label={main.local.name} kind="branch" indent={8} height={24} idPrefix="main-" />}
+            {main.remote && <BranchLeaf r={main.remote} label={main.remote.name} kind="remote" indent={8} height={24} idPrefix="main-" />}
+          </View>
+        )}
         <View style={{ height: 1, backgroundColor: t.border, marginTop: 6, marginHorizontal: 8 }} testID="sidebar-separator" />
         <View style={{ paddingHorizontal: 8, paddingTop: 8 }}>
           <Input value={filter} onChange={setFilter} placeholder="filter branches" icon="search" small testID="sidebar-filter" />
@@ -289,6 +302,7 @@ export function Sidebar() {
       {picked.length > 0 && <BatchBar names={picked} />}
     </View>
     </FilterFolds.Provider>
+    </Twins.Provider>
     </RefOrder.Provider>
   );
 }
@@ -399,10 +413,11 @@ function SubmoduleRow({ sm, label, indent }: { sm: Submodule; label: string; ind
  * moment the pointer moves onto it): shown while the row or the button is hovered, and stays lit while the
  * branch is part of the filter.
  */
-function FunnelButton({ name, active, rowHovered }: { name: string; active: boolean; rowHovered: boolean }) {
+function FunnelButton({ name, active, rowHovered, twin, idPrefix = '' }: { name: string; active: boolean; rowHovered: boolean; twin?: string; idPrefix?: string }) {
   const t = useTheme();
+  const what = twin ? `${name} and ${twin}` : name;
   return (
-    <PressScale onPress={() => toggleBranchFilter(name)} scaleTo={0.85} style={{ width: 18, height: 18, alignItems: 'center', justifyContent: 'center', marginLeft: 4 }} label={active ? `Remove ${name} from the filter` : `Filter the history to ${name}`} testID={`funnel-${name}`}>
+    <PressScale onPress={() => toggleBranchFilter(name)} scaleTo={0.85} style={{ width: 18, height: 18, alignItems: 'center', justifyContent: 'center', marginLeft: 4 }} label={active ? `Remove ${what} from the filter` : `Filter the history to ${what}`} testID={`${idPrefix}funnel-${name}`}>
       {({ hovered }) => (
         <View style={{ opacity: active || rowHovered || hovered ? 1 : 0 }}>
           <Icon name="filter" size={11} color={active ? t.accent : hovered ? t.text : t.textMuted} />
@@ -469,7 +484,7 @@ const VersionNode = memo(function VersionNode({ group }: { group: VersionGroup }
         indent={14}
         testID={`version-row-${group.version}`}
         onPress={toggle}
-        onDoublePress={() => !group.current && primary && checkout(primary.name)}
+        onDoublePress={() => !group.current && openCheckout(group.refs.map((x) => x.name))}
         onContextMenu={(x, y) =>
           showContextMenu(x, y, [
             { label: group.current ? 'Already checked out' : `Checkout ${target ?? group.version}`, disabled: group.current || !primary, onPress: () => primary && checkout(primary.name) },
@@ -654,8 +669,11 @@ function RemoteNode({ remote, tree, defaultOpen }: { remote: Remote; tree: TreeN
   );
 }
 
-/** one branch: subscribes to the few values it shows, so selecting a commit does not re-render thousands of these */
-const BranchLeaf = memo(function BranchLeaf({ r, label, kind, indent }: { r: Ref; label: string; kind: 'branch' | 'remote'; indent: number }) {
+/**
+ * one branch: subscribes to the few values it shows, so selecting a commit does not re-render thousands of these.
+ * `idPrefix` tells its test ids from the same branch's row elsewhere (the main branch above the groups).
+ */
+const BranchLeaf = memo(function BranchLeaf({ r, label, kind, indent, height = 22, idPrefix = '' }: { r: Ref; label: string; kind: 'branch' | 'remote'; indent: number; height?: number; idPrefix?: string }) {
   const t = useTheme();
   const order = useContext(RefOrder);
   const isPicked = useRepoValue((x) => x.refSelection.includes(r.name));
@@ -668,6 +686,10 @@ const BranchLeaf = memo(function BranchLeaf({ r, label, kind, indent }: { r: Ref
     return f.refs.includes(r.name);
   });
   const filtered = useRepoValue((x) => inFilter(x.graphFilter, r.name));
+  // the remote branch its funnel takes along (the funnel's label names it)
+  const twins = useContext(Twins);
+  const hideRemotes = useRepoValue((x) => x.graphFilter.hideRemotes);
+  const funnelTwin = kind === 'branch' && !hideRemotes ? twins.get(r.name) : undefined;
   const items = () => {
     // read at the moment the menu opens, not on every render of every row
     const repo = getState().repoStates[getState().activeTab ?? ''];
@@ -687,8 +709,13 @@ const BranchLeaf = memo(function BranchLeaf({ r, label, kind, indent }: { r: Ref
         { label: `Merge ${r.name} into ${current?.name ?? 'HEAD'}`, disabled: !!r.current, onPress: () => openDialog({ type: 'merge', source: r.name }) },
         { label: `Rebase ${current?.name ?? 'HEAD'} onto ${r.name}`, disabled: !!r.current, onPress: () => openDialog({ type: 'rebase', onto: r.name }) },
         { separator: true },
-        { label: r.upstream ? `Push to ${r.upstream}` : 'Push…', onPress: () => (r.upstream ? push({ branch: r.name }) : openDialog({ type: 'push', branch: r.name })) },
-        { label: r.current ? 'Pull…' : 'Pull (check it out first)', disabled: !r.current, onPress: () => openDialog({ type: 'pull' }) },
+        { label: r.upstream ? `Push to ${r.upstream}` : 'Push…', onPress: () => pushBranch(r.name) },
+        {
+          label: r.current ? 'Pull…' : r.upstream && !r.gone ? `Pull ${r.upstream} (fast-forward)` : 'Pull (it tracks no remote branch)',
+          disabled: !r.current && (!r.upstream || r.gone),
+          onPress: () => (r.current ? openDialog({ type: 'pull' }) : pullBranch(r.name)),
+        },
+        { label: r.upstream && !r.gone ? `Sync with ${r.upstream}` : 'Sync (it tracks no remote branch)', disabled: !r.upstream || r.gone, onPress: () => syncBranch(r.name) },
         { label: 'Set upstream…', onPress: () => openDialog({ type: 'upstream', branch: r.name }) },
         { separator: true },
         { label: 'Create branch here…', onPress: () => openDialog({ type: 'branch', fromSha: r.sha, fromName: r.name }) },
@@ -715,11 +742,11 @@ const BranchLeaf = memo(function BranchLeaf({ r, label, kind, indent }: { r: Ref
   };
   return (
     <Row
-      height={22}
+      height={height}
       indent={indent + 4}
       selected={selected}
       selectMode="soft"
-      testID={isPicked ? `picked-${r.name}` : undefined}
+      testID={isPicked ? `${idPrefix}picked-${r.name}` : undefined}
       onPress={() => {
         clearRefSelection();
         void revealCommit(r.sha);
@@ -729,7 +756,7 @@ const BranchLeaf = memo(function BranchLeaf({ r, label, kind, indent }: { r: Ref
         clickRefSelection(r.name, m, order[kind]);
         return true;
       }}
-      onDoublePress={() => !r.current && checkout(r.name)}
+      onDoublePress={() => openCheckout([r.name])}
       onContextMenu={(x, y) => showContextMenu(x, y, isPicked && pickedCount > 1 ? batchMenu(getState().repoStates[getState().activeTab ?? '']?.refSelection ?? []) : items())}
       style={[!visible ? { opacity: 0.45 } : undefined, isPicked ? { backgroundColor: t.accentSoft } : undefined]}
     >
@@ -742,33 +769,79 @@ const BranchLeaf = memo(function BranchLeaf({ r, label, kind, indent }: { r: Ref
           ) : (
             <Icon name={kind === 'remote' ? 'cloud' : 'branch'} size={11} color={t.textFaint} />
           )}
-          <Txt size={FONT.md} color={r.current ? t.accent : undefined} weight={r.current ? '600' : '400'} style={{ marginLeft: 6, flex: 1 }} numberOfLines={1} testID={`branch-${r.name}`}>
+          <Txt size={FONT.md} color={r.current ? t.accent : undefined} weight={r.current ? '600' : '400'} style={{ marginLeft: 6, flex: 1 }} numberOfLines={1} testID={`${idPrefix}branch-${r.name}`}>
             {label}
           </Txt>
-          {kind === 'branch' && r.upstream && !r.gone ? (
-            <View style={{ marginRight: 4 }} testID={`branch-cloud-${r.name}`}>
-              <Icon name="cloud" size={11} strokeWidth={2.2} color={t.info} />
-            </View>
+          {/* hovered: pull, push and sync in place of the tracking marks */}
+          {kind === 'branch' ? (
+            <HoverReveal
+              rowHovered={hovered}
+              rest={
+                <View style={{ flexDirection: 'row', alignItems: 'center' }}>
+                  {r.upstream && !r.gone ? (
+                    <View style={{ marginRight: 4 }} testID={`${idPrefix}branch-cloud-${r.name}`}>
+                      <Icon name="cloud" size={11} strokeWidth={2.2} color={t.info} />
+                    </View>
+                  ) : null}
+                  {/* its branch on the server was deleted (git says “gone”): the next push makes it again */}
+                  {r.upstream && r.gone ? (
+                    <Txt size={FONT.xs} faint style={{ marginRight: 4 }} testID={`${idPrefix}branch-gone-${r.name}`}>
+                      gone
+                    </Txt>
+                  ) : null}
+                  {r.ahead || r.behind ? (
+                    <Txt size={FONT.xs} muted>
+                      {r.ahead ? `↑${r.ahead} ` : ''}
+                      {r.behind ? `↓${r.behind}` : ''}
+                    </Txt>
+                  ) : null}
+                </View>
+              }
+            >
+              <SyncButtons r={r} idPrefix={idPrefix} />
+            </HoverReveal>
           ) : null}
-          {/* its branch on the server was deleted (git says “gone”): the next push makes it again */}
-          {kind === 'branch' && r.upstream && r.gone ? (
-            <Txt size={FONT.xs} faint style={{ marginRight: 4 }} testID={`branch-gone-${r.name}`}>
-              gone
-            </Txt>
-          ) : null}
-          {kind === 'branch' && (r.ahead || r.behind) ? (
-            <Txt size={FONT.xs} muted>
-              {r.ahead ? `↑${r.ahead} ` : ''}
-              {r.behind ? `↓${r.behind}` : ''}
-            </Txt>
-          ) : null}
-          <FunnelButton name={r.name} active={filtered} rowHovered={hovered} />
+          <FunnelButton name={r.name} active={filtered} rowHovered={hovered} twin={funnelTwin} idPrefix={idPrefix} />
         </>
       )}
     </Row>
   );
 });
 
+/**
+ * A local branch's buttons while its row is hovered: pull, push, sync. Pull and sync work on a branch that is not
+ * checked out too (fast-forward, push), so a branch is synced without switching to it.
+ */
+function SyncButtons({ r, idPrefix }: { r: Ref; idPrefix: string }) {
+  const tracks = !!r.upstream && !r.gone;
+  const why = r.gone ? `${r.upstream} is gone from the remote` : `${r.name} tracks no remote branch`;
+  return (
+    <>
+      <IconButton
+        icon="pull"
+        size={12}
+        style={styles.rowButton}
+        disabled={!tracks && !r.current}
+        title={tracks ? (r.current ? `Pull ${r.upstream} into ${r.name}` : `Pull ${r.upstream} into ${r.name} (fast-forward, without checking it out)`) : r.current ? `Pull into ${r.name}…` : `Pull: ${why}`}
+        onPress={() => pullBranch(r.name)}
+        testID={`${idPrefix}branch-pull-${r.name}`}
+      />
+      <IconButton icon="push" size={12} style={styles.rowButton} title={r.upstream ? `Push ${r.name} to ${r.upstream}` : `Push ${r.name}…`} onPress={() => pushBranch(r.name)} testID={`${idPrefix}branch-push-${r.name}`} />
+      <IconButton
+        icon="sync"
+        size={12}
+        style={styles.rowButton}
+        disabled={!tracks}
+        title={tracks ? (r.current ? `Sync with ${r.upstream}: stash the changes, pull, push, put them back` : `Sync with ${r.upstream}: fast-forward or push`) : `Sync: ${why}`}
+        onPress={() => syncBranch(r.name)}
+        testID={`${idPrefix}branch-sync-${r.name}`}
+      />
+    </>
+  );
+}
+
+/** each local branch's remote branch (remoteTwin), worked out once for the whole list */
+const Twins = createContext<ReadonlyMap<string, string>>(new Map());
 /** the order branch rows are shown in, per kind (Shift selects a run of it) */
 const RefOrder = createContext<{ branch: string[]; remote: string[] }>({ branch: [], remote: [] });
 function leafNames(nodes: TreeNode[]): string[] {
@@ -829,5 +902,6 @@ function BatchBar({ names }: { names: string[] }) {
 
 const styles = StyleSheet.create({
   batch: { borderTopWidth: 1, padding: 8 },
+  rowButton: { width: 20, height: 20 },
   sidebar: { flex: 1, minHeight: 0, borderRightWidth: 1 },
 });

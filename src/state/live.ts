@@ -11,10 +11,10 @@ import { CONTEXT_STEP, coversWholeFile, diffLines } from '../git/diffContext';
 import { filterRevs } from '../components/branchFilter';
 import { remoteTwin } from '../components/branchNames';
 import type { BlobSide, LfsPick, UiSettings } from '../git/GitClient';
-import { GhRepo, HttpGitClient, OpEvent, RebaseTodoItem, ServerSettings, Submodule } from '../git/GitClient';
+import { GhRepo, HttpGitClient, OpEvent, RebaseTodoItem, ServerSettings, Submodule, SwitchOptions } from '../git/GitClient';
 import { Commit, FetchOptions, FileChange, GitHubAccount, Hunk, PullOptions, PushOptions, QueueItem, RepoAuth, RepoInfo, SavedSession, Sha, SshKey, Workspace } from '../git/types';
 import { AgentMessage, AppVersion } from '../agent/types';
-import { applyUiPrefs, Area, closeDialog, confirm, DEFAULT_COLLAPSED_GROUPS, ErrorEntry, findCommit, openAgentChat, UndoEntry, finishAgentRun, getState, nextRevealNonce, openRepo, RebaseTodo, RepoState, Section, setState, subscribe, toast, updateAgent, updateRepo } from './store';
+import { applyUiPrefs, Area, closeDialog, confirm, DEFAULT_COLLAPSED_GROUPS, ErrorEntry, findCommit, openAgentChat, UndoEntry, finishAgentRun, getState, nextRevealNonce, openDialog, openRepo, RebaseTodo, RepoState, Section, setState, subscribe, toast, updateAgent, updateRepo } from './store';
 
 export const client = new HttpGitClient();
 
@@ -829,6 +829,8 @@ async function mutateIn(id: string, label: string, fn: (path: string) => Promise
     const message = String(e?.message ?? e);
     // taken out of the queue by the user
     if (message === 'Cancelled') toast(`${label}: cancelled`, 'info');
+    // stopped while it ran (the queue's Stop)
+    else if (message === 'Stopped' || /\bStopped$/.test(message)) toast(`${label}: stopped`, 'info', 'git was stopped where it was.');
     else toast(`${label} failed`, 'error', message, opts.failAction?.(message));
   }
   await guard('Refresh', () => refresh(id));
@@ -941,6 +943,8 @@ const insideOnly = (path: string) => !!repoState()?.unstaged.some((f) => f.path 
 /** said when only such submodules were asked to be staged or discarded */
 function insideOnlyNote(verb: 'stage' | 'discard', paths: string[]) {
   const what = paths.length === 1 ? paths[0] : `${paths.length} submodules`;
+  if (verb === 'discard')
+    return toast(`Discard all leaves ${what} alone`, 'info', `The changes are in ${paths.length === 1 ? 'its' : 'their'} own files. To drop them, discard ${paths.length === 1 ? 'it' : 'each one'} from ${paths.length === 1 ? 'its' : 'its own'} row (after a confirmation; Undo brings them back).`);
   toast(`Nothing to ${verb} in ${what}`, 'info', `${paths.length === 1 ? 'Its' : 'Their'} commit is the one recorded here; the changes are in ${paths.length === 1 ? 'its' : 'their'} own files. Open the submodule (→ on its row) and commit them there: then the new commit shows here, to stage.`);
 }
 export function stageFile(path: string) {
@@ -980,9 +984,10 @@ export function unstageAll() {
   void mutate('Unstage all', (p) => client.unstageAll(p), () => updateRepo((r) => ({ selectedArea: 'unstaged', selectedFile: r.unstaged.some((f) => f.path === r.selectedFile) ? r.selectedFile : r.unstaged[0]?.path ?? null })), { undo: 'index' });
 }
 /** a discard is undone from the copies the engine kept (none for a very large one: then it says so) */
-const fromCopies = (label: string) => (c: { result: { undo: string | null } }) => {
+const fromCopies = (label: string) => (c: { result: { undo: string | null; tooLarge?: boolean } }) => {
   if (!c.result?.undo) {
-    toast(`${label}: too large to keep a copy`, 'info', 'This discard cannot be undone.');
+    // nothing was lost (a nested repository left alone): no Undo, and nothing to say
+    if (c.result?.tooLarge !== false) toast(`${label}: too large to keep a copy`, 'info', 'This discard cannot be undone.');
     return null;
   }
   const token = c.result.undo;
@@ -1010,15 +1015,33 @@ export function stageFiles(all: string[], what?: string) {
 export function unstageFiles(paths: string[], what?: string) {
   if (paths.length) void mutate(filesLabel('Unstage', paths, what), (p) => client.unstage(p, paths), followFiles, { undo: 'index' });
 }
+/**
+ * What discarding a submodule does, said in its confirmation: one whose commit is not the one recorded here goes back
+ * to it (its own changes stay, or git refuses when they are in the way); one at the recorded commit has its own
+ * changes dropped. Null for a path that is not a submodule.
+ */
+export function submoduleDiscardText(path: string): string | null {
+  const f = repoState()?.unstaged.find((x) => x.path === path && x.kind === 'submodule');
+  if (!f) return null;
+  const short = (sha?: string) => (sha ? sha.slice(0, 7) : '?');
+  const inside = f.inside && f.inside.modified + f.inside.untracked > 0 ? f.inside : null;
+  const what = inside ? [inside.modified ? `${inside.modified} changed` : '', inside.untracked ? `${inside.untracked} new` : ''].filter(Boolean).join(', ') : '';
+  if (!f.inside?.only && f.submodule && f.submodule.before !== f.submodule.after)
+    return `${path} goes back to ${short(f.submodule.before)}, the commit recorded here (it is at ${short(f.submodule.after)})${inside ? `; its own changes (${what}) stay, or git refuses when they are in the way` : ''}.`;
+  if (!inside) return null;
+  const names = inside.files.slice(0, 8).map((x) => `  ${x.path}`).join('\n');
+  const more = inside.modified + inside.untracked - Math.min(8, inside.files.length);
+  return `${path} is at the commit recorded here: the changes in its own files are dropped (${what}).\n${names}${more > 0 ? `\n  … ${more} more` : ''}`;
+}
 export function discardFiles(all: string[], what?: string) {
-  const paths = all.filter((p) => !insideOnly(p));
-  if (all.length && !paths.length) return insideOnlyNote('discard', all);
+  const paths = all;
   if (!paths.length) return;
   if (paths.length === 1) return discardFile(paths[0]);
   const label = filesLabel('Discard', paths, what);
+  const subs = paths.map(submoduleDiscardText).filter((x): x is string => !!x);
   confirm(
     what ? `Discard the changes in ${what}?` : `Discard ${paths.length} files?`,
-    `${what ? `${paths.length} files: their` : 'Their'} changes are dropped. Prong keeps a copy: Undo in the toolbar (⌘Z) brings them back.\n\n${paths.slice(0, 12).join('\n')}${paths.length > 12 ? `\n… ${paths.length - 12} more` : ''}`,
+    `${what ? `${paths.length} files: their` : 'Their'} changes are dropped. Prong keeps a copy: Undo in the toolbar (⌘Z) brings them back.\n\n${paths.slice(0, 12).join('\n')}${paths.length > 12 ? `\n… ${paths.length - 12} more` : ''}${subs.length ? `\n\nSubmodules:\n${subs.join('\n\n')}` : ''}`,
     () => discarding(label, paths, () => updateRepo({ fileSelection: [] })),
     'Discard',
     true,
@@ -1051,7 +1074,11 @@ export function ignoreFiles(patterns: string[]) {
   void mutate('Add to .gitignore', (p) => client.appendIgnore(p, patterns.join('\n')), () => toast(`Added ${patterns.length} lines to .gitignore`, 'success'));
 }
 export function discardFile(path: string) {
-  if (insideOnly(path)) return insideOnlyNote('discard', [path]);
+  const sub = submoduleDiscardText(path);
+  if (sub) {
+    const moves = !insideOnly(path);
+    return confirm(moves ? `Move ${path} back?` : `Discard the changes inside ${path}?`, `${sub}\n\nProng keeps ${moves ? 'where it was' : 'a copy'}: Undo in the toolbar (⌘Z) brings ${moves ? 'it' : 'them'} back.`, () => discarding(`Discard ${baseName(path)}`, [path]), moves ? 'Move back' : 'Discard', true);
+  }
   confirm('Discard changes?', `All changes in ${path} are dropped. Prong keeps a copy: Undo in the toolbar (⌘Z) brings them back.`, () => discarding(`Discard ${baseName(path)}`, [path]), 'Discard', true);
 }
 export function discardAll() {
@@ -1225,6 +1252,38 @@ export function push(opts: PushOptions = {}) {
   );
 }
 
+/**
+ * Pull from a branch's row: the current branch as the toolbar's Pull does it (or its dialog, when it tracks nothing);
+ * another one is fast-forwarded to the branch it tracks without checking it out (refused when they went both ways).
+ */
+export function pullBranch(name: string) {
+  const id = liveId();
+  const r = repoState(id ?? undefined);
+  const b = r?.refs.find((x) => x.kind === 'branch' && x.name === name);
+  if (!id || !b) return;
+  if (b.current) return b.upstream ? pull() : openDialog({ type: 'pull' });
+  if (!b.upstream) return toast(`${name} tracks no remote branch`, 'info', 'Set its upstream from the branch menu, or push it once.');
+  void guard('Pull', async () => track(await client.pullBranch(pathOf(id), name), `Pulling ${b.upstream} into ${name}`));
+}
+/**
+ * Sync from a branch's row. The current branch: local changes stashed, the upstream pulled (the Preferences' pull
+ * mode), the branch pushed, the changes put back. Another branch: fast-forwarded when behind, pushed when ahead.
+ */
+export function syncBranch(name: string) {
+  const id = liveId();
+  const r = repoState(id ?? undefined);
+  const b = r?.refs.find((x) => x.kind === 'branch' && x.name === name);
+  if (!id || !b) return;
+  if (!b.upstream) return toast(`${name} tracks no remote branch`, 'info', 'Push it once to publish it, then sync.');
+  const strategy = getState().serverSettings?.pullMode ?? 'merge';
+  const before = headState(id);
+  void guard('Sync', async () =>
+    track(await client.syncBranch(pathOf(id), name, strategy), `Syncing ${name} with ${b.upstream}`, async (ok) => {
+      if (ok && b.current) void followSubmodules(id, before.head, headState(id).head);
+    }),
+  );
+}
+
 // ---------- branches / tags / integration ----------
 
 /** git refusing to switch because local changes (tracked or untracked) would be overwritten */
@@ -1282,6 +1341,43 @@ export async function checkoutWithStash(target: string, start?: string) {
   if (!ok || !res) return;
   if (!res.stashed || res.reapplied) toast(`Checked out ${target}${res.stashed ? '; local changes reapplied' : ''}`, 'success');
   else toast(`Checked out ${target}, but the local changes conflict with it`, 'error', `Resolve the conflicts in the working tree; the changes also stay in the stash until you drop it.\n\n${res.output}`);
+}
+/**
+ * The Checkout dialog's choice: switch (or create the tracking branch), the local changes stashed around it when
+ * asked, a merge or rebase of the counterpart on the way. Undo switches back when nothing was merged in.
+ */
+export async function switchBranch(opts: SwitchOptions) {
+  const what = opts.integrate ? `${opts.integrate.mode === 'merge' ? 'merged' : 'rebased onto'} ${opts.integrate.from}` : '';
+  let res: { name: string; stashed: boolean; reapplied: boolean; stopped: boolean; output: string } | undefined;
+  const ok = await mutate(
+    `Checkout ${opts.ref}`,
+    async (p) => {
+      res = await client.switchBranch(p, opts);
+      return res;
+    },
+    undefined,
+    {
+      undo: opts.integrate ? undefined : (c) => switchBack(`Checkout ${opts.ref}`, opts.start ? c.result?.name ?? opts.ref : undefined)(c),
+      moves: true,
+      // kept in the working tree and git refused: the same switch with every change (new files too) stashed
+      failAction: (message) => {
+        if (!CHANGES_IN_THE_WAY.test(message)) return undefined;
+        const id = liveId();
+        return {
+          label: 'Stash, switch and reapply',
+          run: () => {
+            if (liveId() !== id) return toast(`Switch back to ${liveInfo(id)?.name ?? 'that repository'} first`, 'info');
+            void switchBranch({ ...opts, stash: true, untracked: true });
+          },
+        };
+      },
+    },
+  );
+  if (!ok || !res) return;
+  const name = res.name;
+  if (res.stopped) toast(`Checked out ${name}; the ${opts.integrate!.mode} stopped on conflicts`, 'error', `Resolve them in Changes, then continue or abort the ${opts.integrate!.mode}.${res.output ? `\n\n${res.output}` : ''}`);
+  else if (res.stashed && !res.reapplied) toast(`Checked out ${name}, but the local changes conflict with it`, 'error', `Resolve the conflicts in the working tree; the changes also stay in the stash until you drop it.\n\n${res.output}`);
+  else toast(`Checked out ${name}${opts.start ? ` (tracks ${opts.start})` : ''}${what ? `, ${what}` : ''}${res.stashed ? '; local changes reapplied' : ''}`, 'success');
 }
 export function createBranch(name: string, sha: Sha, doCheckout: boolean) {
   closeDialog();
@@ -1407,6 +1503,14 @@ export function cancelQueued(id: number) {
   void guard('Cancel', () => client.cancelQueued(id));
 }
 /**
+ * Stops the action that runs now (a checkout, a merge, a discard of thousands of files…): its git is killed, as ⌃C in
+ * a terminal — git cleans up its locks; what it had done by then stays (a discard puts back what it had moved). Asked
+ * first.
+ */
+export function stopQueued(id: number, label: string) {
+  confirm(`Stop ${label}?`, 'git is stopped where it is, as ⌃C in a terminal: what it has done by then stays done (a discard puts back the files it had moved aside). Undo, Abort or the command again can follow.', () => cancelQueued(id), 'Stop', true);
+}
+/**
  * A lock file that another git process left behind (it crashed, or was killed): deleting it lets the waiting actions
  * run. Asked first; the engine refuses while the file still changes.
  */
@@ -1500,17 +1604,44 @@ export function continueOp() {
   void mutate(`Continue ${what}`, async (p) => {
     const r = await client.continueOp(p);
     if (r.conflicts) toast(`${what[0].toUpperCase()}${what.slice(1)} stopped on conflicts again`, 'error', 'resolve the files in Changes, stage them, then Continue');
-    else toast(`Continued ${what}`, 'success');
+    else if (r.settled && !r.settled.popped) toast(`Continued ${what}, but the local changes set aside for it conflict`, 'error', `Resolve them in the working tree; they also stay in the stash until you drop it.\n\n${r.settled.output}`);
+    else toast(`Continued ${what}${r.settled?.popped ? '; local changes put back' : ''}`, 'success');
   });
 }
-export function rebaseAbort() {
-  void mutate('Abort rebase', (p) => client.rebaseAbort(p));
-}
-/** the merge, cherry-pick or revert that stopped on conflicts goes back (the engine aborts whichever runs) */
-export function mergeAbort() {
+/**
+ * Abort of the merge, rebase, cherry-pick or revert that stopped: back to where it started, all of it — the commit,
+ * the local changes of that moment (and the stash Prong set them aside in), nothing made since. When git refuses
+ * and the start is not known (it was begun outside Prong), the error offers to go back anyway, after asking.
+ */
+export function abortOp(force = false) {
   const kind = repoState()?.opKind;
-  void mutate(`Abort ${kind && kind !== 'none' ? kind : 'merge'}`, (p) => client.mergeAbort(p));
+  const what = kind && kind !== 'none' ? kind : 'merge';
+  const id = liveId();
+  void mutate(
+    `Abort ${what}`,
+    async (p) => {
+      const r = await client.abortOp(p, force);
+      toast(`Aborted the ${what}${r.popped ? '; local changes put back' : r.restored ? '; local changes as they were' : ''}`, 'success', r.output || undefined);
+      return r;
+    },
+    undefined,
+    {
+      failAction: (message) =>
+        /git could not abort/.test(message)
+          ? {
+              label: 'Abort anyway',
+              run: () => {
+                if (liveId() !== id) return toast(`Switch back to ${liveInfo(id)?.name ?? 'that repository'} first`, 'info');
+                confirm(`Abort the ${what} anyway?`, 'The working tree goes back to where it started: every change made since — resolutions, edits — is dropped. This cannot be undone.', () => abortOp(true), 'Abort anyway', true);
+              },
+            }
+          : undefined,
+    },
+  );
 }
+export const rebaseAbort = () => abortOp();
+/** the merge, cherry-pick or revert that stopped on conflicts goes back (the engine aborts whichever runs) */
+export const mergeAbort = () => abortOp();
 export function cherryPick(sha: Sha) {
   void mutate(
     'Cherry-pick',

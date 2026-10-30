@@ -3,13 +3,13 @@ import { Platform, Pressable, ScrollView, StyleSheet, View } from 'react-native'
 import Svg, { Line, Path, Polygon, Rect } from 'react-native-svg';
 import { Commit, Ref, Sha } from '../git/types';
 import {
-  checkout,
   cherryPick,
   clearBranchFilter,
   collapseAllMerges,
   commitsToRebase,
   expandAllMerges,
   getState,
+  openCheckout,
   openDialog,
   relTime,
   revert,
@@ -27,11 +27,13 @@ import {
   useMods,
   useRepo,
 } from '../state/store';
-import { FONT, ROW, useSelected, useTheme } from '../theme';
+import { badgeFill, FONT, inkOn, rgba, ROW, useSelected, useTheme } from '../theme';
 import { Icon } from '../ui/Icon';
 import { Avatar, Button, Checkbox, Glass, IconButton, Input, PressScale, ResizeGrip, Row, Segmented, Txt, useKeyboard, useViewport } from '../ui/primitives';
 import { applyCollapse, filterByRefs, GraphLayout, GraphRow, layoutGraph, reachableFrom } from './graphLayout';
 import { RefLabel, refLabels } from './commitRefs';
+import { filterChips } from './branchFilter';
+import { rowCheckoutChoices } from './checkoutPlan';
 import * as live from '../state/live';
 import { rowTop, useVirtualWindow } from '../ui/virtual';
 
@@ -222,7 +224,9 @@ export function CommitList() {
   // the merges of the list shown (a branch filter's list too), for Collapse all / Expand all
   const mergeCount = useMemo(() => filtered.filter((c) => c.parents.length > 1).length, [filtered]);
   const collapsedCount = useMemo(() => filtered.filter((c) => collapsedMerges[c.sha]).length, [filtered, collapsedMerges]);
-  const filterLabel = graphFilter.mode === 'all' ? (graphFilter.hideRemotes ? 'Local branches' : 'All branches') : graphFilter.mode === 'current' ? 'Current branch' : `${graphFilter.refs.length} selected`;
+  // a local branch and its branch on the remote, both in the filter, are one chip (and counted once)
+  const chips = useMemo(() => filterChips(graphFilter, repo.refs, repo.remotes), [graphFilter, repo.refs, repo.remotes]);
+  const filterLabel = graphFilter.mode === 'all' ? (graphFilter.hideRemotes ? 'Local branches' : 'All branches') : graphFilter.mode === 'current' ? 'Current branch' : `${chips.length} selected`;
 
   return (
     <View style={{ flex: 1, backgroundColor: t.panel }}>
@@ -255,18 +259,26 @@ export function CommitList() {
             {graphFilter.mode === 'current' ? 'Current branch only' : 'Showing only'}
           </Txt>
           <ScrollView horizontal showsHorizontalScrollIndicator={false} style={{ flex: 1 }} contentContainerStyle={{ alignItems: 'center' }}>
-            {graphFilter.mode === 'selected' &&
-              graphFilter.refs.map((name) => (
-                <View key={name} style={[styles.filterChip, { borderColor: t.accent }]} testID={`filter-chip-${name}`}>
-                  <Icon name={repo.refs.find((r) => r.name === name)?.kind === 'remote' ? 'cloud' : repo.refs.find((r) => r.name === name)?.kind === 'tag' ? 'tag' : 'branch'} size={10} color={t.accent} />
-                  <Txt size={FONT.xs} color={t.text} style={{ marginLeft: 4 }}>
-                    {name}
-                  </Txt>
-                  <PressScale onPress={() => toggleBranchFilter(name)} scaleTo={0.85} style={{ marginLeft: 4, padding: 1 }} label={`Remove ${name} from the filter`}>
-                    <Icon name="x" size={10} color={t.textMuted} />
-                  </PressScale>
-                </View>
-              ))}
+            {chips.map(({ name, twin }) => (
+              <View key={name} style={[styles.filterChip, { borderColor: t.accent }]} testID={`filter-chip-${name}`}>
+                <Icon name={repo.refs.find((r) => r.name === name)?.kind === 'remote' ? 'cloud' : repo.refs.find((r) => r.name === name)?.kind === 'tag' ? 'tag' : 'branch'} size={10} color={t.accent} />
+                <Txt size={FONT.xs} color={t.text} style={{ marginLeft: 4 }}>
+                  {name}
+                </Txt>
+                {/* its branch on the remote, in the filter with it: a cloud and the remote's name */}
+                {twin ? (
+                  <View style={{ flexDirection: 'row', alignItems: 'center', marginLeft: 5 }} testID={`filter-chip-${twin}`} accessibilityLabel={twin}>
+                    <Icon name="cloud" size={10} color={t.info} />
+                    <Txt size={FONT.xs} muted style={{ marginLeft: 3 }}>
+                      {twin.endsWith(`/${name}`) ? twin.slice(0, -name.length - 1) : twin}
+                    </Txt>
+                  </View>
+                ) : null}
+                <PressScale onPress={() => toggleBranchFilter(name)} scaleTo={0.85} style={{ marginLeft: 4, padding: 1 }} label={twin ? `Remove ${name} and ${twin} from the filter` : `Remove ${name} from the filter`}>
+                  <Icon name="x" size={10} color={t.textMuted} />
+                </PressScale>
+              </View>
+            ))}
           </ScrollView>
           <Button small label="Clear filter" icon="x" onPress={clearBranchFilter} testID="clear-branch-filter" />
         </View>
@@ -507,17 +519,13 @@ const CommitRow = memo(function CommitRow({ commit, row, graphW, refs, selected,
       height={ROW}
       selected={selected}
       onPress={() => (isWip ? setSection('changes') : selectCommit(commit.sha))}
-      // a double click switches to the commit's branch: one → at once, several → a menu where the pointer is,
-      // only a remote one → its local branch (created to track it); a merge without branches folds
-      onDoublePress={(at) => {
+      // a double click opens the Checkout dialog with the commit's branches (a remote one means its local branch);
+      // a merge without branches folds
+      onDoublePress={() => {
         if (isWip) return;
-        const locals = (refs ?? []).filter((r) => r.kind === 'branch');
-        const others = locals.filter((r) => !r.current);
-        const remotes = (refs ?? []).filter((r) => r.kind === 'remote' && !r.name.endsWith('/HEAD') && !locals.some((l) => l.upstream === r.name || r.name.endsWith('/' + l.name)));
-        const choices = [...others.map((r) => r.name), ...remotes.map((r) => r.name)];
-        if (choices.length === 1) return checkout(choices[0]);
-        if (choices.length > 1) return showContextMenu(at.x, at.y, choices.map((n) => ({ label: `Switch to ${n}`, onPress: () => checkout(n) })));
-        if (!locals.length && isMerge) toggleMerge(commit.sha);
+        const choices = rowCheckoutChoices(refs ?? []);
+        if (choices.length) return openCheckout(choices);
+        if (!(refs ?? []).some((r) => r.kind === 'branch') && isMerge) toggleMerge(commit.sha);
       }}
       onContextMenu={onContext}
       testID={selected ? 'selected-commit' : undefined}
@@ -536,7 +544,8 @@ const CommitRow = memo(function CommitRow({ commit, row, graphW, refs, selected,
         </PressScale>
       )}
       <View style={{ flex: 2, minWidth: 120, flexDirection: 'row', alignItems: 'center', overflow: 'hidden' }}>
-        {refs && refLabels(refs).map((l) => <RefChip key={l.ref.name} r={l.ref} label={l} />)}
+        {/* each badge in its line's colour */}
+        {refs && refLabels(refs).map((l) => <RefChip key={l.ref.name} r={l.ref} label={l} color={row ? t.lanes[row.color % t.lanes.length] : undefined} />)}
         {isWip ? (
           <Txt size={FONT.md} color={t.textMuted} style={{ fontStyle: 'italic' }} numberOfLines={1}>
             Uncommitted changes ({changes})
@@ -664,52 +673,56 @@ function copy(text: string) {
   live.copyText(text);
 }
 
-export function RefChip({ r, onPress, compact, label }: { r: Ref; onPress?: () => void; compact?: boolean; label?: RefLabel }) {
+/**
+ * A ref on a commit row. A branch is a badge in the colour of its line in the graph (`color`; the accent where there
+ * is no graph), its name bold: filled for a local branch, outlined for one only on the remote, a solid cloud where
+ * it is on the remote. A tag is outlined in the tag colour. The current branch carries a check. On a selected
+ * (inverted) row the badges keep their colours, edged so they stand off the selection.
+ */
+export function RefChip({ r, onPress, compact, label, color }: { r: Ref; onPress?: () => void; compact?: boolean; label?: RefLabel; color?: string }) {
   const t = useTheme();
   const inverted = useSelected();
   const isCurrent = !!r.current;
+  const isTag = r.kind === 'tag';
   const remote = label ? label.remote : r.kind === 'remote';
   const remoteOnly = label ? label.remoteOnly : r.kind === 'remote';
-  // [name] in the ref's colour; the current branch is a filled block; a cloud marks a branch that is on the
-  // remote too (Fork's origin icon). Inside an inverted row everything flips.
-  const base = r.kind === 'tag' ? t.tag : remoteOnly ? t.textMuted : t.accent;
-  const fg = inverted ? (isCurrent ? t.accent : t.selectionText) : base;
-  const bg = isCurrent ? (inverted ? t.selectionText : t.accent) : 'transparent';
-  const textColor = isCurrent ? (inverted ? t.accent : t.accentText) : fg;
-  const open = r.kind === 'tag' ? '<' : '[';
-  const closeB = r.kind === 'tag' ? '>' : ']';
+  const hue = isTag ? t.tag : color ?? t.accent;
+  const solid = !isTag && !remoteOnly;
+  // a fill its name reads on (a lane colour of too little contrast is nudged a shade)
+  const fill = solid ? badgeFill(hue) : hue;
+  const bg = solid ? fill : inverted ? t.bg : rgba(hue, 0.16);
+  const fg = solid ? inkOn(fill) : hue;
   const name = label?.name ?? r.name;
-  const chipStyle = [styles.chip, { backgroundColor: bg, borderColor: isCurrent ? bg : fg }];
-  const a11y = remote ? (remoteOnly ? `${name} (remote)` : `${name} · also on ${r.upstream ?? 'origin'}`) : name;
+  const chipStyle = [styles.chip, { backgroundColor: bg, borderColor: inverted ? t.selectionText : hue }];
+  const a11y = `${name}${isCurrent ? ' (current)' : ''}${remote ? (remoteOnly ? ' (remote)' : ` · also on ${r.upstream ?? 'origin'}`) : ''}`;
   // a label without an action of its own is not a button: a pressable there took the click, and a click on a
   // branch label in a commit row selected nothing
   const inner = (
     <>
-      {!isCurrent && (
-        <Txt size={10.5} color={fg} style={{ opacity: 0.55 }}>
-          {open}
-        </Txt>
-      )}
-      {remote && (
-        // bright on its own: in the info colour on a plain label, the label's text colour where it is filled
-        <View style={{ marginRight: 4 }} testID={`ref-cloud-${name}`}>
-          <Icon name="cloud" size={11} strokeWidth={2.4} color={isCurrent || inverted ? textColor : t.info} />
+      {isCurrent && (
+        <View style={{ marginRight: 3 }} testID={`ref-current-${name}`}>
+          <Icon name="check" size={10} strokeWidth={3.2} color={fg} />
         </View>
       )}
-      <Txt size={10.5} color={textColor} weight="600" numberOfLines={1}>
+      {isTag && (
+        <View style={{ marginRight: 3 }}>
+          <Icon name="tag" size={10} strokeWidth={2.4} color={fg} />
+        </View>
+      )}
+      {remote && (
+        <View style={{ marginRight: 4 }} testID={`ref-cloud-${name}`}>
+          <Icon name="cloudFill" size={11} color={fg} />
+        </View>
+      )}
+      <Txt size={10.5} color={fg} weight="700" numberOfLines={1}>
         {compact ? name.split('/').pop() : name}
       </Txt>
       {!compact && isCurrent && (r.ahead || r.behind) ? (
-        <Txt size={10} color={textColor} style={{ marginLeft: 4, opacity: 0.85 }}>
+        <Txt size={10} color={fg} weight="700" style={{ marginLeft: 4, opacity: 0.85 }}>
           {r.ahead ? `↑${r.ahead}` : ''}
           {r.behind ? `↓${r.behind}` : ''}
         </Txt>
       ) : null}
-      {!isCurrent && (
-        <Txt size={10.5} color={fg} style={{ opacity: 0.55 }}>
-          {closeB}
-        </Txt>
-      )}
     </>
   );
   return onPress ? (
@@ -735,6 +748,6 @@ const styles = StyleSheet.create({
   filterBar: { flexDirection: 'row', alignItems: 'center', paddingHorizontal: 8, height: 32, borderBottomWidth: 1 },
   historyBar: { flexDirection: 'row', alignItems: 'center', paddingHorizontal: 10, height: 28, borderBottomWidth: 1 },
   header: { flexDirection: 'row', alignItems: 'center', height: 22, borderBottomWidth: 1, paddingRight: 8 },
-  chip: { flexDirection: 'row', alignItems: 'center', paddingHorizontal: 4, height: 16, marginRight: 5, borderWidth: 1 },
+  chip: { flexDirection: 'row', alignItems: 'center', paddingHorizontal: 5, height: 16, marginRight: 5, borderWidth: 1 },
   popover: { position: 'absolute', top: 32, left: 396, padding: 10, paddingBottom: 16, zIndex: 20 },
 });

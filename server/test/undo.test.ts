@@ -78,15 +78,15 @@ describe('undo building blocks and submodule sync', () => {
     expect(readFileSync(path.join(dir, 'a.txt'), 'utf8')).toBe('a\n');
     expect(existsSync(path.join(dir, 'new.txt'))).toBe(false);
     expect(existsSync(path.join(dir, 'b.txt'))).toBe(true);
-    expect(restoreFromUndo(repo, token!).restored).toBe(3);
+    expect((await restoreFromUndo(repo, token!)).restored).toBe(3);
     expect(readFileSync(path.join(dir, 'a.txt'), 'utf8')).toBe('a changed\n');
     expect(readFileSync(path.join(dir, 'new.txt'), 'utf8')).toBe('untracked\n');
     expect(existsSync(path.join(dir, 'b.txt'))).toBe(false);
-    expect(() => restoreFromUndo(repo, token!)).toThrow(/no longer be undone/);
+    await expect(restoreFromUndo(repo, token!)).rejects.toThrow(/no longer be undone/);
     // one file: only that one is copied
     const one = await saveForUndo(repo, ['a.txt']);
     await repo.discard(['a.txt']);
-    restoreFromUndo(repo, one!);
+    await restoreFromUndo(repo, one!);
     expect(readFileSync(path.join(dir, 'a.txt'), 'utf8')).toBe('a changed\n');
     git(dir, 'checkout', '--', '.');
     git(dir, 'clean', '-fdq');

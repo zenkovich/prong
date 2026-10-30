@@ -29,13 +29,13 @@ export function parseLog(out: string): Commit[] {
 // ---------- refs ----------
 
 /** `git for-each-ref --format=<REF_FORMAT> refs/heads refs/remotes refs/tags` */
-export const REF_FORMAT = `%(refname)${SEP}%(if)%(*objectname)%(then)%(*objectname)%(else)%(objectname)%(end)${SEP}%(HEAD)${SEP}%(upstream:short)${SEP}%(upstream:track)`;
+export const REF_FORMAT = `%(refname)${SEP}%(if)%(*objectname)%(then)%(*objectname)%(else)%(objectname)%(end)${SEP}%(HEAD)${SEP}%(upstream:short)${SEP}%(upstream:track)${SEP}%(symref:short)`;
 
 export function parseRefs(out: string): Ref[] {
   const refs: Ref[] = [];
   for (const line of out.split('\n')) {
     if (!line.trim()) continue;
-    const [refname, sha, head, upstream, track] = line.split(SEP);
+    const [refname, sha, head, upstream, track, symref] = line.split(SEP);
     let kind: Ref['kind'];
     let name: string;
     if (refname.startsWith('refs/heads/')) {
@@ -50,6 +50,8 @@ export function parseRefs(out: string): Ref[] {
     } else continue;
     const ref: Ref = { name, kind, sha };
     if (head === '*') ref.current = true;
+    // origin/HEAD: the remote's default branch
+    if (symref) ref.target = symref;
     if (upstream) {
       ref.upstream = upstream;
       const a = track?.match(/ahead (\d+)/);
@@ -99,15 +101,25 @@ export interface StatusResult {
   branch?: { head: string; oid: string; upstream?: string; ahead?: number; behind?: number };
 }
 
-const IMAGE_RX = /\.(png|jpe?g|gif|webp|bmp|svg|ico|avif|heic)$/i;
+const IMAGE_RX = /\.(png|jpe?g|gif|webp|bmp|ico|avif|heic)$/i;
+const SVG_RX = /\.svg$/i;
 const AUDIO_RX = /\.(mp3|wav|ogg|oga|opus|m4a|aac|flac|aiff?|caf|weba)$/i;
 // .ts is TypeScript, never MPEG transport stream
 const VIDEO_RX = /\.(mp4|m4v|mov|webm|ogv|mkv|avi|mpe?g|3gp|wmv|flv)$/i;
 const MEDIA_KINDS: ContentKind[] = ['image', 'audio', 'video'];
 export const isMediaKind = (k: ContentKind) => MEDIA_KINDS.includes(k);
 
+/** SVG is text: its diff is text, and the interface also draws it (the diff's Image / Text switch) */
+export const isSvgPath = (path: string) => SVG_RX.test(path);
+
 export function kindOf(path: string): ContentKind {
   return IMAGE_RX.test(path) ? 'image' : AUDIO_RX.test(path) ? 'audio' : VIDEO_RX.test(path) ? 'video' : 'text';
+}
+
+/** what a file git calls binary is previewed as: a picture, a sound or a video by its name (an SVG kept binary, by .gitattributes or Git LFS, is a picture), otherwise a binary */
+export function binaryKindOf(path: string): ContentKind {
+  const k = kindOf(path);
+  return isMediaKind(k) ? k : isSvgPath(path) ? 'image' : 'binary';
 }
 
 // ---------- Git LFS ----------
@@ -143,7 +155,7 @@ export function isLfsPointerDiff(hunks: Hunk[]): boolean {
 }
 
 /** what a file in Git LFS is previewed as: a picture, a sound or a video by its name, otherwise a binary */
-export const lfsKindOf = (path: string): ContentKind => (isMediaKind(kindOf(path)) ? kindOf(path) : 'binary');
+export const lfsKindOf = binaryKindOf;
 
 function statusChar(c: string): FileStatus {
   switch (c) {
@@ -322,7 +334,7 @@ export function parseDiff(out: string, opts: { largeThreshold?: number } = {}): 
       continue;
     }
     if (line.startsWith('Binary files') || line.startsWith('GIT binary patch')) {
-      cur.kind = isMediaKind(cur.kind) ? cur.kind : 'binary';
+      cur.kind = binaryKindOf(cur.path);
       cur.hunks = undefined;
       continue;
     }

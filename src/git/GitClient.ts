@@ -7,6 +7,17 @@ import { Commit, FileChange, Hunk, PullOptions, PushOptions, QueueItem, RepoAuth
  * same interface and swaps the transport.
  */
 
+/** what the Checkout dialog asks for */
+export interface SwitchOptions {
+  ref: string;
+  start?: string;
+  /** the changes to tracked files go to the stash and come back after */
+  stash?: boolean;
+  /** new files too */
+  untracked?: boolean;
+  integrate?: { mode: 'merge' | 'rebase'; from: string };
+}
+
 export interface OpEvent {
   opId: string;
   label: string;
@@ -136,6 +147,8 @@ export interface UiSettings {
   uiScale: number;
   fileView: 'list' | 'tree';
   diffMode: 'unified' | 'split';
+  /** an SVG's change shown as a picture or as its text diff */
+  svgView?: 'image' | 'text';
   sidebarWidth: number;
   submoduleView: 'list' | 'tree';
   commitAction: 'commit' | 'commit-push';
@@ -243,8 +256,8 @@ export interface GitClient {
   unstageAll(path: string): Promise<void>;
   /** `undo`: the engine kept copies of what was discarded (undoDiscard puts them back); null when too large */
   /** `kept`: repositories of their own among the paths, which a discard leaves alone */
-  discard(path: string, paths: string[]): Promise<{ undo: string | null; kept?: string[] }>;
-  discardAll(path: string): Promise<{ undo: string | null }>;
+  discard(path: string, paths: string[]): Promise<{ undo: string | null; kept?: string[]; tooLarge?: boolean }>;
+  discardAll(path: string): Promise<{ undo: string | null; tooLarge?: boolean }>;
   undoDiscard(path: string, token: string): Promise<{ restored: number }>;
   /** the index as a tree (null while files are in conflict), and back */
   writeTree(path: string): Promise<string | null>;
@@ -270,10 +283,19 @@ export interface GitClient {
   followAllBranches(path: string, remote?: string): Promise<{ opId: string }>;
   pull(path: string, strategy: 'merge' | 'rebase' | 'ff', opts?: Omit<PullOptions, 'strategy'>): Promise<{ opId: string }>;
   push(path: string, opts: PushOptions): Promise<{ opId: string }>;
+  /** a branch that is not checked out, fast-forwarded to the branch it tracks (fetched first) */
+  pullBranch(path: string, branch: string): Promise<{ opId: string }>;
+  /** the current branch: stash, pull, push, put the changes back; another branch: fast-forward or push */
+  syncBranch(path: string, branch: string, strategy: 'merge' | 'rebase' | 'ff'): Promise<{ opId: string }>;
 
   checkout(path: string, ref: string): Promise<void>;
   /** stash the local changes, check out (`start`: create `ref` from there), reapply them */
   checkoutWithStash(path: string, ref: string, start?: string): Promise<{ stashed: boolean; reapplied: boolean; output: string }>;
+  /**
+   * the Checkout dialog: switch to `ref` (`start`: create it there, tracking it), stash around it, and merge or rebase
+   * `integrate.from` into it on the way; `stopped`: the merge or rebase stopped on conflicts
+   */
+  switchBranch(path: string, opts: SwitchOptions): Promise<{ name: string; stashed: boolean; reapplied: boolean; stopped: boolean; output: string }>;
   /** a lock file another git process left behind (refused while it still changes) */
   removeLock(path: string, lock: string): Promise<{ removed: boolean }>;
   /** the action queues that have something in them, by repository path */
@@ -293,7 +315,9 @@ export interface GitClient {
   rebaseAbort(path: string): Promise<void>;
   mergeAbort(path: string): Promise<void>;
   /** goes on with whichever of merge, rebase, cherry-pick and revert is in progress */
-  continueOp(path: string): Promise<{ kind: string; conflicts: boolean }>;
+  continueOp(path: string): Promise<{ kind: string; conflicts: boolean; settled?: { popped: boolean; output: string } | null }>;
+  /** whichever stopped, back to where it started (`force`: when git refuses and the start was not noted) */
+  abortOp(path: string, force?: boolean): Promise<{ kind: string; restored: boolean; popped: boolean; output: string }>;
   cherryPick(path: string, sha: Sha): Promise<{ conflicts: boolean }>;
   revert(path: string, sha: Sha): Promise<{ conflicts: boolean }>;
   reset(path: string, sha: Sha, mode: 'soft' | 'mixed' | 'hard' | 'keep'): Promise<void>;
@@ -591,11 +615,20 @@ export class HttpGitClient implements GitClient {
   push(path: string, opts: PushOptions) {
     return this.op<{ opId: string }>('push', path, { ...opts });
   }
+  pullBranch(path: string, branch: string) {
+    return this.op<{ opId: string }>('pullBranch', path, { branch });
+  }
+  syncBranch(path: string, branch: string, strategy: 'merge' | 'rebase' | 'ff') {
+    return this.op<{ opId: string }>('syncBranch', path, { branch, strategy });
+  }
   async checkout(path: string, ref: string) {
     await this.op('checkout', path, { ref });
   }
   checkoutWithStash(path: string, ref: string, start?: string) {
     return this.op<{ stashed: boolean; reapplied: boolean; output: string }>('checkoutWithStash', path, { ref, start });
+  }
+  switchBranch(path: string, opts: SwitchOptions) {
+    return this.op<{ name: string; stashed: boolean; reapplied: boolean; stopped: boolean; output: string }>('switchBranch', path, { ...opts });
   }
   removeLock(path: string, lock: string) {
     return this.op<{ removed: boolean }>('removeLock', path, { lock });
@@ -640,7 +673,10 @@ export class HttpGitClient implements GitClient {
     await this.op('rebaseAbort', path);
   }
   continueOp(path: string) {
-    return this.op<{ kind: string; conflicts: boolean }>('continueOp', path);
+    return this.op<{ kind: string; conflicts: boolean; settled?: { popped: boolean; output: string } | null }>('continueOp', path);
+  }
+  abortOp(path: string, force = false) {
+    return this.op<{ kind: string; restored: boolean; popped: boolean; output: string }>('abortOp', path, { force });
   }
   async mergeAbort(path: string) {
     await this.op('mergeAbort', path);

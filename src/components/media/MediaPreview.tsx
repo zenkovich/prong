@@ -6,7 +6,7 @@ import { Icon } from '../../ui/Icon';
 import { Spinner, Txt } from '../../ui/primitives';
 import { AVCompare } from './AVCompare';
 import { LfsNotHere, SideBanner, useMediaSides } from './common';
-import { fmtBytes, sideState, signedBytes } from './mediaMath';
+import { fmtBytes, isSvgPath, sideState, signedBytes } from './mediaMath';
 import { ImageCompare } from './ImageCompare';
 
 /**
@@ -14,13 +14,13 @@ import { ImageCompare } from './ImageCompare';
  * (whether they exist, their size, where to fetch them) comes from the engine; nothing is assumed from the
  * diff, which for binaries carries no content at all.
  */
-export function MediaPreview({ file, area, rev }: { file: FileChange; area: 'unstaged' | 'staged' | 'commit' | 'stash'; rev: string }) {
+export function MediaPreview({ file, area, rev, as }: { file: FileChange; area: 'unstaged' | 'staged' | 'commit' | 'stash'; rev: string; as?: 'image' }) {
   const sides = useMediaSides(file, area, rev);
-  const kind = file.kind === 'image' || file.kind === 'audio' || file.kind === 'video' ? file.kind : 'binary';
+  const kind = as ?? (file.kind === 'image' || file.kind === 'audio' || file.kind === 'video' ? file.kind : 'binary');
   // a Git LFS side not on this machine: nothing to show until it is downloaded
   if (!sides.loading && [sides.before, sides.after].some((s) => s?.lfs && !s.lfs.local)) return <LfsNotHere before={sides.before} after={sides.after} onDownloaded={sides.reload} />;
   if (Platform.OS !== 'web' && kind !== 'binary') return <BinaryInfo {...sides} />;
-  if (kind === 'image') return <ImageCompare before={sides.before} after={sides.after} loading={sides.loading} error={sides.error} />;
+  if (kind === 'image') return <ImageCompare before={sides.before} after={sides.after} loading={sides.loading} error={sides.error} vector={isSvgPath(file.path)} />;
   if (kind === 'audio' || kind === 'video') return <AVCompare kind={kind} before={sides.before} after={sides.after} loading={sides.loading} error={sides.error} />;
   return <BinaryInfo {...sides} />;
 }

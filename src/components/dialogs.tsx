@@ -31,6 +31,7 @@ import {
   stash,
   stashBranch,
   stepUiScale,
+  switchBranch,
   switchWorkspace,
   toast,
   toggleAgent,
@@ -52,6 +53,7 @@ import { ConnectionDialog } from './ConnectionDialog';
 import { DeleteBranchesDialog } from './BranchBatchDialog';
 import { LfsDialog } from './LfsDialog';
 import { branchNameProblem } from './branchNames';
+import { canIntegrate, checkoutPlan, defaultIntegrate, Integrate, relationText } from './checkoutPlan';
 import * as live from '../state/live';
 import { desktop, pickFolder } from '../desktop';
 import { refNameProblem } from './refName';
@@ -82,6 +84,8 @@ export function DialogHost() {
       return <BranchDialog fromSha={d.fromSha} fromName={d.fromName} stash={d.stash} />;
     case 'merge':
       return <MergeDialog source={d.source} />;
+    case 'checkout':
+      return <CheckoutDialog refs={d.refs} />;
     case 'tag':
       return <TagDialog sha={d.sha} />;
     case 'reset':
@@ -929,6 +933,102 @@ function MergeDialog({ source: initial }: { source?: string }) {
           <Checkbox checked={noFf} onChange={(v) => (setNoFf(v), v && setSquash(false))} label="Always create a merge commit (--no-ff)" testID="merge-no-ff" />
           <Checkbox checked={squash} onChange={(v) => (setSquash(v), v && setNoFf(false))} label="Squash commits (--squash): the changes are staged, you commit them" testID="merge-squash" />
         </View>
+      </View>
+    </Modal>
+  );
+}
+
+/**
+ * Checkout: what every double click on a branch opens (the sidebar, a version, a commit row). Which branch (a row with
+ * several), what it switches to — a remote branch means its local branch, made when there is none — and how it stands
+ * against its counterpart (the remote branch picked, or its upstream): left as it is, merged or rebased on the way.
+ * Local changes are stashed and put back, or kept in the working tree. Enter checks out.
+ */
+function CheckoutDialog({ refs: names }: { refs: string[] }) {
+  const t = useTheme();
+  const repo = useRepo();
+  const pullMode = useStore((s) => s.serverSettings?.pullMode ?? 'merge');
+  const plans = useMemo(() => names.map((n) => checkoutPlan(repo.refs, n)).filter((p) => !!p), [names, repo.refs]);
+  const [pick, setPick] = useState(plans[0]?.ref ?? '');
+  const plan = plans.find((p) => p.ref === pick) ?? plans[0];
+  const [integrate, setIntegrate] = useState<Integrate>(() => (plan ? defaultIntegrate(plan, pullMode) : 'none'));
+  // changed tracked files (new ones stay where they are: a checkout carries them)
+  const changes = new Set([...repo.unstaged.filter((f) => f.status !== '?').map((f) => f.path), ...repo.staged.map((f) => f.path)]).size;
+  const [keep, setKeep] = useState(false);
+  const choose = (ref: string) => {
+    setPick(ref);
+    const p = plans.find((x) => x.ref === ref);
+    setIntegrate(p ? defaultIntegrate(p, pullMode) : 'none');
+  };
+  const offer = !!plan && canIntegrate(plan);
+  const mode = offer ? integrate : 'none';
+  const nothing = !plan || (plan.current && mode === 'none');
+  const go = () => {
+    if (nothing || !plan) return;
+    switchBranch({
+      ref: plan.target,
+      start: plan.start,
+      stash: changes > 0 && !keep,
+      integrate: mode !== 'none' && plan.other ? { mode, from: plan.other } : undefined,
+    });
+  };
+  useEnter(go, !nothing);
+  const relation = plan ? relationText(plan) : null;
+  return (
+    <Modal
+      title="Checkout"
+      width={520}
+      icon={<Icon name="branch" size={18} color={t.accent} />}
+      footer={
+        <>
+          <Button label="Cancel" onPress={closeDialog} />
+          <Button label={!plan ? 'Checkout' : plan.current ? (mode === 'none' ? `Already on ${plan.target}` : `${mode === 'merge' ? 'Merge' : 'Rebase'} ${plan.target}`) : 'Checkout'} primary style={{ marginLeft: 8 }} disabled={nothing} onPress={go} testID="checkout-go" />
+        </>
+      }
+    >
+      <View testID="checkout-dialog">
+        {plans.length > 1 && (
+          <Line label="Branch" top>
+            {plans.map((p) => (
+              <Radio key={p.ref} checked={p.ref === plan?.ref} onPress={() => choose(p.ref)} label={p.ref} hint={p.start ? `remote: a new ${p.target} tracking it` : p.ref !== p.target ? `remote: switches to ${p.target}` : undefined} testID={`checkout-pick-${p.ref}`} />
+            ))}
+          </Line>
+        )}
+        {plan && (
+          <>
+            <Line label={plan.current ? 'On' : 'Switch to'}>
+              <View style={{ flexDirection: 'row', alignItems: 'center', minHeight: 26 }}>
+                <View style={{ width: 7, height: 7, backgroundColor: t.accent, marginRight: 6 }} />
+                <Txt size={FONT.md} weight="600" numberOfLines={1} testID="checkout-target">
+                  {plan.target}
+                </Txt>
+                {plan.start ? (
+                  <Txt size={FONT.sm} muted style={{ marginLeft: 6 }} numberOfLines={1}>
+                    new, tracks {plan.start}
+                  </Txt>
+                ) : plan.ref !== plan.target ? (
+                  <Txt size={FONT.sm} muted style={{ marginLeft: 6 }} numberOfLines={1}>
+                    for {plan.ref}
+                  </Txt>
+                ) : null}
+              </View>
+            </Line>
+            {relation && <Note color={plan.behind ? t.info : undefined}>{relation}</Note>}
+            {offer && plan.other && (
+              <Line label="Then" top>
+                <Radio checked={mode === 'none'} onPress={() => setIntegrate('none')} label={`Leave ${plan.target} as it is`} testID="checkout-then-none" />
+                <Radio checked={mode === 'merge'} onPress={() => setIntegrate('merge')} label={`Merge ${plan.other} into ${plan.target}`} hint={plan.ahead ? 'a merge commit joins the two' : 'moves it forward: nothing of its own to join'} testID="checkout-then-merge" />
+                <Radio checked={mode === 'rebase'} onPress={() => setIntegrate('rebase')} label={`Rebase ${plan.target} onto ${plan.other}`} hint={plan.ahead ? 'its own commits replayed on top' : 'moves it forward: nothing of its own to replay'} testID="checkout-then-rebase" />
+              </Line>
+            )}
+            {changes > 0 && (
+              <Line label="Changes" top>
+                <Radio checked={!keep} onPress={() => setKeep(false)} label="Stash and reapply" hint={`${plural(changes, 'changed file')} ${changes === 1 ? 'goes to the stash and comes' : 'go to the stash and come'} back after; new files stay`} testID="checkout-stash" />
+                <Radio checked={keep} onPress={() => setKeep(true)} label="Keep in the working tree" hint={mode === 'rebase' ? 'a rebase refuses to start with them' : 'git refuses when the switch touches them'} testID="checkout-keep" />
+              </Line>
+            )}
+          </>
+        )}
       </View>
     </Modal>
   );

@@ -36,6 +36,11 @@ describe('parseRefs', () => {
     expect(refs[2].name).toBe('origin/main');
     expect(refs[3].name).toBe('v1.0.0');
   });
+  it('reads where origin/HEAD points (the remote’s default branch)', () => {
+    const refs = parseRefs([['refs/remotes/origin/HEAD', 'c'.repeat(40), '', '', '', 'origin/master'].join(SEP), ['refs/remotes/origin/master', 'c'.repeat(40), '', '', '', ''].join(SEP)].join('\n'));
+    expect(refs[0]).toMatchObject({ name: 'origin/HEAD', kind: 'remote', target: 'origin/master' });
+    expect(refs[1].target).toBeUndefined();
+  });
   it('marks an upstream whose remote branch is gone', () => {
     const refs = parseRefs(['refs/heads/old', 'e'.repeat(40), '', 'origin/old', '[gone]'].join(SEP));
     expect(refs[0]).toMatchObject({ upstream: 'origin/old', gone: true });

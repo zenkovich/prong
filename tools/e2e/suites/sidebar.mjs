@@ -94,6 +94,13 @@ async function itemsOf(loc) {
 }
 /** the confirmation dialog's button */
 const confirmOk = () => tid('confirm-ok').click();
+/** a double click on a branch opens the Checkout dialog: Checkout there (the defaults) */
+async function dblCheckout(loc) {
+  await loc.dblclick();
+  await waitShown('checkout-dialog');
+  await tid('checkout-go').click();
+  await waitGone('checkout-dialog');
+}
 const confirmCancel = () => tid('confirm-cancel').click();
 const waitDialog = (title) => page.getByText(title, { exact: true }).first().waitFor({ timeout: 5000 });
 /**
@@ -425,9 +432,9 @@ await step('sidebar · tree: a click on a branch selects its commit; on a tag (a
   expect(headOf(R.dir) === 'main', 'single clicks check nothing out');
 });
 
-await step('sidebar · tree: a double click checks a branch out; on the current branch it does nothing; on a remote branch in a folder it makes the tracking branch', async () => {
+await step('sidebar · tree: a double click opens Checkout and checks a branch out; on the current branch it only says so; on a remote branch in a folder it makes the tracking branch', async () => {
   await settle();
-  await br('hs/tmp/alpha').dblclick();
+  await dblCheckout(br('hs/tmp/alpha'));
   await until(() => headOf(R.dir) === 'hs/tmp/alpha', 'on hs/tmp/alpha: ' + headOf(R.dir));
   await statusHas(/Checked out hs\/tmp\/alpha/);
   await page.waitForFunction(() => /SemiBold|Bold/.test(getComputedStyle(document.querySelector('[data-testid="group-branches"] [data-testid="branch-hs/tmp/alpha"]')).fontFamily), null, {
@@ -435,15 +442,19 @@ await step('sidebar · tree: a double click checks a branch out; on the current 
   });
   await settle();
   await br('hs/tmp/alpha').dblclick();
-  await page.waitForTimeout(800);
-  expect(headOf(R.dir) === 'hs/tmp/alpha' && !(await has('error-dialog')), 'nothing happens on the current branch');
+  await statusHas(/Already on hs\/tmp\/alpha/);
+  expect(headOf(R.dir) === 'hs/tmp/alpha' && !(await has('error-dialog')) && !(await has('checkout-dialog')), 'nothing to do on the current branch: no dialog');
   await settle();
   await br('origin/remote-only/topic').dblclick();
+  await waitShown('checkout-dialog');
+  expect((await tid('checkout-target').innerText()) === 'remote-only/topic' && (await tid('checkout-dialog').innerText()).includes('new, tracks origin/remote-only/topic'), 'a new branch tracking it: ' + (await tid('checkout-dialog').innerText()));
+  await page.keyboard.press('Enter');
+  await waitGone('checkout-dialog');
   await until(() => headOf(R.dir) === 'remote-only/topic', 'on remote-only/topic: ' + headOf(R.dir));
   expect(git(R.dir, 'rev-parse', '--abbrev-ref', 'remote-only/topic@{upstream}').trim() === 'origin/remote-only/topic', 'it tracks origin/remote-only/topic');
   await waitShown('branch-remote-only/topic');
   await settle();
-  await br('main').dblclick();
+  await dblCheckout(br('main'));
   await until(() => headOf(R.dir) === 'main', 'back on main');
 });
 
@@ -513,11 +524,12 @@ await step('sidebar · branch menu: a local branch offers Checkout, Merge, Rebas
     const it = find(items, l);
     expect(it && !it.disabled, `“${l}” offered and enabled: ${labels(items)}`);
   }
-  expect(find(items, 'Pull (check it out first)')?.disabled, 'Pull is off for a branch that is not checked out: ' + labels(items));
+  expect(find(items, 'Pull (it tracks no remote branch)')?.disabled && find(items, 'Sync (it tracks no remote branch)')?.disabled, 'Pull and Sync are off for a branch on no remote: ' + labels(items));
   expect(find(items, /^Delete \(local \+ remote\)/)?.disabled, 'a branch on no remote: “Delete (local + remote)” is off: ' + labels(items));
   expect(!find(items, 'Clear the branch filter') && !find(items, /to the filter|from the filter/), 'no filter items while nothing is filtered');
   items = await itemsOf(br('pub'));
   expect(find(items, 'Push to origin/pub') && !find(items, 'Push to origin/pub').disabled, 'a published branch pushes to its upstream: ' + labels(items));
+  for (const l of ['Pull origin/pub (fast-forward)', 'Sync with origin/pub']) expect(find(items, l) && !find(items, l).disabled, `a published branch not checked out: “${l}”: ${labels(items)}`);
   expect(find(items, 'Delete (local + origin/pub)') && !find(items, 'Delete (local + origin/pub)').disabled, 'and names the remote branch it deletes too: ' + labels(items));
 });
 
@@ -715,6 +727,157 @@ await step('sidebar · branch menu: the filter items of a branch: Show only, Rem
   await waitGone('branch-filter-bar');
 });
 
+await step('sidebar · funnel of a local branch: its branch on the remote comes along in one chip; ✕ takes both out; the remote one’s own funnel takes only it', async () => {
+  const filterText = () => tid('graph-filter-button').innerText();
+  await br('pub').hover();
+  await tid('funnel-pub').click();
+  await waitShown('filter-chip-pub');
+  // the chip of pub holds origin/pub: a cloud and the remote's name
+  expect((await tid('filter-chip-pub').getByTestId('filter-chip-origin/pub').count()) === 1, 'origin/pub inside pub’s chip');
+  expect(/origin/.test(await tid('filter-chip-pub').innerText()), 'the chip names origin: ' + (await tid('filter-chip-pub').innerText()));
+  expect(/1 selected/i.test(await filterText()), 'counted once: ' + (await filterText()));
+  expect((await tid('funnel-origin/pub').getAttribute('aria-label')) === 'Remove origin/pub from the filter', 'the remote branch’s funnel is lit too');
+  // the remote one alone out: pub stays, on a chip of its own
+  await br('origin/pub').hover();
+  await tid('funnel-origin/pub').click();
+  await waitGone('filter-chip-origin/pub');
+  expect(await has('filter-chip-pub'), 'pub stays');
+  await tid('filter-chip-pub').getByLabel('Remove pub from the filter').click();
+  await waitGone('branch-filter-bar');
+  // in again, and out by the chip's ✕: both
+  await br('pub').hover();
+  expect((await tid('funnel-pub').getAttribute('aria-label')) === 'Filter the history to pub and origin/pub', 'the funnel says what it adds: ' + (await tid('funnel-pub').getAttribute('aria-label')));
+  await tid('funnel-pub').click();
+  await waitShown('filter-chip-origin/pub');
+  await tid('filter-chip-pub').getByLabel('Remove pub and origin/pub from the filter').click();
+  await waitGone('branch-filter-bar');
+  // Show only this branch: with its remote branch too
+  await menu(br('pub'), 'Show only this branch');
+  await waitShown('filter-chip-origin/pub');
+  await tid('clear-branch-filter').click();
+  await waitGone('branch-filter-bar');
+});
+
+await step('sidebar · main branch: main and origin/main sit under All Commits, above the groups; a click shows the commit, the funnel filters both', async () => {
+  await waitShown('main-branch');
+  const y = (id) => page.evaluate((id) => document.querySelector(`[data-testid="${id}"]`)?.getBoundingClientRect().y ?? -1, id);
+  const [commitsY, localY, remoteY, separatorY] = [await y('sidebar-commits'), await y('main-branch-main'), await y('main-branch-origin/main'), await y('sidebar-separator')];
+  expect(commitsY < localY && localY < remoteY && remoteY < separatorY, `All Commits ${commitsY} < main ${localY} < origin/main ${remoteY} < the separator ${separatorY}`);
+  expect((await tid('main-branch').innerText()).replace(/\s+/g, ' ').includes('origin/main'), 'the remote one by its full name');
+  // the same branch still in its group, its ids apart
+  expect(await has('branch-main') && (await tid('branch-main').count()) === 1, 'one branch-main: the group’s');
+  await tid('main-branch-origin/main').hover();
+  await tid('main-funnel-origin/main').click();
+  await waitShown('filter-chip-origin/main');
+  await tid('clear-branch-filter').click();
+  await waitGone('branch-filter-bar');
+  await tid('main-branch-main').hover();
+  await tid('main-funnel-main').click();
+  await waitShown('filter-chip-main');
+  expect(await has('filter-chip-origin/main'), 'with origin/main');
+  await tid('clear-branch-filter').click();
+  await waitGone('branch-filter-bar');
+});
+
+await step('sidebar · branch buttons: hovered, a branch shows pull, push and sync in place of its marks; push, pull and sync a branch not checked out; sync the current one with local changes', async () => {
+  const remote = (b) => git(O.dir, 'ls-remote', 'origin', `refs/heads/${b}`).split('\t')[0];
+  const newCommit = (parent, msg) => git(O.dir, 'commit-tree', `${parent}^{tree}`, '-p', parent, '-m', msg).trim();
+  git(O.dir, 'branch', 'btn', 'main');
+  git(O.dir, 'push', '-q', '-u', 'origin', 'btn');
+  const ahead = newCommit('btn', 'btn work');
+  git(O.dir, 'update-ref', 'refs/heads/btn', ahead);
+  await refreshUi();
+  await page.waitForFunction(() => /↑1/.test(document.querySelector('[data-testid="group-branches"] [data-testid="branch-btn"]')?.parentElement?.innerText ?? ''), null, { timeout: 8000 });
+  // at rest the marks, hovered the buttons in their place
+  expect(!(await tid('branch-push-btn').isVisible()), 'no buttons at rest');
+  await br('btn').hover();
+  await tid('branch-push-btn').waitFor({ state: 'visible', timeout: 3000 });
+  expect(!(await tid('branch-cloud-btn').isVisible()), 'the cloud makes way');
+  expect((await tid('branch-sync-btn').getAttribute('aria-label')) === 'Sync with origin/btn: fast-forward or push', 'sync on a branch not checked out: ' + (await tid('branch-sync-btn').getAttribute('aria-label')));
+  await tid('branch-push-btn').click();
+  await until(() => remote('btn') === ahead, 'btn pushed');
+  // someone else's commit on origin/btn: pull fast-forwards btn, main stays checked out
+  const theirs = newCommit(ahead, 'their btn work');
+  git(O.dir, 'push', '-q', 'origin', `${theirs}:refs/heads/btn`);
+  await br('btn').hover();
+  await tid('branch-pull-btn').click();
+  await until(() => shaOf(O.dir, 'btn') === theirs, 'btn fast-forwarded: ' + shaOf(O.dir, 'btn'));
+  expect(headOf(O.dir) === 'main', 'still on main');
+  await statusHas(/btn fast-forwarded to origin\/btn \(1 commit\)/);
+  // sync: ahead again, pushed
+  const again = newCommit(theirs, 'more btn work');
+  git(O.dir, 'update-ref', 'refs/heads/btn', again);
+  await refreshUi();
+  await br('btn').hover();
+  await tid('branch-sync-btn').click();
+  await until(() => remote('btn') === again, 'btn synced: pushed');
+  // a branch on no remote (topic; unpub tracks origin/rb by now): pull and sync are off, push opens the dialog
+  await br('topic').hover();
+  await tid('branch-push-topic').waitFor({ state: 'visible', timeout: 3000 });
+  expect((await disabledBtn('branch-pull-topic')) && (await disabledBtn('branch-sync-topic')), 'pull and sync off for topic');
+  await tid('branch-push-topic').click();
+  await waitShown('push-dialog');
+  await page.keyboard.press('Escape');
+  await waitGone('push-dialog');
+  // the current branch: origin/main moved on, a new file and an edit in the working tree
+  try {
+    const remoteMain = newCommit(remote('main'), 'remote main work');
+    git(O.dir, 'push', '-q', 'origin', `${remoteMain}:refs/heads/main`);
+    writeFileSync(path.join(O.dir, 'wip-sync.txt'), 'wip\n');
+    writeFileSync(path.join(O.dir, 'README.md'), '# side-ops, edited\n');
+    await refreshUi();
+    await br('main').hover();
+    await tid('branch-sync-main').waitFor({ state: 'visible', timeout: 3000 });
+    expect((await tid('branch-sync-main').getAttribute('aria-label')) === 'Sync with origin/main: stash the changes, pull, push, put them back', 'sync on the current branch: ' + (await tid('branch-sync-main').getAttribute('aria-label')));
+    await tid('branch-sync-main').click();
+    const has = (sha) => {
+      try {
+        git(O.dir, 'merge-base', '--is-ancestor', sha, 'main');
+        return true;
+      } catch {
+        return false;
+      }
+    };
+    await until(() => remote('main') === shaOf(O.dir, 'main') && has(remoteMain), 'main pulled and pushed');
+    await until(() => existsSync(path.join(O.dir, 'wip-sync.txt')) && git(O.dir, 'stash', 'list').trim() === '', 'the local changes back, no stash left');
+    expect(git(O.dir, 'status', '--porcelain').includes('README.md'), 'the edit is back too');
+  } finally {
+    git(O.dir, 'checkout', '-q', '--', 'README.md');
+    git(O.dir, 'clean', '-qf', '--', 'wip-sync.txt');
+    await resetMain();
+  }
+});
+
+await step('sidebar · Checkout dialog: a double click on a remote branch its local one is behind offers merge or rebase (the pull mode picked), stashes the local changes around it', async () => {
+  const theirs = git(O.dir, 'commit-tree', 'btn^{tree}', '-p', 'btn', '-m', 'their btn again').trim();
+  git(O.dir, 'push', '-q', 'origin', `${theirs}:refs/heads/btn`);
+  // an edit of a tracked file: stashed around the switch (new files stay where they are)
+  writeFileSync(path.join(O.dir, 'base.txt'), 'base, edited\n');
+  try {
+    await refreshUi();
+    await br('origin/btn').dblclick();
+    await waitShown('checkout-dialog');
+    const text = await tid('checkout-dialog').innerText();
+    expect((await tid('checkout-target').innerText()) === 'btn' && text.includes('btn is 1 commit behind origin/btn'), 'its local branch, one behind: ' + text);
+    const mode = (await (await fetch(`${base}/api/settings`)).json().catch(() => ({})))?.pullMode;
+    const picked = (await has('checkout-then-merge-on')) ? 'merge' : (await has('checkout-then-rebase-on')) ? 'rebase' : 'none';
+    expect(picked === (mode === 'rebase' ? 'rebase' : 'merge'), `the pull mode (${mode}) picked: ${picked}`);
+    expect(await has('checkout-then-none'), 'leaving it offered');
+    expect(await has('checkout-stash-on'), 'the local change: stash and reapply picked');
+    if (picked !== 'merge') await tid('checkout-then-merge').click();
+    await waitShown('checkout-then-merge-on');
+    await tid('checkout-go').click();
+    await until(() => headOf(O.dir) === 'btn' && shaOf(O.dir, 'btn') === theirs, 'on btn, at origin/btn: ' + headOf(O.dir));
+    await statusHas(/Checked out btn, merged origin\/btn; local changes reapplied/);
+    expect(git(O.dir, 'status', '--porcelain').includes('base.txt') && git(O.dir, 'stash', 'list').trim() === '', 'the change back, no stash left');
+    // leave picked: only the switch
+    await dblCheckout(br('main'));
+    await until(() => headOf(O.dir) === 'main', 'back on main');
+  } finally {
+    git(O.dir, 'checkout', '-q', '--', 'base.txt');
+  }
+});
+
 // ===================================================================================== remotes
 let M;
 /** a repository with an origin, and another clone of that origin where someone else pushes and deletes */
@@ -899,7 +1062,7 @@ await step('sidebar · tags: the menu of a tag: Checkout (a detached HEAD at it)
   await until(() => shaOf(T.dir, 'HEAD') === shaOf(T.dir, 'v1^{commit}') && headOf(T.dir) === 'HEAD', 'detached at v1');
   await statusHas(/Detached HEAD at/);
   await settle();
-  await br('main').dblclick();
+  await dblCheckout(br('main'));
   await until(() => headOf(T.dir) === 'main', 'back on main');
   await menu(tid('tag-v2'), 'Push tag');
   await until(() => lsRemote(T.dir, 'upstream', 'refs/tags/v2'), 'v2 is on upstream (the only remote)');
@@ -1166,14 +1329,14 @@ await step('sidebar · versions: the menu of a version: Checkout its branch, Sho
   await statusHas(/Copied.*926-hotfix/);
   expect(find(await itemsOf(tid('version-row-700')), 'Checkout ver/700'), 'a version only on the remote checks out as its local branch');
   await settle();
-  await tid('version-row-700').dblclick();
+  await dblCheckout(tid('version-row-700'));
   await until(() => headOf(V.dir) === 'ver/700', 'on ver/700: ' + headOf(V.dir));
   expect(upOf(V.dir, 'ver/700') === 'origin/ver/700', 'tracking origin/ver/700');
   await settle();
-  await tid('version-row-925').dblclick();
+  await dblCheckout(tid('version-row-925'));
   await until(() => headOf(V.dir) === 'ver/925', 'on ver/925');
   await settle();
-  await br('main').dblclick();
+  await dblCheckout(br('main'));
   await until(() => headOf(V.dir) === 'main', 'back on main');
 });
 

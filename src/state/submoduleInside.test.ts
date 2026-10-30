@@ -52,17 +52,34 @@ describe('submodules listed for their own files', () => {
     expect(getState().toasts.at(-1)).toMatchObject({ text: 'Nothing to stage in 2 submodules' });
   });
 
-  it('Discard of a group leaves them out (no confirm for them alone); Stage all with only them says so', () => {
-    open([insideOnly('libs/core')]);
-    const discard = vi.spyOn(client, 'discard');
+  it('Discard asks first, naming what goes inside the submodule, then discards it; a group names its submodules; Stage all with only them says so', async () => {
+    open([insideOnly('libs/core'), file('a.txt')]);
+    const discard = vi.spyOn(client, 'discard').mockResolvedValue({ undo: null, kept: [] } as any);
     discardFiles(['libs/core']);
     expect(discard).not.toHaveBeenCalled();
-    expect(getState().toasts.at(-1)).toMatchObject({ text: 'Nothing to discard in libs/core' });
-    expect(getState().dialog).toBeFalsy();
+    const d = getState().dialog as any;
+    expect(d).toMatchObject({ type: 'confirm', title: 'Discard the changes inside libs/core?', confirmLabel: 'Discard' });
+    expect(d.message).toContain('libs/core is at the commit recorded here: the changes in its own files are dropped (1 changed).');
+    expect(d.message).toContain('core.txt');
+    d.onConfirm();
+    await vi.waitFor(() => expect(discard).toHaveBeenCalledWith('/w/proj', ['libs/core']));
+    // with other files: the confirmation has a part for the submodule
+    discardFiles(['libs/core', 'a.txt']);
+    expect((getState().dialog as any).message).toMatch(/Submodules:\nlibs\/core is at the commit recorded here/);
+    setState({ dialog: null });
+    open([insideOnly('libs/core')]);
     const all = vi.spyOn(client, 'stageAll');
     stageAll();
     expect(all).not.toHaveBeenCalled();
     expect(getState().toasts.at(-1)).toMatchObject({ text: 'Nothing to stage in libs/core' });
+  });
+
+  it('a submodule at another commit than recorded: Discard moves it back, after saying so', () => {
+    open([file('libs/core', { kind: 'submodule', submodule: { before: 'a'.repeat(40), after: 'b'.repeat(40) } })]);
+    discardFiles(['libs/core']);
+    const d = getState().dialog as any;
+    expect(d).toMatchObject({ title: 'Move libs/core back?', confirmLabel: 'Move back' });
+    expect(d.message).toContain(`libs/core goes back to aaaaaaa, the commit recorded here (it is at bbbbbbb)`);
   });
 });
 

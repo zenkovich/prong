@@ -36,6 +36,7 @@ npm run test:affected    # только то, что задела правка: 
 ```bash
 node tools/e2e/suites/changes.mjs                  # один набор
 E2E_ONLY='hover' node tools/e2e/suites/changes.mjs # только проверки, чьё имя совпало
+E2E_BROWSER=webkit E2E_ONLY='SVG' node tools/e2e/suites/changes.mjs  # в WebKit, движке Prong.app (тоже без окна; буфера обмена нет)
 E2E_JOBS=2 node tools/e2e/run-all.mjs '^(changes|history)$'
 npm run test:affected -- --suites changes --only 'submodule'   # общий код: сценарий выбирается явно
 npm run test:affected -- --dry                     # что запустится

@@ -1023,31 +1023,49 @@ await check('several branches at once: ⌘ and Shift pick them, the batch bar fi
   await page.waitForFunction(() => !document.querySelector('[data-testid="batch-bar"]'), null, { timeout: 3000 });
 });
 
-await check('a double click switches branches: in the branch list, and on a commit (a menu when it carries several)', async () => {
+await check('a double click opens the Checkout dialog: in the branch list, and on a commit (it lists the branches when there are several)', async () => {
   await openRepo('alpha');
   await page.getByText('All Commits', { exact: true }).first().click();
   const head = () => gitOut('rev-parse', '--abbrev-ref', 'HEAD').trim();
+  const go = async () => {
+    await page.getByTestId('checkout-dialog').waitFor({ timeout: 5000 });
+    await page.getByTestId('checkout-go').click();
+  };
   await page.waitForTimeout(600);
   // the branch list
   await page.getByTestId('branch-batch/b').dblclick();
+  await go();
   await page.waitForFunction(() => /Checked out batch\/b/.test(document.querySelector('[data-testid="status-bar"]')?.textContent ?? ''), null, { timeout: 10000 });
   expect(head() === 'batch/b', 'on batch/b: ' + head());
-  // a commit with one other branch: straight to it
+  // a commit with one other branch: that one, no choice
   await page.waitForTimeout(600);
   await page.getByText('Search feature work', { exact: true }).first().dblclick();
+  await page.getByTestId('checkout-dialog').waitFor({ timeout: 5000 });
+  expect((await page.getByTestId('checkout-target').innerText()) === 'feature/search' && !(await page.locator('[data-testid^="checkout-pick-"]').count()), 'feature/search, nothing to pick');
+  await page.getByTestId('checkout-go').click();
   await page.waitForFunction(() => /Checked out feature\/search/.test(document.querySelector('[data-testid="status-bar"]')?.textContent ?? ''), null, { timeout: 10000 });
   expect(head() === 'feature/search', 'on feature/search: ' + head());
-  // a commit with several: a menu, then the chosen one
+  // a commit with several: the dialog lists them, the one picked is checked out
   await page.waitForTimeout(600);
   await page.getByText('Add app module', { exact: true }).first().dblclick();
-  await page.getByText('Switch to main', { exact: true }).first().waitFor({ timeout: 3000 });
-  expect((await page.getByText('Switch to feature/login', { exact: true }).count()) >= 1, 'the other branches are offered too');
-  await page.getByText('Switch to main', { exact: true }).first().click();
+  await page.getByTestId('checkout-dialog').waitFor({ timeout: 5000 });
+  expect((await page.getByTestId('checkout-pick-main').count()) + (await page.getByTestId('checkout-pick-main-on').count()) === 1 && (await page.locator('[data-testid^="checkout-pick-feature/login"]').count()) === 1, 'main and feature/login offered');
+  await page.locator('[data-testid^="checkout-pick-main"]').click();
+  expect((await page.getByTestId('checkout-target').innerText()) === 'main', 'main picked');
+  await page.getByTestId('checkout-go').click();
   await page.waitForFunction(() => /Checked out main/.test(document.querySelector('[data-testid="status-bar"]')?.textContent ?? ''), null, { timeout: 10000 });
   expect(head() === 'main', 'back on main: ' + head());
 });
 
 const headNow = () => gitOut('rev-parse', '--abbrev-ref', 'HEAD').trim();
+/** every double click on a branch opens the Checkout dialog: Checkout there (`keep`: the local changes left in the working tree) */
+const confirmCheckout = async ({ keep = false } = {}) => {
+  await page.getByTestId('checkout-dialog').waitFor({ timeout: 5000 });
+  // only changes to tracked files are asked about (new files stay where they are)
+  if (keep && (await page.getByTestId('checkout-keep').count())) await page.getByTestId('checkout-keep').click();
+  await page.getByTestId('checkout-go').click();
+  await page.waitForFunction(() => !document.querySelector('[data-testid="checkout-dialog"]'), null, { timeout: 5000 });
+};
 // the batch check deleted most branches at main's commit: these are fresh ones (alpha has local changes, so the
 // switches stay on one commit)
 gitOut('checkout', '-q', 'main');
@@ -1064,6 +1082,7 @@ await check('a slow double click still switches: the system’s click count deci
   await page.waitForTimeout(800);
   await page.mouse.down({ clickCount: 2 });
   await page.mouse.up({ clickCount: 2 });
+  await confirmCheckout();
   await statusHas(/Checked out dbl\/one/);
   expect(headNow() === 'dbl/one', 'on dbl/one: ' + headNow());
   // two separate clicks are not a double click, however quick
@@ -1071,7 +1090,7 @@ await check('a slow double click still switches: the system’s click count deci
   await page.waitForTimeout(200);
   await page.getByTestId('branch-dbl/two').click();
   await page.waitForTimeout(800);
-  expect(headNow() === 'dbl/one', 'two single clicks do not check out: ' + headNow());
+  expect(headNow() === 'dbl/one' && !(await page.getByTestId('checkout-dialog').count()), 'two single clicks do not check out: ' + headNow());
 });
 
 await check('a remote branch: a double click makes its local branch, tracking it (as Fork does)', async () => {
@@ -1082,13 +1101,14 @@ await check('a remote branch: a double click makes its local branch, tracking it
   await page.getByPlaceholder('filter branches').fill('from-origin');
   await page.waitForTimeout(400);
   await page.getByTestId('branch-origin/from-origin').dblclick();
+  await confirmCheckout();
   await statusHas(/Checked out from-origin \(tracks origin\/from-origin\)/);
   expect(headNow() === 'from-origin', 'on from-origin: ' + headNow());
   expect(gitOut('rev-parse', '--abbrev-ref', 'from-origin@{upstream}').trim() === 'origin/from-origin', 'tracks origin/from-origin');
   await page.getByPlaceholder('filter branches').fill('');
 });
 
-await check('local changes in the way of a switch: the error offers stash, switch and reapply', async () => {
+await check('local changes in the way of a switch, kept in the working tree: the error offers stash, switch and reapply', async () => {
   const dir = path.join(root, 'alpha');
   gitOut('checkout', '-q', 'main');
   const lines = Array.from({ length: 12 }, (_, i) => `line ${i + 1}`);
@@ -1104,6 +1124,7 @@ await check('local changes in the way of a switch: the error offers stash, switc
   writeFileSync(path.join(dir, 'far.txt'), [...lines.slice(0, 11), 'line 12 changed here'].join('\n') + '\n');
   await refreshUi();
   await page.getByTestId('branch-far-lines').dblclick();
+  await confirmCheckout({ keep: true });
   await page.getByTestId('error-action').waitFor({ timeout: 10000 });
   // innerText is upper-cased by the button's style
   expect(/stash, switch and reapply/i.test(await page.getByTestId('error-action').innerText()), 'the action is offered');
@@ -1127,11 +1148,13 @@ await check('the action queue: an action blocked by another git’s index.lock w
   try {
     await page.waitForTimeout(600);
     await page.getByTestId('branch-q/one').dblclick();
+    await confirmCheckout();
     await page.getByTestId('queue-status').waitFor({ timeout: 5000 });
     const shown = await page.getByTestId('queue-status').innerText();
     expect(/Waiting for index\.lock · Checkout q\/one/i.test(shown), 'what waits, for what: ' + shown);
     // a second action lines up behind it, and can be taken out
     await page.getByTestId('branch-q/two').dblclick();
+    await confirmCheckout();
     await page.waitForFunction(() => /1 more/.test(document.querySelector('[data-testid="queue-status"]')?.textContent ?? ''), null, { timeout: 5000 });
     await page.getByTestId('queue-status').click();
     await page.getByTestId('queue-panel').waitFor({ timeout: 3000 });
@@ -1157,6 +1180,7 @@ await check('a lock left behind by a crash: once it is old, the queue list delet
   utimesSync(lock, old, old);
   try {
     await page.getByTestId('branch-q/three').dblclick();
+    await confirmCheckout();
     await page.getByTestId('queue-status').waitFor({ timeout: 5000 });
     await page.getByTestId('queue-status').click();
     await page.getByTestId('queue-remove-lock').waitFor({ timeout: 3000 });
@@ -1210,6 +1234,7 @@ await check('“Ask AI” in the error window hands the error to the agent: in t
   try {
     await page.waitForTimeout(600);
     await page.getByTestId('branch-far-lines').dblclick();
+    await confirmCheckout({ keep: true });
     await page.getByTestId('error-ask-ai').waitFor({ timeout: 10000 });
     await page.getByTestId('error-ask-ai').click();
     await page.waitForFunction(() => !document.querySelector('[data-testid="error-dialog"]'), null, { timeout: 5000 });
@@ -1409,6 +1434,7 @@ await check('Undo (⌘Z, the toolbar button): staging, a commit, a discard and a
     await page.getByText('All Commits', { exact: true }).first().click();
     await page.waitForTimeout(600);
     await page.getByTestId('branch-dbl/two').dblclick();
+    await confirmCheckout();
     await statusHas(/Checked out dbl\/two/);
     await page.keyboard.press('Meta+z');
     await statusHas(/Undone: Checkout dbl\/two/);
@@ -1439,6 +1465,7 @@ await check('submodules follow a checkout and its undo; one moved by hand is lef
     await page.getByText('All Commits', { exact: true }).first().click();
     await page.waitForTimeout(600);
     await page.getByTestId('branch-before-bump').dblclick();
+    await confirmCheckout();
     await statusHas(/Updating submodules \(1\): done/);
     expect(coreHead() === recorded('before-bump'), 'the submodule followed the checkout');
     // undoing the checkout: back on main, the submodule follows again
@@ -1455,6 +1482,7 @@ await check('submodules follow a checkout and its undo; one moved by hand is lef
     git(core, 'checkout', '-q', byHand);
     await page.waitForTimeout(600);
     await page.getByTestId('branch-before-bump').dblclick();
+    await confirmCheckout();
     await statusHas(/left where you put it/);
     expect(coreHead() === byHand, 'not moved');
   } finally {

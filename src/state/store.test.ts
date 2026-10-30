@@ -226,12 +226,16 @@ describe('store: branch click and branch filter', () => {
     expect(getState().repoStates.a.reveal!.nonce).toBeGreaterThan(first.nonce); // a second click scrolls again
   });
 
-  it('the funnel adds and removes branches; the last one out, or Clear, shows everything', () => {
+  it('the funnel adds and removes branches (a local one with its remote branch); the last one out, or Clear, shows everything', () => {
+    const refs = getState().repoStates.a.refs;
+    const twinOf = (n: string) => (refs.some((x) => x.name === `origin/${n}`) ? [n, `origin/${n}`] : [n]);
+    expect(twinOf('main')).toEqual(['main', 'origin/main']);
     toggleBranchFilter('main');
-    expect(getState().repoStates.a.graphFilter).toMatchObject({ mode: 'selected', refs: ['main'] });
+    expect(getState().repoStates.a.graphFilter).toMatchObject({ mode: 'selected', refs: ['main', 'origin/main'] });
     toggleBranchFilter('dev');
-    expect(getState().repoStates.a.graphFilter.refs).toEqual(['main', 'dev']);
+    expect(getState().repoStates.a.graphFilter.refs).toEqual(['main', 'origin/main', ...twinOf('dev')]);
     toggleBranchFilter('main');
+    expect(getState().repoStates.a.graphFilter.refs).toEqual(twinOf('dev'));
     toggleBranchFilter('dev');
     expect(getState().repoStates.a.graphFilter).toMatchObject({ mode: 'all', refs: [] });
     toggleBranchFilter('dev');

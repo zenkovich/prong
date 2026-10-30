@@ -5,9 +5,10 @@ import { SCHEMES, ThemeName, UI_SCALES, THEMES } from '../theme';
 import { AgentMessage, AgentSettings, AgentTarget, AppMods, AppVersion, FACTORY_MODS } from '../agent/types';
 import { plan as planCommand } from '../agent/mockAgent';
 import * as live from './live';
-import type { ServerSettings, Submodule } from '../git/GitClient';
+import type { ServerSettings, Submodule, SwitchOptions } from '../git/GitClient';
 import { GraphFilter } from '../components/graphLayout';
-import { toggleFilterRef } from '../components/branchFilter';
+import { filterTwin, toggleFilterRef } from '../components/branchFilter';
+import { canIntegrate, checkoutPlan, relationText } from '../components/checkoutPlan';
 import { nextSelection } from '../components/refSelection';
 
 /** smallest heights of the resizable commit box and commit description block */
@@ -116,6 +117,8 @@ export type Dialog =
   /** `stash`: "Branch from stash" (the branch starts where that stash was made and gets its changes) */
   | { type: 'branch'; fromSha?: Sha; /** the branch or tag it starts from (the sidebar's menus) */ fromName?: string; stash?: number }
   | { type: 'merge'; source?: string }
+  /** every double click on a branch: what it switches to, the local changes, a merge or rebase on the way (`refs`: the choices, the first picked) */
+  | { type: 'checkout'; refs: string[] }
   | { type: 'tag'; sha: Sha }
   | { type: 'reset'; sha: Sha }
   | { type: 'stash' }
@@ -225,6 +228,8 @@ export interface AppState {
   /** defaults for new repository views (persisted with the other UI preferences) */
   fileView: 'list' | 'tree';
   diffMode: 'unified' | 'split';
+  /** an SVG's change shown as a picture or as its text diff (remembered for every repository) */
+  svgView: 'image' | 'text';
   submoduleView: 'list' | 'tree';
   commitAction: 'commit' | 'commit-push';
   /** tab groups (a repository with its open submodules) the user folded, by the parent tab id */
@@ -310,6 +315,7 @@ let state: AppState = {
   uiScale: 1,
   fileView: 'tree',
   diffMode: 'unified',
+  svgView: 'image',
   submoduleView: 'tree',
   commitAction: 'commit',
   collapsedTabGroups: {},
@@ -773,9 +779,9 @@ export function filterToSelection(add = false) {
   if (live.isLiveActive()) void live.applyGraphFilter();
 }
 
-/** Fork-style branch filter: the funnel next to a branch */
+/** Fork-style branch filter: the funnel next to a branch (a local one brings its branch on the remote along) */
 export function toggleBranchFilter(name: string) {
-  updateRepo((r) => ({ graphFilter: toggleFilterRef(r.graphFilter, name) }));
+  updateRepo((r) => ({ graphFilter: toggleFilterRef(r.graphFilter, name, filterTwin(r.refs, r.remotes, name, r.graphFilter.hideRemotes)) }));
   if (live.isLiveActive()) void live.applyGraphFilter();
 }
 export function clearBranchFilter() {
@@ -945,8 +951,12 @@ export function toggleGraphRef(name: string) {
   });
   if (live.isLiveActive()) void live.applyGraphFilter();
 }
+/** the history narrowed to one ref (a local branch with its branch on the remote) */
 export function showOnlyRef(name: string) {
-  updateRepo((r) => ({ graphFilter: { ...r.graphFilter, mode: 'selected', refs: [name] } }));
+  updateRepo((r) => {
+    const twin = filterTwin(r.refs, r.remotes, name, r.graphFilter.hideRemotes);
+    return { graphFilter: { ...r.graphFilter, mode: 'selected', refs: twin ? [name, twin] : [name] } };
+  });
   if (live.isLiveActive()) void live.applyGraphFilter();
 }
 export function isRefVisible(r: RepoState, name: string) {
@@ -999,6 +1009,10 @@ export function setDiffMode(diffMode: 'unified' | 'split') {
 export function toggleTabGroup(id: string) {
   setState((s) => ({ collapsedTabGroups: { ...s.collapsedTabGroups, [id]: !s.collapsedTabGroups[id] } }));
 }
+export function setSvgView(svgView: 'image' | 'text') {
+  setState({ svgView });
+  live.persistUi({ svgView });
+}
 export function setSubmoduleView(submoduleView: 'list' | 'tree') {
   setState({ submoduleView });
   live.persistUi({ submoduleView });
@@ -1008,7 +1022,7 @@ export function setCommitAction(commitAction: 'commit' | 'commit-push') {
   live.persistUi({ commitAction });
 }
 /** Applies persisted UI preferences (engine settings or local storage) without writing them back. */
-export function applyUiPrefs(ui: Partial<{ theme: string; uiScale: number; fileView: 'list' | 'tree'; diffMode: 'unified' | 'split'; sidebarWidth: number; submoduleView: 'list' | 'tree'; commitAction: 'commit' | 'commit-push'; commitBoxHeight: number; detailsHeaderHeight: number; commitDescOpen: boolean; detailsDescOpen: boolean; detailsRatio: number; sync: Partial<SyncPrefs> }>) {
+export function applyUiPrefs(ui: Partial<{ theme: string; uiScale: number; fileView: 'list' | 'tree'; diffMode: 'unified' | 'split'; svgView: 'image' | 'text'; sidebarWidth: number; submoduleView: 'list' | 'tree'; commitAction: 'commit' | 'commit-push'; commitBoxHeight: number; detailsHeaderHeight: number; commitDescOpen: boolean; detailsDescOpen: boolean; detailsRatio: number; sync: Partial<SyncPrefs> }>) {
   setState((s) => ({
     syncPrefs: ui.sync ? { ...s.syncPrefs, ...ui.sync } : s.syncPrefs,
     commitDescOpen: ui.commitDescOpen ?? s.commitDescOpen,
@@ -1019,6 +1033,7 @@ export function applyUiPrefs(ui: Partial<{ theme: string; uiScale: number; fileV
     uiScale: ui.uiScale ? Math.min(2, Math.max(0.6, ui.uiScale)) : s.uiScale,
     fileView: ui.fileView ?? s.fileView,
     diffMode: ui.diffMode ?? s.diffMode,
+    svgView: ui.svgView === 'text' || ui.svgView === 'image' ? ui.svgView : s.svgView,
     layout: {
       ...s.layout,
       ...(ui.sidebarWidth ? { sidebar: Math.max(170, Math.min(420, ui.sidebarWidth)) } : {}),
@@ -1396,6 +1411,40 @@ export function push(opts: PushOptions = {}) {
   );
 }
 
+/** a branch row's push button: to the branch it tracks, else the Push dialog (where it goes, and tracking it) */
+export function pushBranch(name: string) {
+  const b = activeRepo()?.refs.find((x) => x.kind === 'branch' && x.name === name);
+  if (!b?.upstream) return openDialog({ type: 'push', branch: name });
+  push({ branch: name });
+}
+/** a branch row's pull button: the current branch is pulled; another one is fast-forwarded without checking it out */
+export function pullBranch(name: string) {
+  if (live.isLiveActive()) return live.pullBranch(name);
+  toast(`Pulled into ${name} (mock)`, 'success');
+}
+/** a branch row's sync button: stash, pull, push, put the changes back (another branch: fast-forward or push) */
+export function syncBranch(name: string) {
+  if (live.isLiveActive()) return live.syncBranch(name);
+  toast(`Synced ${name} (mock)`, 'success');
+}
+/**
+ * A double click on a branch (the sidebar, a version, a commit row): the Checkout dialog with these choices. Only
+ * when there is nothing to choose and nothing to do — on the branch already, level with its counterpart or ahead of
+ * it — it says so instead.
+ */
+export function openCheckout(names: string[]) {
+  const r = activeRepo();
+  const plans = r ? names.map((n) => checkoutPlan(r.refs, n)).filter((p) => !!p) : [];
+  if (!plans.length) return;
+  if (plans.length === 1 && plans[0].current && !canIntegrate(plans[0])) return toast(`Already on ${plans[0].target}`, 'info', relationText(plans[0]) ?? undefined);
+  openDialog({ type: 'checkout', refs: plans.map((p) => p.ref) });
+}
+/** the Checkout dialog's choice */
+export function switchBranch(opts: SwitchOptions) {
+  closeDialog();
+  if (live.isLiveActive()) return void live.switchBranch(opts);
+  checkout(opts.start ?? opts.ref);
+}
 export function checkout(name: string) {
   if (live.isLiveActive()) return live.checkout(name);
   const r = activeRepo();

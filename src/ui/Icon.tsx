@@ -6,6 +6,7 @@ export type IconName =
   | 'fetch'
   | 'pull'
   | 'push'
+  | 'sync'
   | 'stash'
   | 'branch'
   | 'merge'
@@ -26,9 +27,11 @@ export type IconName =
   | 'clone'
   | 'tag'
   | 'cloud'
+  | 'cloudFill'
   | 'commit'
   | 'file'
   | 'image'
+  | 'code'
   | 'binary'
   | 'trash'
   | 'pin'
@@ -100,6 +103,14 @@ export function Icon({ name, size = 16, color, strokeWidth = 1.8 }: Props) {
           <>
             <Path {...p} d="M12 20V7M6 13l6-6 6 6" />
             <Line {...p} x1={5} y1={3} x2={19} y2={3} />
+          </>
+        );
+      case 'sync':
+        // pull, then push: an arrow down beside an arrow up
+        return (
+          <>
+            <Path {...p} d="M8 4v16M4 16l4 4 4-4" />
+            <Path {...p} d="M16 20V4M12 8l4-4 4 4" />
           </>
         );
       case 'stash':
@@ -217,6 +228,9 @@ export function Icon({ name, size = 16, color, strokeWidth = 1.8 }: Props) {
         );
       case 'cloud':
         return <Path {...p} d="M17.5 19a4.5 4.5 0 0 0 .5-9 7 7 0 0 0-13.5 2A4 4 0 0 0 6 19z" />;
+      case 'cloudFill':
+        // solid: reads on a coloured badge where the outline one blurred into it
+        return <Path {...p} fill={c} strokeWidth={1.2} d="M17.5 20a5 5 0 0 0 .6-10A7.5 7.5 0 0 0 3.6 12.3 4.3 4.3 0 0 0 6 20z" />;
       case 'commit':
         return (
           <>
@@ -238,6 +252,13 @@ export function Icon({ name, size = 16, color, strokeWidth = 1.8 }: Props) {
             <Rect {...p} x={3} y={3} width={18} height={18} rx={2} />
             <Circle {...p} cx={8.5} cy={8.5} r={1.5} />
             <Polyline {...p} points="21 15 16 10 5 21" />
+          </>
+        );
+      case 'code':
+        return (
+          <>
+            <Polyline {...p} points="16 18 22 12 16 6" />
+            <Polyline {...p} points="8 6 2 12 8 18" />
           </>
         );
       case 'binary':

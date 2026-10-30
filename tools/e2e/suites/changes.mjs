@@ -10,7 +10,7 @@
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
-import { page, check, expect, waitText, until, git, root, tmp, post, finish, text, visible, refreshUi, pageErrors, undoLabel, PNG_A, PNG_B, makeWav, SHOTS } from '../harness.mjs';
+import { page, check, expect, waitText, until, git, root, tmp, post, finish, text, visible, refreshUi, pageErrors, undoLabel, PNG_A, PNG_B, makeWav, SHOTS, base } from '../harness.mjs';
 
 // ---------- repositories of this suite ----------
 
@@ -145,6 +145,34 @@ const MERGE = conflicting('chg-merge');
 const MERGE_OURS = conflicting('chg-merge-ours');
 const ABORT = conflicting('chg-abort');
 const CHERRY = conflicting('chg-cherry');
+/** a merge with a conflict (a.txt) and a file merged in cleanly (clean.txt); local.txt is changed before it starts */
+const ABORT_ALL = repo('chg-abort-all', { 'a.txt': 'base\n', 'clean.txt': 'clean\n', 'local.txt': 'local\n' }, (d) => {
+  git(d, 'checkout', '-q', '-b', 'other');
+  write(d, 'a.txt', 'theirs\n');
+  write(d, 'clean.txt', 'clean from other\n');
+  git(d, 'commit', '-qam', 'Theirs');
+  git(d, 'checkout', '-q', 'main');
+  write(d, 'a.txt', 'ours\n');
+  git(d, 'commit', '-qam', 'Ours');
+});
+/** thousands of changed and new files (Fork discards them at once) */
+const MANY = repo('chg-many', { 'README.md': '# many\n' }, (d) => {
+  for (let i = 0; i < 3000; i++) {
+    mkdirSync(path.join(d, `assets/d${i % 30}`), { recursive: true });
+    writeFileSync(path.join(d, `assets/d${i % 30}/f${i}.txt`), `${i}\n`);
+  }
+  git(d, 'add', '-A');
+  git(d, 'commit', '-qm', 'Many files');
+  for (let i = 0; i < 3000; i++) writeFileSync(path.join(d, `assets/d${i % 30}/f${i}.txt`), `changed ${i}\n`);
+  mkdirSync(path.join(d, 'assets/new'), { recursive: true });
+  for (let i = 0; i < 500; i++) writeFileSync(path.join(d, `assets/new/n${i}.txt`), `new ${i}\n`);
+});
+/** a commit whose pre-commit hook runs for a long time: an action to stop while it runs */
+const SLOW = repo('chg-slow', { 's.txt': 's\n' }, (d) => {
+  writeFileSync(path.join(d, '.git/hooks/pre-commit'), '#!/bin/sh\nsleep 30\n', { mode: 0o755 });
+  write(d, 's.txt', 's changed\n');
+  git(d, 'add', 's.txt');
+});
 const OUTSIDE = repo('chg-outside', { 'o.txt': 'alpha\nbeta\n', 'p.txt': 'p\n' }, (d) => write(d, 'o.txt', 'alpha\nFIRST\n'));
 const LONG_NAME = 'a-really-long-file-name-that-does-not-fit-in-the-list-at-all-even-on-a-wide-screen.txt';
 const NARROW = repo('chg-narrow', { 'n.txt': 'n\n' }, (d) => {
@@ -172,6 +200,13 @@ const NAMES = repo('chg-names', { 'фото.png': PNG_A, 'заметки.txt': '
   write(d, 'фото.png', PNG_B);
   write(d, 'заметки.txt', 'раз\nтри\n');
   write(d, 'with space.txt', 'one two\n');
+});
+// SVGs: an icon with a viewBox only (its colour changed), one kept binary by .gitattributes, a new one with a size
+const STAR = (fill, more = '') => `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">\n  <path d="M12 2l3 7h7l-6 4 2 8-6-5-6 5 2-8-6-4h7z" fill="${fill}"/>\n${more}</svg>\n`;
+repo('chg-svg', { 'icons/star.svg': STAR('#000000'), 'bin.svg': STAR('#000000'), '.gitattributes': 'bin.svg binary\n' }, (d) => {
+  write(d, 'icons/star.svg', STAR('#e0302a', '  <circle cx="12" cy="12" r="2" fill="#ffffff"/>\n'));
+  write(d, 'bin.svg', STAR('#2a7de0'));
+  write(d, 'new.svg', '<svg xmlns="http://www.w3.org/2000/svg" width="40" height="20">\n  <rect width="40" height="20" fill="#3a3"/>\n</svg>\n');
 });
 const DIFFHEAD = repo('chg-diffhead', { 'h.txt': 'h\n' }, (d) => write(d, 'h.txt', 'h changed\n'));
 // submodules with edited or new files of their own (git status's "modified content" / "untracked content"), at
@@ -235,7 +270,8 @@ const lfsObjects = () => {
 
 // registered as a scan of the workspaces would, then one reload lists them all
 for (const ws of ['work', 'home']) await post('/api/scan', { path: root, depth: 1, register: true, workspace: ws });
-await page.context().grantPermissions(['clipboard-read', 'clipboard-write']);
+// WebKit (E2E_BROWSER=webkit) has no clipboard permissions: the copy checks need Chromium
+await page.context().grantPermissions(['clipboard-read', 'clipboard-write']).catch(() => {});
 await page.reload({ waitUntil: 'load' });
 // the session restores its tabs a moment after a reload
 await page.waitForTimeout(1500);
@@ -428,6 +464,62 @@ await check('names in Cyrillic and with spaces: the rows, an image compare (it c
   await waitText('one two');
   await page.getByTestId('stage-hunk').click();
   await until(() => staged(NAMES).includes('with space.txt'), 'the file with a space staged');
+  expect(pageErrors.length === 0, 'page errors: ' + pageErrors.join(' | '));
+});
+
+await check('an SVG: the picture by default, drawn at its zoomed size (sharp), its viewBox size and coordinates, the background; Text is its diff and is remembered; one kept binary is the picture alone', async () => {
+  await openChanges('chg-svg', 'file-unstaged-icons/star.svg');
+  await row('unstaged', 'icons/star.svg').click();
+  const view = page.getByTestId('svg-view');
+  await view.waitFor({ timeout: 10000 });
+  // both versions, sized from the file (an <img> says 150 or 0 for a viewBox only)
+  await page.waitForFunction(() => [...document.querySelectorAll('[data-pane] img[data-vector]')].filter((i) => i.complete && i.naturalWidth > 0).length >= 2, null, { timeout: 15000 });
+  await waitText('24×24 viewBox');
+  expect((await page.getByLabel('split', { exact: true }).count()) === 0, 'no unified / split for a picture');
+  // fitted: the 24-unit icon fills the pane, laid out at that size (no bitmap scaled by a transform)
+  const drawn = () =>
+    page.evaluate(() => {
+      const i = document.querySelector('[data-pane="BEFORE"] img[data-vector]');
+      return { w: i.getBoundingClientRect().width / (i.offsetWidth ? i.getBoundingClientRect().width / i.offsetWidth : 1), lw: i.offsetWidth, lh: i.offsetHeight, own: getComputedStyle(i).transform, parent: getComputedStyle(i.parentElement).transform, zoom: document.querySelector('[data-testid="image-zoom"]')?.textContent };
+    });
+  const fitted = await drawn();
+  expect(fitted.lw > 24 * 6 && fitted.lw === fitted.lh, 'enlarged as a vector: ' + JSON.stringify(fitted));
+  expect(fitted.own === 'none' && fitted.parent === 'none', 'not scaled by a transform: ' + JSON.stringify(fitted));
+  expect(Math.abs(fitted.lw - (24 * parseInt(fitted.zoom, 10)) / 100) <= 1, 'its layout size is the zoom: ' + JSON.stringify(fitted));
+  // 1:1 is the design size
+  await page.getByText('1:1', { exact: true }).click();
+  await until(async () => (await drawn()).lw === 24, 'the icon at 24 px');
+  await page.getByText('Fit', { exact: true }).click();
+  await until(async () => (await drawn()).lw === fitted.lw, 'fitted again');
+  // the cursor reads in the viewBox's units: the middle across, a quarter down
+  const img = await page.locator('[data-pane="BEFORE"] img[data-vector]').boundingBox();
+  await page.mouse.move(img.x + img.width / 2, img.y + img.height / 4);
+  const at = (await page.getByTestId('image-cursor').innerText()).split(',').map(parseFloat);
+  expect(Math.abs(at[0] - 12) < 0.3 && Math.abs(at[1] - 6) < 0.3, 'viewBox coordinates: ' + at.join(', '));
+  // a black sheet behind it, then the checkered one again
+  await page.getByTestId('image-bg-dark').click();
+  expect((await page.evaluate(() => getComputedStyle(document.querySelector('[data-pane] img[data-vector]')).backgroundColor)) === 'rgb(0, 0, 0)', 'black background');
+  if (SHOTS) await page.screenshot({ path: path.join(SHOTS, 'svg-image.png') });
+  await page.getByTestId('image-bg-checker').click();
+  // Text: the lines, with hunk staging and unified / split
+  await view.getByLabel('Text', { exact: true }).click();
+  await page.waitForFunction(() => document.body.innerText.includes('fill="#e0302a"'), null, { timeout: 5000 });
+  expect((await page.getByTestId('stage-hunk').count()) >= 1, 'its hunks stage');
+  expect((await page.getByLabel('split', { exact: true }).count()) === 1, 'unified / split back');
+  expect((await page.locator('[data-pane]').count()) === 0, 'no picture');
+  if (SHOTS) await page.screenshot({ path: path.join(SHOTS, 'svg-text.png') });
+  await until(async () => (await (await fetch(`${base}/api/settings`)).json()).ui?.svgView === 'text', 'the choice saved');
+  // kept binary: the picture whatever was picked, no switch
+  await row('unstaged', 'bin.svg').click();
+  await page.waitForFunction(() => document.querySelectorAll('[data-pane] img[data-vector]').length >= 2, null, { timeout: 10000 });
+  expect((await page.getByTestId('svg-view').count()) === 0, 'no Text for a binary SVG');
+  // a new one opens as text (the choice holds), and as a picture has its own size
+  await row('unstaged', 'new.svg').click();
+  await page.waitForFunction(() => document.body.innerText.includes('fill="#3a3"'), null, { timeout: 5000 });
+  await page.getByTestId('svg-view').getByLabel('Image', { exact: true }).click();
+  await waitText('40×20 px');
+  await page.waitForFunction(() => [...document.querySelectorAll('[data-pane] img[data-vector]')].some((i) => i.complete && i.naturalWidth > 0), null, { timeout: 10000 });
+  await until(async () => (await (await fetch(`${base}/api/settings`)).json()).ui?.svgView === 'image', 'back to pictures');
   expect(pageErrors.length === 0, 'page errors: ' + pageErrors.join(' | '));
 });
 
@@ -1109,6 +1201,25 @@ await check('Abort merge in the conflict bar puts everything back', async () => 
   await page.waitForFunction(() => !document.querySelector('[data-testid="conflict-bar"]'), null, { timeout: 5000 });
 });
 
+await check('Abort of a merge Prong started takes back everything: edits made while the conflicts were open go, the local change of the start stays', async () => {
+  const head = git(ABORT_ALL, 'rev-parse', 'HEAD').trim();
+  write(ABORT_ALL, 'local.txt', 'local, not committed\n');
+  await openChanges('chg-abort-all', 'file-unstaged-local.txt');
+  const r = await post('/api/repo/merge', { path: ABORT_ALL, source: 'other' });
+  expect(r.conflicts === true, 'the merge stopped on a conflict: ' + JSON.stringify(r));
+  // while it is open: the cleanly merged file edited again (git's own abort refuses then), the conflict half resolved
+  write(ABORT_ALL, 'clean.txt', 'edited during the conflict\n');
+  write(ABORT_ALL, 'a.txt', 'half resolved\n');
+  await refreshUi();
+  await page.getByTestId('conflict-bar').waitFor({ timeout: 5000 });
+  await page.getByTestId('conflict-abort').click();
+  await waitText('Aborted the merge; local changes as they were');
+  expect(git(ABORT_ALL, 'rev-parse', 'HEAD').trim() === head && !existsSync(path.join(ABORT_ALL, '.git/MERGE_HEAD')), 'back on the commit, no merge');
+  expect(read(ABORT_ALL, 'a.txt') === 'ours\n' && read(ABORT_ALL, 'clean.txt') === 'clean\n', 'the merge and the edits since gone');
+  expect(read(ABORT_ALL, 'local.txt') === 'local, not committed\n' && git(ABORT_ALL, 'status', '--porcelain').trim() === 'M local.txt', 'the local change as it was: ' + git(ABORT_ALL, 'status', '--porcelain'));
+  await page.waitForFunction(() => !document.querySelector('[data-testid="conflict-bar"]'), null, { timeout: 5000 });
+});
+
 await check('a cherry-pick conflict: the bar names it, the picked commit’s message is in the box, Abort cherry-pick works ("There is no merge to abort" before)', async () => {
   try {
     git(CHERRY, 'cherry-pick', 'other');
@@ -1295,7 +1406,7 @@ await check('a submodule change: the row’s menu opens the submodule at the com
   await waitText('core: three');
 });
 
-await check('a submodule with edited or new files of its own is listed as in Fork: what is inside, no Stage or Discard, its view names the files and opens the submodule on Changes', async () => {
+await check('a submodule with edited or new files of its own is listed as in Fork: what is inside, Discard but no Stage, its view names the files and opens the submodule on Changes', async () => {
   await openChanges('chg-subs', 'file-unstaged-libs/edited');
   await setView('list');
   const rowText = async (p) => (await row('unstaged', p).innerText()).replace(/\s+/g, ' ').trim();
@@ -1306,12 +1417,12 @@ await check('a submodule with edited or new files of its own is listed as in For
   // the sidebar's square says so too
   const said = await page.getByTestId('group-submodules').count() ? await page.getByTestId('submodule-state-libs/edited').getAttribute('aria-label').catch(() => null) : null;
   if (said !== null) expect(/own files changed \(1 changed\)/.test(said), 'the sidebar square: ' + said);
-  // hovered: no Stage or Discard (they are committed in the submodule); the menu opens it instead
+  // hovered: no Stage (they are committed in the submodule), Discard (after asking); the menu opens it first
   await row('unstaged', 'libs/edited').hover();
-  expect((await page.getByTestId('file-stage-libs/edited').count()) === 0 && (await page.getByTestId('file-discard-libs/edited').count()) === 0, 'no Stage / Discard buttons');
+  expect((await page.getByTestId('file-stage-libs/edited').count()) === 0 && (await page.getByTestId('file-discard-libs/edited').count()) === 1, 'Discard, no Stage');
   await row('unstaged', 'libs/edited').click({ button: 'right' });
   const labels = (await menuLabels()).map((l) => l.label);
-  expect(labels[0] === 'Open submodule' && !labels.includes('Stage') && !labels.some((l) => l.startsWith('Discard')), 'menu: ' + labels.join(', '));
+  expect(labels[0] === 'Open submodule' && !labels.includes('Stage') && labels.includes('Discard the changes inside…'), 'menu: ' + labels.join(', '));
   await closeMenu();
   // its view: what is inside, by name; no Stage file / Discard in the header
   await row('unstaged', 'libs/edited').click();
@@ -1336,6 +1447,71 @@ await check('a submodule with edited or new files of its own is listed as in For
   await page.getByTestId('tab-libs/fresh').waitFor({ timeout: 15000 });
   await row('unstaged', 'new.txt').waitFor({ timeout: 15000 });
   expect(staged(SUBS).length === 0, 'still nothing staged');
+});
+
+await check('Discard of a submodule at the recorded commit drops the changes inside it, after asking; Undo brings them back', async () => {
+  await openChanges('chg-subs', 'file-unstaged-libs/edited');
+  await setView('list');
+  await row('unstaged', 'libs/edited').hover();
+  await page.getByTestId('file-discard-libs/edited').click();
+  await page.getByText('Discard the changes inside libs/edited?', { exact: true }).waitFor({ timeout: 5000 });
+  // what goes, by name
+  await waitText('is at the commit recorded here: the changes in its own files are dropped (1 changed)');
+  expect(/dropped \(1 changed\)\.\s+core\.txt/.test(await page.evaluate(() => document.body.innerText)), 'the file named');
+  await page.getByTestId('confirm-ok').click();
+  await until(() => git(path.join(SUBS, 'libs/edited'), 'status', '--porcelain').trim() === '', 'clean inside');
+  await page.waitForFunction(() => !document.querySelector('[data-testid="file-unstaged-libs/edited"]'), null, { timeout: 8000 });
+  expect(read(path.join(SUBS, 'libs/edited'), 'core.txt') === 'core\n', 'its file as committed');
+  await until(async () => /Undo Discard edited/.test(await undoLabel()), 'Undo offers it: ' + (await undoLabel()));
+  await page.getByTestId('undo-button').click();
+  await until(() => read(path.join(SUBS, 'libs/edited'), 'core.txt') === 'core\nedited inside\n', 'the change is back');
+  await row('unstaged', 'libs/edited').waitFor({ timeout: 8000 });
+});
+
+await check('Discard of thousands of files: 3 000 changed and 500 new go at once (one status, files put back by name, moved aside for Undo); Undo brings them back', async () => {
+  await openChanges('chg-many', 'file-unstaged-assets/d0/f0.txt');
+  await setView('tree');
+  const t0 = Date.now();
+  await page.getByLabel('Discard all', { exact: true }).first().click();
+  await page.getByTestId('confirm-ok').click();
+  await until(() => git(MANY, 'status', '--porcelain').trim() === '', 'everything discarded', 60000);
+  await page.waitForFunction(() => !document.querySelector('[data-testid^="file-unstaged-assets/"]'), null, { timeout: 30000 });
+  const took = Date.now() - t0;
+  expect(took < 25000, `discarded in ${took} ms`);
+  await until(async () => /Undo Discard all/.test(await undoLabel()), 'Undo offers it: ' + (await undoLabel()));
+  await page.getByTestId('undo-button').click();
+  await until(() => git(MANY, 'status', '--porcelain', '-uall').trim().split('\n').length === 3500, 'all back', 60000);
+  expect(read(MANY, 'assets/d7/f7.txt') === 'changed 7\n' && read(MANY, 'assets/new/n9.txt') === 'new 9\n', 'as they were');
+  // a picked folder (its menu): thousands of paths sent, one status
+  await refreshUi();
+  // the list draws what is on screen: d0's 100 files push d1 out of it until d0 is folded
+  if (!(await page.getByTestId('folder-unstaged-assets/d1').count())) await page.getByTestId('folder-toggle-unstaged-assets/d0').click();
+  await page.getByTestId('folder-unstaged-assets/d1').waitFor({ timeout: 10000 });
+  await page.getByTestId('folder-unstaged-assets/d1').click({ button: 'right' });
+  await page.getByText(/^Discard all \d+ files inside…$/).first().click();
+  await page.getByTestId('confirm-ok').click();
+  await until(() => !git(MANY, 'status', '--porcelain').includes('assets/d1/'), 'the folder discarded', 30000);
+  expect(git(MANY, 'status', '--porcelain').includes('assets/d2/'), 'the others stay');
+});
+
+await check('an action that runs a long time (a commit whose hook sleeps) shows a stop button; Stop kills its git: no commit, no lock left, the queue empty', async () => {
+  await openChanges('chg-slow', 'file-staged-s.txt');
+  const before = git(SLOW, 'rev-parse', 'HEAD').trim();
+  const errorsBefore = pageErrors.length;
+  await summary().fill('Slow commit');
+  await commitButton().click();
+  await page.getByTestId('queue-stop').waitFor({ timeout: 10000 });
+  expect(/Commit/.test(await page.getByTestId('queue-status').innerText()), 'what runs: ' + (await page.getByTestId('queue-status').innerText()));
+  await page.getByTestId('queue-stop').click();
+  await page.getByTestId('confirm-ok').click();
+  await waitText('Commit: stopped');
+  await page.waitForFunction(() => !document.querySelector('[data-testid="queue-status"]'), null, { timeout: 10000 });
+  expect(git(SLOW, 'rev-parse', 'HEAD').trim() === before, 'no commit made');
+  expect(!existsSync(path.join(SLOW, '.git/index.lock')), 'no lock left');
+  expect(staged(SLOW).join() === 's.txt', 'still staged');
+  // the stopped commit's request ends in an error on purpose
+  await page.waitForTimeout(300);
+  for (let i = pageErrors.length - 1; i >= errorsBefore; i--) if (/status of 500/.test(pageErrors[i])) pageErrors.splice(i, 1);
 });
 
 await check('narrow window: the commit box row, the diff header and the hunk header keep their buttons apart from the text', async () => {

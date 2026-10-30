@@ -2,7 +2,7 @@ import React, { useEffect, useState } from 'react';
 import { Animated, Easing, ScrollView, StyleSheet, View } from 'react-native';
 import type { QueueItem } from '../git/types';
 import { cancelOperation, dismissToast, showErrors, useRepo, useStore } from '../state/store';
-import { cancelQueued, continueOp, mergeAbort, rebaseAbort, removeStaleLock, undoLast } from '../state/live';
+import { abortOp, cancelQueued, continueOp, removeStaleLock, stopQueued, undoLast } from '../state/live';
 import { FONT, useTheme } from '../theme';
 import { Icon } from '../ui/Icon';
 import { Button, PressScale, Spinner, Txt, useKeyboard } from '../ui/primitives';
@@ -54,6 +54,7 @@ export function StatusPanel({ welcome }: { welcome?: boolean }) {
   // a long operation already has its progress here: its queue entry is not shown twice
   const queued = queue.filter((i) => !(i.state === 'running' && i.label === op?.label));
   const waiting = queued.find((i) => i.state === 'waiting-lock');
+  const running = queued.find((i) => i.state === 'running');
   const showQueue = queued.length > 0 && (!!waiting || queued.length > 1 || now - queued[0].since > SLOW_MS);
   // a long operation that waits for another git's lock says so (it used to sit at "0%" with no reason given)
   const opWaiting = op ? queue.find((i) => i.state === 'waiting-lock') : undefined;
@@ -173,7 +174,7 @@ export function StatusPanel({ welcome }: { welcome?: boolean }) {
             </Txt>
             {/* a merge goes on with a commit in Changes; a rebase, cherry-pick or revert with Continue */}
             {inOp !== 'merge' && <Button small label="Continue" primary style={{ marginLeft: 6, height: 18, flexShrink: 0 }} onPress={continueOp} testID="op-continue" />}
-            <Button small label="Abort" style={{ marginLeft: 4, height: 18, flexShrink: 0 }} onPress={inOp === 'rebase' ? rebaseAbort : mergeAbort} testID="op-abort" />
+            <Button small label="Abort" style={{ marginLeft: 4, height: 18, flexShrink: 0 }} onPress={() => abortOp()} testID="op-abort" />
           </>
         )}
       </View>
@@ -186,6 +187,12 @@ export function StatusPanel({ welcome }: { welcome?: boolean }) {
         {body}
         {op && (
           <PressScale onPress={cancelOperation} scaleTo={0.9} style={{ marginLeft: 6, padding: 2 }} hoverStyle={{ backgroundColor: t.hover }} label={`Stop ${op.label}`} testID="activity-stop">
+            <Icon name="x" size={11} />
+          </PressScale>
+        )}
+        {/* an action of the queue that takes a while (a checkout, a merge, a large discard): it can be stopped too */}
+        {!op && showQueue && running && (
+          <PressScale onPress={() => stopQueued(running.id, running.label)} scaleTo={0.9} style={{ marginLeft: 6, padding: 2 }} hoverStyle={{ backgroundColor: t.hover }} label={`Stop ${running.label}`} testID="queue-stop">
             <Icon name="x" size={11} />
           </PressScale>
         )}
@@ -265,9 +272,13 @@ function QueueList({ items, repoPath, now }: { items: QueueItem[]; repoPath: str
               <Txt size={FONT.xs} faint style={{ marginLeft: 8 }}>
                 {i.state === 'running' ? `running · ${ago(now - i.since)}` : i.state === 'queued' ? 'next in line' : `waiting · ${ago(now - i.since)}`}
               </Txt>
-              {i.state !== 'running' && (
+              {i.state !== 'running' ? (
                 <PressScale onPress={() => cancelQueued(i.id)} scaleTo={0.9} style={{ marginLeft: 6, padding: 2 }} hoverStyle={{ backgroundColor: t.hover }} label={`Cancel ${i.label}`} testID={`queue-cancel-${i.id}`}>
                   <Icon name="x" size={11} />
+                </PressScale>
+              ) : (
+                <PressScale onPress={() => stopQueued(i.id, i.label)} scaleTo={0.9} style={{ marginLeft: 6, padding: 2 }} hoverStyle={{ backgroundColor: t.hover }} label={`Stop ${i.label}`} testID={`queue-stop-${i.id}`}>
+                  <Icon name="stop" size={11} />
                 </PressScale>
               )}
             </View>

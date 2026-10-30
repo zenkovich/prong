@@ -9,6 +9,8 @@ import { createWriteStream, rmSync } from 'node:fs';
  */
 const stopSignal = new AsyncLocalStorage<AbortSignal>();
 export const withStop = <T>(signal: AbortSignal, fn: () => Promise<T>): Promise<T> => stopSignal.run(signal, fn);
+/** the running work was stopped: long loops of its own (moving thousands of files) end there */
+export const stopRequested = () => !!stopSignal.getStore()?.aborted;
 /** what a stopped git rejects with */
 export class StoppedError extends Error {
   constructor() {

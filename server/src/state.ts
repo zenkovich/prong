@@ -54,6 +54,8 @@ export interface UiSettings {
   uiScale: number;
   fileView: 'list' | 'tree';
   diffMode: 'unified' | 'split';
+  /** an SVG's change shown as a picture or as its text diff */
+  svgView: 'image' | 'text';
   sidebarWidth: number;
   submoduleView: 'list' | 'tree';
   /** what the commit button does: commit, or commit and push */
@@ -68,7 +70,7 @@ export interface UiSettings {
   detailsRatio: number;
 }
 
-export const DEFAULT_UI: UiSettings = { theme: 'amber', uiScale: 1, fileView: 'tree', diffMode: 'unified', sidebarWidth: 230, submoduleView: 'tree', commitAction: 'commit', commitBoxHeight: 170, commitDescOpen: true, detailsHeaderHeight: 130, detailsDescOpen: true, detailsRatio: 0.46 };
+export const DEFAULT_UI: UiSettings = { theme: 'amber', uiScale: 1, fileView: 'tree', diffMode: 'unified', svgView: 'image', sidebarWidth: 230, submoduleView: 'tree', commitAction: 'commit', commitBoxHeight: 170, commitDescOpen: true, detailsHeaderHeight: 130, detailsDescOpen: true, detailsRatio: 0.46 };
 
 export const DEFAULT_SETTINGS: Settings = {
   editor: 'Visual Studio Code',

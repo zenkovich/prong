@@ -2,7 +2,7 @@ import React, { memo, useEffect, useMemo, useState } from 'react';
 import { Platform, Pressable, ScrollView, StyleSheet, View } from 'react-native';
 import * as live from '../state/live';
 import { DiffLine, FileChange, Hunk } from '../git/types';
-import { discardFile, discardHunk, discardLines, loadLarge, markResolved, relTime, resolveConflict, revealCommit, setDiffMode, setSection, stageFile, stageHunk, stageLines, toast, toggleHunk, unstageFile, unstageHunk, unstageLines, useRepo } from '../state/store';
+import { discardFile, discardHunk, discardLines, loadLarge, markResolved, relTime, resolveConflict, revealCommit, setDiffMode, setSection, setSvgView, stageFile, stageHunk, stageLines, toast, toggleHunk, unstageFile, unstageHunk, unstageLines, useRepo, useStore } from '../state/store';
 import { FONT, useTheme } from '../theme';
 import { Icon } from '../ui/Icon';
 import { Badge, Button, Chevron, FadeIn, PressScale, Segmented, Txt, useKeyboard, webCursor } from '../ui/primitives';
@@ -11,6 +11,7 @@ import { langOf, LangDef, tokenize, TokenKind } from './highlight';
 import { lineRange } from '../git/lineStaging';
 import { coversWholeFile } from '../git/diffContext';
 import { MediaPreview } from './media/MediaPreview';
+import { svgViewOf } from './media/mediaMath';
 import { ErrorBoundary } from '../ui/ErrorBoundary';
 
 const isMedia = (f: FileChange) => f.kind === 'image' || f.kind === 'audio' || f.kind === 'video' || f.kind === 'binary';
@@ -45,6 +46,7 @@ function jumpHunk(dir: 1 | -1) {
 export function DiffView({ file, editable, area }: { file: FileChange | null; editable: boolean; area: 'unstaged' | 'staged' | 'commit' | 'stash' }) {
   const t = useTheme();
   const repo = useRepo();
+  const svgPref = useStore((s) => s.svgView);
   useKeyboard((e) => {
     if ((e.key !== 'F7' && e.key !== 'F8') || e.meta) return;
     const target = e.target as HTMLElement | null;
@@ -64,6 +66,7 @@ export function DiffView({ file, editable, area }: { file: FileChange | null; ed
     );
   }
   const isUnstaged = area === 'unstaged';
+  const svg = svgViewOf(file, svgPref);
   return (
     <View style={{ flex: 1, backgroundColor: t.panel }}>
       <View style={[styles.header, { borderColor: t.border, backgroundColor: t.panelAlt }]} testID="diff-header">
@@ -78,16 +81,29 @@ export function DiffView({ file, editable, area }: { file: FileChange | null; ed
             {file.similarity}% similar
           </Txt>
         ) : null}
+        {/* next to the name, so it stays in place when the switch hides the unified / split one */}
+        {svg.hasText && (
+          <View style={{ marginLeft: 10 }} testID="svg-view">
+            <Segmented
+              value={svg.asImage ? 'image' : 'text'}
+              onChange={setSvgView}
+              options={[
+                { value: 'image', icon: 'image', label: 'Image' },
+                { value: 'text', icon: 'code', label: 'Text' },
+              ]}
+            />
+          </View>
+        )}
         <View style={{ flex: 1 }} />
         {file.kind === 'text' && !file.conflict && file.status !== 'U' && (
           <>
             <Txt size={FONT.xs} color={t.add} mono>
               +{file.additions}
             </Txt>
-            <Txt size={FONT.xs} color={t.del} mono style={{ marginLeft: 6, marginRight: 10 }}>
+            <Txt size={FONT.xs} color={t.del} mono style={{ marginLeft: 6, marginRight: svg.asImage ? 0 : 10 }}>
               −{file.deletions}
             </Txt>
-            <Segmented value={repo.diffMode} onChange={setDiffMode} options={[{ value: 'unified', icon: 'rows' }, { value: 'split', icon: 'columns' }]} />
+            {!svg.asImage && <Segmented value={repo.diffMode} onChange={setDiffMode} options={[{ value: 'unified', icon: 'rows' }, { value: 'split', icon: 'columns' }]} />}
           </>
         )}
         {/* a conflicted file is resolved in its view below (sides, Mark resolved); a submodule's own files are
@@ -105,10 +121,10 @@ export function DiffView({ file, editable, area }: { file: FileChange | null; ed
           </View>
         )}
       </View>
-      <FadeIn keyProp={file.path + area} slide={4} style={{ flex: 1 }}>
+      <FadeIn keyProp={file.path + area + (svg.asImage ? ':image' : '')} slide={4} style={{ flex: 1 }}>
         <ErrorBoundary key={`${area}:${file.path}`} name="Preview" inline>
-          {isMedia(file) && !file.conflict ? (
-            <MediaPreview file={file} area={area} rev={area === 'commit' ? repo.selectedCommit ?? '' : area === 'stash' ? `stash@{${repo.selectedStash ?? 0}}` : area} />
+          {(isMedia(file) || svg.asImage) && !file.conflict ? (
+            <MediaPreview file={file} area={area} rev={area === 'commit' ? repo.selectedCommit ?? '' : area === 'stash' ? `stash@{${repo.selectedStash ?? 0}}` : area} as={svg.asImage ? 'image' : undefined} />
           ) : (
             <ScrollView style={{ flex: 1 }} contentContainerStyle={{ paddingBottom: 24 }} testID="diff-body">
               <Body file={file} editable={editable} isUnstaged={isUnstaged} working={area === 'unstaged' || area === 'staged'} />
@@ -292,10 +308,11 @@ function InsideDiff({ file }: { file: FileChange }) {
           {file.path}
         </Txt>
         <View style={{ flex: 1, minWidth: 12 }} />
-        <Button small primary label={`Open ${name}`} icon="layers" onPress={() => open()} testID="submodule-inside-open" />
+        <Button small label="Discard…" icon="undo" onPress={() => discardFile(file.path)} testID="submodule-inside-discard" />
+        <Button small primary label={`Open ${name}`} icon="layers" style={{ marginLeft: 6 }} onPress={() => open()} testID="submodule-inside-open" />
       </View>
       <Txt size={FONT.sm} muted style={{ marginTop: 8 }}>
-        {name} is at the commit this project records; its own files have changes ({insideText(c)}). They are committed in the submodule, and its new commit then shows here, to stage.
+        {name} is at the commit this project records; its own files have changes ({insideText(c)}). They are committed in the submodule, and its new commit then shows here, to stage; Discard drops them (Undo brings them back).
       </Txt>
       <InsideFiles inside={c} onOpen={open} title="In the submodule" />
     </View>

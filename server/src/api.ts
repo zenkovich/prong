@@ -5,10 +5,10 @@ import path from 'node:path';
 import { LfsNotDownloaded, type LfsPick, lfsPatterns, mimeOf, Repo, RebaseTodoItem, safeRelPath, WORKTREE } from './git/repo.js';
 import { accountAuth, hostOwner, NetAuth, RepoAuth, resolveAuth, sshAuth, sshDir, validKeyPath } from './auth.js';
 import { allQueues, cancelQueued, LOCK_FILES, onQueueChange, QueueItem, queueFor } from './queue.js';
-import { restoreFromUndo, saveForUndo } from './undo.js';
+import { discardWithUndo, restoreFromUndo, saveForUndo } from './undo.js';
 import { serveFile } from './http-file.js';
 import { systemFileIcon } from './fileicons.js';
-import { progressOf, runGit, withStop } from './git/run.js';
+import { progressOf, runGit, StoppedError, withStop } from './git/run.js';
 import { scanRepos } from './scan.js';
 import { loadSession, loadSettings, loadWorkspaces, readJson as readState, saveSession, saveSettings, saveWorkspaces, writeJson, Workspace } from './state.js';
 import { addKeyToAgent, deleteSecret, generateSshKey, getSecret, listSshKeys, openTerminal, openWith, reveal, setSecret, testSsh, which } from './system.js';
@@ -151,12 +151,14 @@ async function asAccount<T>(acc: TokenAccount, call: (token: string) => Promise<
 const UNQUEUED = new Set([
   'snapshot', 'snapshotCached', 'status', 'log', 'commitFiles', 'commitFileDiff', 'logUntil', 'logPosition', 'stashFiles', 'fileDiff', 'mediaSides', 'blobFile', 'blame', 'lfsFiles', 'lfsRestore', 'lfsDownload',
   'config', 'globalConfig', 'logPage', 'logFile', 'searchLog', 'fileAt', 'submodules', 'submoduleChanges', 'submoduleCommits', 'submoduleRange', 'changedSubmodules', 'authInfo', 'setAuth', 'testAuth',
-  'fetch', 'unshallow', 'followAllBranches', 'pull', 'push', 'pushTag', 'submoduleUpdate', 'pushBranches', 'removeLock',
+  'fetch', 'unshallow', 'followAllBranches', 'pull', 'push', 'pullBranch', 'syncBranch', 'pushTag', 'submoduleUpdate', 'pushBranches', 'removeLock',
 ]);
 /** a list of strings from a request (anything else in it is dropped), at most `max` */
 const strings = (v: unknown, max = 200_000): string[] => (Array.isArray(v) ? v.filter((x): x is string => typeof x === 'string').slice(0, max) : []);
 /** what the queue shows for an operation: "Checkout ver/925", "Stage hunk" */
 function opLabel(op: string, b: any): string {
+  // the Checkout dialog's switch reads as the checkout it is
+  if (op === 'switchBranch') return `Checkout ${String(b?.ref ?? '')}`;
   const words = op.replace(/([A-Z])/g, ' $1').toLowerCase();
   const what = b?.ref ?? b?.name ?? b?.branch ?? (Array.isArray(b?.paths) && b.paths.length === 1 ? b.paths[0] : Array.isArray(b?.paths) ? `${b.paths.length} files` : Array.isArray(b?.names) ? `${b.names.length} branches` : '');
   return `${words[0].toUpperCase()}${words.slice(1)}${what ? ` ${String(what)}` : ''}`;
@@ -236,11 +238,12 @@ export function createApi(opts: { log?: (s: string) => void } = {}) {
     const ctl = new AbortController();
     running.set(opId, ctl);
     emit({ opId, label, progress: 0 });
-    // Stop kills the git processes of the work (runGit reads the signal from withStop), or takes it out of the queue
-    const work = () => withStop(ctl.signal, () => fn((line, p) => emit({ opId, label, line, progress: p }), ctl.signal));
-    (dir ? queueFor(dir).run(label, work, ctl.signal) : work())
+    // Stop kills the git processes of the work (runGit reads the signal from withStop), or takes it out of the queue;
+    // queued, the queue's own Stop (its list) stops it too
+    const work = (signal: AbortSignal) => withStop(signal, () => fn((line, p) => emit({ opId, label, line, progress: p }), signal));
+    (dir ? queueFor(dir).run(label, work, ctl.signal) : work(ctl.signal))
       .then(() => emit({ opId, label, done: true, progress: 1 }))
-      .catch((err: Error) => emit({ opId, label, done: true, error: ctl.signal.aborted ? 'Stopped' : err.message }))
+      .catch((err: Error) => emit({ opId, label, done: true, error: ctl.signal.aborted || err instanceof StoppedError ? 'Stopped' : err.message }))
       .finally(() => running.delete(opId));
     return { opId };
   };
@@ -357,18 +360,15 @@ export function createApi(opts: { log?: (s: string) => void } = {}) {
     stageAll: async (b) => repoOf(b).stageAll(),
     unstage: async (b) => repoOf(b).unstage(b.paths),
     unstageAll: async (b) => repoOf(b).unstageAll(),
-    // discarding keeps copies first: the result's `undo` token puts the files back (undoDiscard)
+    // discarding keeps what it drops first (moved aside): the result's `undo` token puts it back (undoDiscard)
     discard: async (b) => {
       const r = repoOf(b);
-      const undo = await saveForUndo(r, b.paths);
-      const { kept } = await r.discard(b.paths);
-      return { undo, kept };
+      return discardWithUndo(r, await r.discardPlan(strings(b.paths)));
     },
     discardAll: async (b) => {
       const r = repoOf(b);
-      const undo = await saveForUndo(r, null);
-      await r.discardAll();
-      return { undo };
+      const { undo, tooLarge } = await discardWithUndo(r, await r.discardPlan(null));
+      return { undo, tooLarge };
     },
     undoDiscard: async (b) => restoreFromUndo(repoOf(b), String(b.token ?? '')),
     stageHunk: async (b) => repoOf(b).stageHunk(b.file as FileChange, b.hunk as Hunk),
@@ -403,6 +403,15 @@ export function createApi(opts: { log?: (s: string) => void } = {}) {
       return { removed: true };
     },
     createBranch: async (b) => repoOf(b).createBranch(b.name, b.start ?? 'HEAD', !!b.checkout),
+    /** the Checkout dialog: switch (or create a tracking branch), stash around it, merge or rebase on the way */
+    switchBranch: async (b) =>
+      repoOf(b).switchBranch({
+        ref: refNames([b.ref])[0],
+        start: b.start ? refNames([b.start])[0] : undefined,
+        stash: !!b.stash,
+        untracked: !!b.untracked,
+        integrate: b.integrate ? { mode: b.integrate.mode === 'rebase' ? 'rebase' : 'merge', from: refNames([b.integrate.from])[0] } : undefined,
+      }),
     deleteBranch: async (b) => repoOf(b).deleteBranch(b.name, !!b.force, b.remote),
     deleteRemoteBranch: async (b) => repoOf(b).deleteRemoteBranch(String(b.remote), String(b.branch)),
     deleteBranches: async (b) => repoOf(b).deleteBranches(refNames(b.names), !!b.force, !!b.withRemote),
@@ -420,16 +429,40 @@ export function createApi(opts: { log?: (s: string) => void } = {}) {
     setUpstream: async (b) => repoOf(b).setUpstream(b.branch, b.upstream),
     createTag: async (b) => repoOf(b).createTag(b.name, b.sha ?? 'HEAD', b.message),
     deleteTag: async (b) => repoOf(b).deleteTag(b.name),
-    merge: async (b) => repoOf(b).merge(b.source, { noFf: !!b.noFf, squash: !!b.squash }),
-    rebase: async (b) => repoOf(b).rebase(refNames([b.onto])[0], { preserveMerges: !!b.preserveMerges, autostash: !!b.autostash }),
-    rebaseInteractive: async (b) => repoOf(b).rebaseInteractive(refNames([b.onto])[0], b.todo as RebaseTodoItem[], { autostash: !!b.autostash }),
+    // what may stop on conflicts notes where it started: its Abort goes back exactly there (Repo.withRollback)
+    merge: async (b) => {
+      const r = repoOf(b);
+      return r.withRollback(() => r.merge(b.source, { noFf: !!b.noFf, squash: !!b.squash }));
+    },
+    rebase: async (b) => {
+      const r = repoOf(b);
+      return r.withRollback(() => r.rebase(refNames([b.onto])[0], { preserveMerges: !!b.preserveMerges, autostash: !!b.autostash }));
+    },
+    rebaseInteractive: async (b) => {
+      const r = repoOf(b);
+      return r.withRollback(() => r.rebaseInteractive(refNames([b.onto])[0], b.todo as RebaseTodoItem[], { autostash: !!b.autostash }));
+    },
     rebaseContinue: async (b) => repoOf(b).rebaseContinue(),
-    rebaseAbort: async (b) => repoOf(b).rebaseAbort(),
-    mergeAbort: async (b) => repoOf(b).mergeAbort(),
+    rebaseAbort: async (b) => repoOf(b).abortOp(),
+    mergeAbort: async (b) => repoOf(b).abortOp(),
+    /** whichever is in progress, back to where it started (`force`: also when git refuses and Prong did not note the start) */
+    abortOp: async (b) => repoOf(b).abortOp({ force: !!b.force }),
     // whichever of merge, rebase, cherry-pick and revert is in progress
-    continueOp: async (b) => repoOf(b).continueOp(),
-    cherryPick: async (b) => repoOf(b).cherryPick(commitId(b.sha)),
-    revert: async (b) => repoOf(b).revert(commitId(b.sha)),
+    continueOp: async (b) => {
+      const r = repoOf(b);
+      const res = await r.continueOp();
+      // finished: the changes set aside for it come back
+      const settled = res.conflicts ? null : await r.settleRollback();
+      return { ...res, settled };
+    },
+    cherryPick: async (b) => {
+      const r = repoOf(b);
+      return r.withRollback(() => r.cherryPick(commitId(b.sha)));
+    },
+    revert: async (b) => {
+      const r = repoOf(b);
+      return r.withRollback(() => r.revert(commitId(b.sha)));
+    },
     reset: async (b) => {
       const mode = ['soft', 'mixed', 'hard', 'keep'].includes(b.mode) ? b.mode : 'mixed';
       if (!/^[0-9a-f]{4,64}$/.test(String(b.sha)) && !/^HEAD[~^]?\d*$/.test(String(b.sha))) throw new HttpError(400, 'bad commit');
@@ -569,7 +602,7 @@ export function createApi(opts: { log?: (s: string) => void } = {}) {
       const strategy = b.strategy === 'rebase' || b.strategy === 'ff' ? b.strategy : 'merge';
       const remote = b.remote ? remoteName(b.remote) : undefined;
       const branch = remote && b.branch ? refNames([b.branch])[0] : undefined;
-      return longOp(`Pulling${branch ? ` ${remote}/${branch}` : ''} (${strategy})`, (p) => r.pull(strategy, p, { remote, branch, autostash: !!b.autostash, tags: !!b.tags }), r.dir);
+      return longOp(`Pulling${branch ? ` ${remote}/${branch}` : ''} (${strategy})`, (p) => r.withRollback(() => r.pull(strategy, p, { remote, branch, autostash: !!b.autostash, tags: !!b.tags })), r.dir);
     },
     push: async (b) => {
       const r = repoOf(b);
@@ -578,6 +611,19 @@ export function createApi(opts: { log?: (s: string) => void } = {}) {
       const remoteBranch = b.remoteBranch ? refNames([b.remoteBranch])[0] : undefined;
       const to = remote && branch ? ` to ${remote}/${remoteBranch ?? branch}` : '';
       return longOp(`Pushing ${branch ?? 'current branch'}${to}`, (p) => r.push({ remote, branch, remoteBranch, force: !!b.force, tags: !!b.tags, setUpstream: !!b.setUpstream }, p), r.dir);
+    },
+    /** a branch that is not checked out, fast-forwarded to the branch it tracks */
+    pullBranch: async (b) => {
+      const r = repoOf(b);
+      const branch = refNames([b.branch])[0];
+      return longOp(`Pulling into ${branch}`, (p) => r.fastForwardBranch(branch, p), r.dir);
+    },
+    /** stash, pull, push, put the changes back (the current branch); fast-forward or push (another one) */
+    syncBranch: async (b) => {
+      const r = repoOf(b);
+      const branch = refNames([b.branch])[0];
+      const strategy = b.strategy === 'rebase' || b.strategy === 'ff' ? b.strategy : 'merge';
+      return longOp(`Syncing ${branch}`, (p) => r.syncBranch(branch, strategy, p), r.dir);
     },
   };
 
@@ -658,7 +704,9 @@ export function createApi(opts: { log?: (s: string) => void } = {}) {
           throw e instanceof LfsNotDownloaded ? new HttpError(404, e.message) : e;
         });
         if (!blob) throw new HttpError(404, `${file} does not exist at ${rev}`);
-        serveFile(req, res, blob.path, mimeOf(file));
+        // a repository's file, not Prong's: opened by itself (an SVG with a script) it runs in a sandbox of its own,
+        // never as a page of the engine (an <img> runs no scripts either way)
+        serveFile(req, res, blob.path, mimeOf(file), { 'content-security-policy': 'sandbox', 'x-content-type-options': 'nosniff' });
         return;
       }
       if (req.method === 'GET' && url.pathname === '/api/fileicon') {

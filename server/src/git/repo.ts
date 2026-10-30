@@ -3,11 +3,36 @@ import { createHash } from 'node:crypto';
 import { homedir, tmpdir } from 'node:os';
 import path from 'node:path';
 import type { Commit, FileChange, FileStatus, Hunk, RepoSnapshot, Sha, Stash, SubmoduleChanges } from '../types.js';
-import { hunkPatch, joinSubmoduleChanges, kindOf, LFS_POINTER_MAX, type LfsPointer, LOG_FORMAT, parseLfsPointer, parseDiff, parseLog, parseNumstat, parseRaw, parseRefs, parseRemotes, parseStashList, parseStatus, REC, REF_FORMAT, STASH_FORMAT } from './parse.js';
+import { binaryKindOf, hunkPatch, joinSubmoduleChanges, kindOf, LFS_POINTER_MAX, type LfsPointer, LOG_FORMAT, parseLfsPointer, parseDiff, parseLog, parseNumstat, parseRaw, parseRefs, parseRemotes, parseStashList, parseStatus, REC, REF_FORMAT, STASH_FORMAT } from './parse.js';
 import { inRuns, progressOf, runGit, runGitLines, runGitToFile, RunOptions, withoutProgress } from './run.js';
 import type { NetAuth } from '../auth.js';
 
 export type Progress = (line: string, progress: number | null) => void;
+/** where an operation that may stop on conflicts started (Repo.withRollback), for its Abort */
+interface Rollback {
+  head: string;
+  branch: string | null;
+  /** the local changes of that moment (`git stash create`), when there were any */
+  snapshot: string | null;
+  /** the message of the stash Prong set the local changes aside in (Sync, Checkout) */
+  stash: string | null;
+  at: number;
+}
+/** up to this many paths a status asks about them by name; more, and the whole status is read and filtered */
+const FEW_PATHS = 200;
+/** what a discard does (Repo.discardPlan), and what Undo copies aside first */
+export interface DiscardPlan {
+  /** tracked files whose working-tree change goes: put back from the index */
+  restore: string[];
+  /** those of them deleted on disk (Undo deletes them again) */
+  absent: string[];
+  /** untracked files and folders: deleted */
+  remove: string[];
+  /** repositories of their own inside, listed as untracked folders: left alone */
+  nested: string[];
+  /** submodules picked: back to the recorded commit, or at it, their own changes dropped (`inner`) */
+  submodules: { path: string; recorded: string; head: string; branch: string | null; inner: DiscardPlan | null }[];
+}
 
 export interface RebaseTodoItem {
   sha: Sha;
@@ -80,7 +105,7 @@ function countUntrackedLines(dir: string, list: FileChange[]) {
       if (untrackedCounts.size > 50_000) untrackedCounts.clear();
       untrackedCounts.set(abs, c);
     }
-    if (c.binary) f.kind = 'binary';
+    if (c.binary) f.kind = binaryKindOf(f.path);
     else f.additions = c.lines;
   }
 }
@@ -363,7 +388,7 @@ export class Repo {
       f.additions = c.additions;
       f.deletions = c.deletions;
       // a binary file named like text (data.bin, a .asset): no "+0 −0", its diff is the binary preview
-      if (c.binary && f.kind === 'text') f.kind = 'binary';
+      if (c.binary && f.kind === 'text') f.kind = binaryKindOf(f.path);
     };
     await joined;
     for (const f of st.unstaged) put(f, unMap.get(f.path));
@@ -396,6 +421,11 @@ export class Repo {
     return pending;
   }
 
+  /** the submodules' own files were changed by Prong (a discard, its undo): the next status reads them again */
+  forgetSubmoduleChanges() {
+    const c = insideCache.get(this.dir);
+    if (c) c.at = 0;
+  }
   /** the last read of submoduleChanges, without reading (none yet: none) */
   knownSubmoduleChanges(): SubmoduleChanges[] {
     return insideCache.get(this.dir)?.list ?? [];
@@ -499,8 +529,8 @@ export class Repo {
     return r.stdout.trim() === 'true';
   }
 
-  async opState(): Promise<OpState> {
-    // a submodule's (or a worktree's) .git is a file naming the real folder: a conflict there is shown too
+  /** the repository's git folder: a submodule's (or a worktree's) .git is a file naming the real one */
+  gitDirPath(): string {
     let g = path.join(this.dir, '.git');
     try {
       if (statSync(g).isFile()) {
@@ -510,6 +540,11 @@ export class Repo {
     } catch {
       /* not a repository: nothing in progress */
     }
+    return g;
+  }
+  async opState(): Promise<OpState> {
+    // a conflict in a submodule (or a worktree) is shown too
+    const g = this.gitDirPath();
     if (existsSync(path.join(g, 'rebase-merge')) || existsSync(path.join(g, 'rebase-apply'))) return { kind: 'rebase' };
     const message = () => {
       try {
@@ -1188,47 +1223,115 @@ export class Repo {
     await this.git(['reset', '-q']);
   }
   /** `kept`: repositories of their own among the paths, left alone */
-  async discard(paths: string[]): Promise<{ kept: string[] }> {
-    // which are untracked (deleted from disk) and which git puts back: one status per run, not one per file
-    const untracked = new Set<string>();
-    for (const run of inRuns(paths)) {
-      const st = await this.git(['status', '--porcelain=v1', '-z', '--', ...run]);
-      for (const e of st.stdout.split('\0')) if (e.startsWith('?? ')) untracked.add(e.slice(3));
+  /**
+   * What discarding `paths` (every unstaged change when null) touches, read from one `git status`. A few paths are
+   * asked about by name; thousands are not: git matches every file of the index against every pathspec, so 12 000
+   * paths in a repository of 60 000 files took 9 s per status (Fork-like speed needs the whole status, 0.3 s, and a
+   * set lookup). A folder picked ("dir/") takes what is under it; a file picked inside an untracked folder git lists
+   * as one ("new/") is that file.
+   */
+  async discardPlan(paths: string[] | null): Promise<DiscardPlan> {
+    const args = ['status', '--porcelain=v1', '-z', '--untracked-files=normal', '--ignore-submodules=all', '--no-renames'];
+    let out = '';
+    if (paths && paths.length <= FEW_PATHS) for (const run of inRuns(paths)) out += (await this.git(['--literal-pathspecs', ...args, '--', ...run])).stdout;
+    else out = (await this.git(args)).stdout;
+    const picked = paths ? new Set(paths) : null;
+    const isPicked = (p: string) => {
+      if (!picked || picked.has(p)) return true;
+      for (let i = p.indexOf('/'); i !== -1 && i < p.length - 1; i = p.indexOf('/', i + 1)) if (picked.has(p.slice(0, i + 1))) return true;
+      return false;
+    };
+    const sorted = paths ? [...paths].sort() : [];
+    /** the picked paths inside a folder (binary search: the picked list is sorted) */
+    const inside = (dir: string) => {
+      let lo = 0;
+      let hi = sorted.length;
+      while (lo < hi) {
+        const mid = (lo + hi) >> 1;
+        if (sorted[mid] < dir) lo = mid + 1;
+        else hi = mid;
+      }
+      const found: string[] = [];
+      for (let i = lo; i < sorted.length && sorted[i].startsWith(dir); i++) found.push(sorted[i]);
+      return found;
+    };
+    const plan: DiscardPlan = { restore: [], absent: [], remove: [], nested: [], submodules: [] };
+    const untracked: string[] = [];
+    for (const e of out.split('\0')) {
+      if (e.length < 4) continue;
+      const xy = e.slice(0, 2);
+      const rel = e.slice(3);
+      if (xy === '??') {
+        if (isPicked(rel)) untracked.push(rel);
+        else if (rel.endsWith('/')) untracked.push(...inside(rel));
+        continue;
+      }
+      // only staged (nothing in the working tree to drop), or in conflict (resolved as ours / theirs instead)
+      if (xy[1] === ' ' || xy === '!!' || xy.includes('U') || xy === 'AA' || xy === 'DD' || !isPicked(rel)) continue;
+      plan.restore.push(rel);
+      if (xy[1] === 'D') plan.absent.push(rel);
     }
-    // status may name an untracked folder ("dir/") for a path inside it, or the files of a folder named "dir/"
-    // (status.showUntrackedFiles=all)
-    const dirs = [...untracked].filter((u) => u.endsWith('/'));
-    const isUntracked = (p: string) => untracked.has(p) || dirs.some((d) => p.startsWith(d)) || (p.endsWith('/') && [...untracked].some((u) => u.startsWith(p)));
-    const tracked: string[] = [];
     // a repository of its own inside (git lists it as "dir/"): its history is not a change to drop, and the copy for
     // Undo cannot hold its .git — left alone, as `git clean` leaves it
-    const nested: string[] = [];
+    for (const u of new Set(untracked)) (existsSync(path.join(this.dir, u.replace(/\/+$/, ''), '.git')) ? plan.nested : plan.remove).push(u);
+    if (picked) plan.submodules = await this.submodulePlans([...picked].map((p) => p.replace(/\/+$/, '')));
+    return plan;
+  }
+  /**
+   * The submodules among `paths`: one whose commit is not the one recorded here goes back to it (as `git submodule
+   * update` leaves it, detached); one at the recorded commit has its own changes dropped (its files put back,
+   * new ones deleted), read and done inside it as for this repository.
+   */
+  private async submodulePlans(paths: string[]): Promise<DiscardPlan['submodules']> {
+    if (!existsSync(path.join(this.dir, '.gitmodules'))) return [];
+    const listed = (await this.git(['config', '-f', '.gitmodules', '--get-regexp', '^submodule\\..*\\.path$'], { allowFail: true })).stdout;
+    const subs = new Set(listed.split('\n').map((l) => l.slice(l.indexOf(' ') + 1).trim()).filter(Boolean));
+    const out: DiscardPlan['submodules'] = [];
     for (const p of paths) {
-      if (!isUntracked(p)) {
-        tracked.push(p);
-        continue;
-      }
-      if (existsSync(path.join(this.dir, p.replace(/\/+$/, ''), '.git'))) {
-        nested.push(p);
-        continue;
-      }
-      rmSync(path.join(this.dir, p), { recursive: true, force: true });
-      // the files of a new folder go one by one: the folders they leave empty go too
-      for (let d = path.dirname(path.join(this.dir, p.replace(/\/+$/, ''))); d.startsWith(this.dir + path.sep); d = path.dirname(d)) {
-        try {
-          if (readdirSync(d).length) break;
-          rmdirSync(d);
-        } catch {
-          break;
-        }
+      if (!subs.has(p) || !existsSync(path.join(this.dir, p, '.git'))) continue;
+      const recorded = (await this.git(['rev-parse', '--verify', '-q', `:${p}`], { allowFail: true })).stdout.trim();
+      const sub = new Repo(path.join(this.dir, p));
+      const head = (await sub.git(['rev-parse', '--verify', '-q', 'HEAD'], { allowFail: true })).stdout.trim() || null;
+      if (!recorded || !head) continue;
+      const branch = (await sub.git(['symbolic-ref', '-q', '--short', 'HEAD'], { allowFail: true })).stdout.trim() || null;
+      out.push({ path: p, recorded, head, branch, inner: head === recorded ? await sub.discardPlan(null) : null });
+    }
+    return out;
+  }
+  /** does what the plan says; the nested repositories it left alone are returned */
+  async applyDiscard(plan: DiscardPlan): Promise<{ kept: string[] }> {
+    // tracked files back from the index, each looked up by name (not a pathspec matched against the whole index)
+    if (plan.restore.length) await this.git(['checkout-index', '-f', '-u', '-q', '-z', '--stdin'], { input: plan.restore.join('\0') + '\0' });
+    const parents = new Set<string>();
+    for (const p of plan.remove) {
+      const abs = path.join(this.dir, p.replace(/\/+$/, ''));
+      if (!abs.startsWith(this.dir + path.sep)) continue;
+      rmSync(abs, { recursive: true, force: true });
+      parents.add(path.dirname(abs));
+    }
+    // the folders the removed files leave empty go too, deepest first (each folder looked at once, not once per file)
+    const up = new Set<string>();
+    for (let d of parents) for (; d.startsWith(this.dir + path.sep) && !up.has(d); d = path.dirname(d)) up.add(d);
+    for (const d of [...up].sort((a, b) => b.length - a.length)) {
+      try {
+        rmdirSync(d);
+      } catch {
+        /* not empty */
       }
     }
-    for (const run of inRuns(tracked)) await this.git(['checkout', '--', ...run]);
-    return { kept: nested };
+    if (plan.submodules.length) this.forgetSubmoduleChanges();
+    for (const sm of plan.submodules) {
+      const sub = new Repo(path.join(this.dir, sm.path));
+      if (sm.head !== sm.recorded) await sub.git(['checkout', '-q', '--detach', sm.recorded]);
+      else if (sm.inner) await sub.applyDiscard(sm.inner);
+    }
+    return { kept: plan.nested };
+  }
+  async discard(paths: string[]): Promise<{ kept: string[] }> {
+    return this.applyDiscard(await this.discardPlan(paths));
   }
   async discardAll() {
-    await this.git(['checkout', '--', '.']);
-    await this.git(['clean', '-fd']);
+    await this.applyDiscard(await this.discardPlan(null));
   }
 
   async stageHunk(file: FileChange, hunk: Hunk) {
@@ -1334,7 +1437,120 @@ export class Repo {
     if (opts.amend) args.push('--amend');
     if (opts.allowEmpty) args.push('--allow-empty');
     await this.git(args);
+    // the commit that finishes a merge stopped on conflicts: the changes set aside for it come back
+    await this.settleRollback();
     return this.head();
+  }
+
+  // ---------- where an operation started: what Abort goes back to ----------
+
+  private async rollbackFile() {
+    return path.resolve(this.dir, (await this.git(['rev-parse', '--git-path', 'prong-rollback.json'])).stdout.trim());
+  }
+  private readRollback(file: string): Rollback | null {
+    try {
+      const p = JSON.parse(readFileSync(file, 'utf8')) as Rollback;
+      return /^[0-9a-f]{40,64}$/.test(p.head) && Date.now() - p.at < 30 * 24 * 3600_000 ? p : null;
+    } catch {
+      return null;
+    }
+  }
+  /**
+   * Runs an operation that may stop on conflicts (merge, rebase, pull, cherry-pick, revert) with a note of where it
+   * started: the commit, the local changes (`git stash create`: a snapshot, nothing in the stash list changes) and
+   * the stash Prong set them aside in (`stash`: its message). Abort goes back to exactly that. Dropped when the
+   * operation does not stop.
+   */
+  async withRollback<T>(fn: () => Promise<T>, stash?: string): Promise<T> {
+    const file = await this.rollbackFile();
+    const head = (await this.git(['rev-parse', '--verify', '-q', 'HEAD'], { allowFail: true })).stdout.trim();
+    if (head) {
+      const snapshot = stash ? '' : (await this.git(['stash', 'create'], { allowFail: true })).stdout.trim();
+      const branch = (await this.git(['symbolic-ref', '-q', '--short', 'HEAD'], { allowFail: true })).stdout.trim();
+      const point: Rollback = { head, branch: branch || null, snapshot: snapshot || null, stash: stash ?? null, at: Date.now() };
+      writeFileSync(file, JSON.stringify(point));
+    }
+    try {
+      return await fn();
+    } finally {
+      if ((await this.opState()).kind === 'none') rmSync(file, { force: true });
+    }
+  }
+  /** the stash of the changes Prong set aside for an operation (by its message), as `stash@{n}`, or null */
+  private async prongStash(message: string): Promise<string | null> {
+    const list = (await this.git(['stash', 'list', '--format=%gd%x00%gs'], { allowFail: true })).stdout;
+    for (const line of list.split('\n')) {
+      const [ref, subject] = line.split('\0');
+      if (ref && subject?.endsWith(message)) return ref;
+    }
+    return null;
+  }
+  /** the operation finished (its last commit made): the changes set aside for it come back, the note goes */
+  async settleRollback(): Promise<{ popped: boolean; output: string } | null> {
+    const file = await this.rollbackFile();
+    if (!existsSync(file) || (await this.opState()).kind !== 'none') return null;
+    const point = this.readRollback(file);
+    rmSync(file, { force: true });
+    const ref = point?.stash ? await this.prongStash(point.stash) : null;
+    if (!ref) return null;
+    const p = await this.git(['stash', 'pop', ref], { allowFail: true });
+    return { popped: p.code === 0, output: (p.stdout + p.stderr).trim() };
+  }
+  /**
+   * Abort of the merge, rebase, cherry-pick or revert that stopped: everything since it started goes. git's own abort
+   * first; then, where Prong noted the start (withRollback), the working tree is reset to it and the local changes of
+   * that moment are put back (and the stash Prong set them aside in is popped). git's abort keeps edits made while the
+   * conflicts were open, and refuses when they are in the way: with the start noted the reset goes ahead, else only
+   * with `force` (it drops every change since).
+   */
+  async abortOp(opts: { force?: boolean } = {}): Promise<{ kind: OpState['kind']; restored: boolean; popped: boolean; output: string }> {
+    const op = await this.opState();
+    const file = await this.rollbackFile();
+    const point = this.readRollback(file);
+    if (op.kind === 'none') {
+      rmSync(file, { force: true });
+      throw new Error('No merge, rebase, cherry-pick or revert is in progress.');
+    }
+    const g = this.gitDirPath();
+    const read = (f: string) => {
+      try {
+        return readFileSync(path.join(g, f), 'utf8').trim();
+      } catch {
+        return '';
+      }
+    };
+    const r = await this.git(op.kind === 'merge' ? ['merge', '--abort'] : [op.kind, '--abort'], { allowFail: true });
+    if (r.code !== 0) {
+      const why = (r.stderr || r.stdout).trim().split('\n').slice(0, 4).join('\n');
+      if (!point && !opts.force) throw new Error(`git could not abort the ${op.kind}: ${why}\n\nAbort anyway resets the working tree to where it started: every change made since is dropped.`);
+      const start = point?.head || (op.kind === 'rebase' ? read('rebase-merge/orig-head') || read('rebase-apply/orig-head') : op.kind === 'merge' ? '' : read('sequencer/head')) || 'HEAD';
+      const branch = point?.branch ?? (op.kind === 'rebase' ? (read('rebase-merge/head-name') || read('rebase-apply/head-name')).replace(/^refs\/heads\//, '') : '');
+      if (op.kind !== 'merge') await this.git([op.kind, '--quit'], { allowFail: true });
+      // a rebase leaves HEAD on its own commits: back on the branch (not moved yet), then exactly its commit
+      if (op.kind === 'rebase' && branch) await this.git(['checkout', '-q', '-f', branch]);
+      await this.git(['reset', '-q', '--hard', start]);
+    }
+    let restored = false;
+    let popped = false;
+    let output = '';
+    const head = (await this.git(['rev-parse', '--verify', '-q', 'HEAD'], { allowFail: true })).stdout.trim();
+    if (point && head === point.head) {
+      // what was made while the conflicts were open goes too; the local changes of the start come back
+      await this.git(['reset', '-q', '--hard', point.head]);
+      if (point.snapshot) {
+        const a = await this.git(['stash', 'apply', '--index', point.snapshot], { allowFail: true });
+        if (a.code !== 0) await this.git(['stash', 'apply', point.snapshot], { allowFail: true });
+        restored = true;
+      }
+      const ref = point.stash ? await this.prongStash(point.stash) : null;
+      if (ref) {
+        const p = await this.git(['stash', 'pop', ref], { allowFail: true });
+        popped = p.code === 0;
+        output = (p.stdout + p.stderr).trim();
+      }
+    }
+    rmSync(file, { force: true });
+    return { kind: op.kind, restored, popped, output };
   }
 
   // ---------- remote ----------
@@ -1456,6 +1672,110 @@ export class Repo {
       if (has.code !== 0) await this.net(['fetch', opts.remote, target], { allowFail: true });
     }
   }
+  /** the remote and branch a local branch tracks (`branch.<name>.remote` / `.merge`); null when it tracks none */
+  async trackingOf(branch: string): Promise<{ remote: string; merge: string; name: string } | null> {
+    const get = async (key: string) => (await this.git(['config', '--get', `branch.${branch}.${key}`], { allowFail: true })).stdout.trim();
+    const [remote, merge] = await Promise.all([get('remote'), get('merge')]);
+    if (!remote || !merge) return null;
+    const short = merge.replace(/^refs\/heads\//, '');
+    return { remote, merge, name: remote === '.' ? short : `${remote}/${short}` };
+  }
+  /** the folder a branch is checked out in (this worktree or another), or null */
+  async worktreeOf(branch: string): Promise<string | null> {
+    const out = (await this.git(['worktree', 'list', '--porcelain'], { allowFail: true })).stdout;
+    let dir = '';
+    for (const line of out.split('\n')) {
+      if (line.startsWith('worktree ')) dir = line.slice('worktree '.length);
+      else if (line === `branch refs/heads/${branch}`) return dir;
+    }
+    return null;
+  }
+  private async isAncestor(a: string, b: string) {
+    return (await this.git(['merge-base', '--is-ancestor', a, b], { allowFail: true })).code === 0;
+  }
+  /**
+   * A branch that is not checked out, brought up to the branch it tracks without checking it out: the remote branch
+   * is fetched and the local one moves forward when it is only behind. Ahead or the same: nothing to do. Gone both
+   * ways: it has to be checked out to merge or rebase. A branch checked out anywhere (here, another worktree) is
+   * refused: moving it would leave that working tree behind its own HEAD.
+   */
+  async fastForwardBranch(branch: string, onProgress?: Progress): Promise<'updated' | 'up-to-date' | 'ahead'> {
+    const t = await this.trackingOf(branch);
+    if (!t) throw new Error(`${branch} tracks no remote branch: set its upstream first.`);
+    const say = (line: string) => onProgress?.(line, null);
+    const where = await this.worktreeOf(branch);
+    if (where) throw new Error(path.resolve(where) === path.resolve(this.dir) ? `${branch} is checked out: pull it with Pull.` : `${branch} is checked out in ${where}: pull it there.`);
+    let theirs: string;
+    if (t.remote === '.') theirs = (await this.git(['rev-parse', '--verify', `${t.merge}^{commit}`])).stdout.trim();
+    else {
+      const f = await this.net(['fetch', '--progress', t.remote, t.merge], { allowFail: true, onLine: (l) => onProgress?.(l, progressOf(l)) });
+      if (f.code !== 0) throw new Error(/couldn't find remote ref/i.test(f.stderr) ? `${t.name} is not on ${t.remote} any more: push ${branch} to make it again.` : f.stderr.trim() || `git fetch ${t.remote} failed`);
+      theirs = (await this.git(['rev-parse', '--verify', 'FETCH_HEAD^{commit}'])).stdout.trim();
+    }
+    const mine = (await this.git(['rev-parse', '--verify', `refs/heads/${branch}^{commit}`])).stdout.trim();
+    if (mine === theirs) {
+      say(`${branch} is up to date with ${t.name}`);
+      return 'up-to-date';
+    }
+    if (await this.isAncestor(theirs, mine)) {
+      say(`${branch} is ahead of ${t.name}: nothing to pull`);
+      return 'ahead';
+    }
+    if (!(await this.isAncestor(mine, theirs))) throw new Error(`${branch} and ${t.name} have diverged: check out ${branch} and pull to merge or rebase them.`);
+    const n = Number((await this.git(['rev-list', '--count', `${mine}..${theirs}`])).stdout.trim());
+    // the old value too: refused if the branch moved meanwhile
+    await this.git(['update-ref', '-m', `pull: fast-forward to ${t.name}`, `refs/heads/${branch}`, theirs, mine]);
+    say(`${branch} fast-forwarded to ${t.name} (${n} commit${n === 1 ? '' : 's'})`);
+    return 'updated';
+  }
+  /**
+   * A branch synced with the one it tracks. The current branch: its local changes stashed (new files too), the
+   * upstream pulled (merge, rebase or fast-forward), the branch pushed, the changes put back. A pull that stops on
+   * conflicts keeps them in the stash; one that fails before changing anything puts them back. A push that fails
+   * still puts them back. Another branch: fast-forwarded when behind, pushed when ahead (one gone both ways has to
+   * be checked out first).
+   */
+  async syncBranch(branch: string, strategy: 'merge' | 'rebase' | 'ff' = 'merge', onProgress?: Progress) {
+    const t = await this.trackingOf(branch);
+    if (!t) throw new Error(`${branch} tracks no remote branch: push it once to publish it, or set its upstream.`);
+    if (t.remote === '.') throw new Error(`${branch} tracks the local branch ${t.name}: there is no remote to sync with.`);
+    const say = (line: string) => onProgress?.(line, null);
+    const push = () => this.push({ remote: t.remote, branch, remoteBranch: t.merge.replace(/^refs\/heads\//, '') }, onProgress);
+    const current = (await this.git(['symbolic-ref', '--short', '-q', 'HEAD'], { allowFail: true })).stdout.trim() === branch;
+    if (!current) {
+      const r = await this.fastForwardBranch(branch, onProgress);
+      if (r === 'ahead') await push();
+      say(`${branch} is in sync with ${t.name}`);
+      return;
+    }
+    const label = `Prong: sync ${branch}`;
+    const s = await this.git(['stash', 'push', '--include-untracked', '-m', label]);
+    const stashed = !/No local changes to save/.test(s.stdout + s.stderr);
+    if (stashed) say('Stashed the local changes');
+    try {
+      // Abort of a pull stopped on conflicts puts the stashed changes back too
+      await this.withRollback(() => this.pull(strategy, onProgress), stashed ? label : undefined);
+    } catch (e) {
+      // stopped on conflicts (a merge or rebase in progress): the changes wait in the stash until it is finished
+      if (stashed && (await this.opState()).kind !== 'none') throw new Error(`${(e as Error).message}\n\nYour local changes are in the stash (“${label}”): they come back when the pull is finished or aborted.`);
+      if (stashed) await this.git(['stash', 'pop'], { allowFail: true });
+      throw e;
+    }
+    let pushError: Error | null = null;
+    try {
+      await push();
+    } catch (e) {
+      pushError = e as Error;
+    }
+    if (stashed) {
+      const p = await this.git(['stash', 'pop'], { allowFail: true });
+      if (p.code !== 0)
+        throw new Error(`${pushError ? `Pulled, but the push failed: ${pushError.message}\n\nThe` : 'Pulled and pushed, but the'} local changes conflict with what came in: resolve the conflicts in the working tree. They also stay in the stash (“${label}”) until you drop it.\n\n${(p.stdout + p.stderr).trim()}`);
+      say('Put the local changes back');
+    }
+    if (pushError) throw pushError;
+    say(`${branch} is in sync with ${t.name}`);
+  }
   /** does `git fetch <remote>` bring refs/heads/<branch>? (its fetch refspecs, wildcards included) */
   async fetchesBranch(remote: string, branch: string) {
     const specs = (await this.git(['config', '--get-all', `remote.${remote}.fetch`], { allowFail: true })).stdout.split('\n').filter(Boolean);
@@ -1490,6 +1810,49 @@ export class Repo {
     if (!stashed) return { stashed, reapplied: false, output: '' };
     const p = await this.git(['stash', 'pop'], { allowFail: true });
     return { stashed, reapplied: p.code === 0, output: (p.stdout + p.stderr).trim() };
+  }
+  /**
+   * The Checkout dialog: switch to `ref` (with `start`: create it there, tracking it), the local changes stashed
+   * before and put back after when asked (new files too with `untracked`), and on the way the branch brought up to `integrate.from` by a merge or a
+   * rebase. A merge or rebase that stops on conflicts leaves the changes in the stash (said in `output`); changes
+   * that clash with the branch when put back stay in the working tree as conflicts, and in the stash.
+   */
+  async switchBranch(opts: { ref: string; start?: string; stash?: boolean; untracked?: boolean; integrate?: { mode: 'merge' | 'rebase'; from: string } }): Promise<{ name: string; stashed: boolean; reapplied: boolean; stopped: boolean; output: string }> {
+    const label = `Prong: before switching to ${opts.ref}`;
+    let stashed = false;
+    // the changes to tracked files; new files stay (a checkout carries them) unless asked: stashing every untracked
+    // file of a large working copy writes them all into the object store
+    if (opts.stash) {
+      const s = await this.git(['stash', 'push', ...(opts.untracked ? ['--include-untracked'] : []), '-m', label]);
+      stashed = !/No local changes to save/.test(s.stdout + s.stderr);
+    }
+    const putBack = async () => {
+      if (stashed) await this.git(['stash', 'pop'], { allowFail: true });
+    };
+    let name = opts.ref;
+    try {
+      const cur = (await this.git(['symbolic-ref', '--short', '-q', 'HEAD'], { allowFail: true })).stdout.trim();
+      if (opts.start) name = (await this.createBranch(opts.ref, opts.start, true)).name;
+      else if (cur !== opts.ref) await this.checkout(opts.ref);
+    } catch (e) {
+      await putBack();
+      throw e;
+    }
+    if (opts.integrate) {
+      const { mode, from } = opts.integrate;
+      let conflicts: boolean;
+      try {
+        conflicts = (await this.withRollback(() => (mode === 'rebase' ? this.rebase(from) : this.merge(from)), stashed ? label : undefined)).conflicts;
+      } catch (e) {
+        // switched, but the merge or rebase never started: the changes come back on the new branch
+        await putBack();
+        throw new Error(`Switched to ${name}, but the ${mode} of ${from} did not start: ${(e as Error).message.trim()}`);
+      }
+      if (conflicts) return { name, stashed, reapplied: false, stopped: true, output: stashed ? `Your local changes are in the stash (“${label}”): they come back when the ${mode} is finished or aborted.` : '' };
+    }
+    if (!stashed) return { name, stashed, reapplied: false, stopped: false, output: '' };
+    const p = await this.git(['stash', 'pop'], { allowFail: true });
+    return { name, stashed, reapplied: p.code === 0, stopped: false, output: (p.stdout + p.stderr).trim() };
   }
   /** the name it got (see storedBranchName) */
   async createBranch(name: string, start: string, checkout: boolean): Promise<{ name: string }> {
@@ -1677,18 +2040,14 @@ export class Repo {
     await this.git(['rebase', '--continue'], { env: { GIT_EDITOR: 'true' } });
   }
   async rebaseAbort() {
-    await this.git(['rebase', '--abort']);
+    return this.abortOp();
   }
   /**
    * Abort of the operation that stopped on conflicts: a merge, and also a cherry-pick or a revert (the conflict bar
    * and the status panel offer one Abort; `git merge --abort` there failed with "There is no merge to abort").
    */
   async mergeAbort() {
-    const op = await this.opState();
-    if (op.kind === 'cherry-pick') await this.git(['cherry-pick', '--abort']);
-    else if (op.kind === 'revert') await this.git(['revert', '--abort']);
-    else if (op.kind === 'rebase') await this.git(['rebase', '--abort']);
-    else await this.git(['merge', '--abort']);
+    return this.abortOp();
   }
   /**
    * Goes on with the rebase, cherry-pick or revert that stopped (on conflicts the user resolved and staged); stopping

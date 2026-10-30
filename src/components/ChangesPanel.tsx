@@ -49,7 +49,7 @@ export function ChangesPanel() {
               {conflicts} conflicted file{conflicts > 1 ? 's' : ''}
             </Txt>
             {/* what stopped on the conflicts goes back; conflicts left by a stash apply have nothing to abort */}
-            {(op || !repo.live) && <Button small label={`Abort ${op ?? 'merge'}`} onPress={() => (repo.live ? (op === 'rebase' ? live.rebaseAbort() : live.mergeAbort()) : toast('Merge aborted (mock)', 'info'))} testID="conflict-abort" />}
+            {(op || !repo.live) && <Button small label={`Abort ${op ?? 'merge'}`} onPress={() => (repo.live ? live.abortOp() : toast('Merge aborted (mock)', 'info'))} testID="conflict-abort" />}
           </View>
         )}
         <SectionHeader

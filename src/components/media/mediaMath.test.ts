@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
-import { availableModes, fitView, fmtBytes, fmtDuration, peaks, sideState, signedBytes, zoomAt } from './mediaMath';
+import type { FileChange } from '../../git/types';
+import { availableModes, fitView, fmtBytes, fmtDuration, peaks, sideState, signedBytes, svgPoint, svgSize, svgSizeText, svgViewOf, VECTOR_FIT_MAX, zoomAt } from './mediaMath';
 
 describe('zoom and pan geometry', () => {
   it('fits and centres, enlarging small images at most 8×', () => {
@@ -69,5 +70,53 @@ describe('waveform peaks', () => {
       [0, expect.closeTo(0.9)],
     ]);
     expect(peaks([new Float32Array(0)])).toEqual([]);
+  });
+});
+
+describe('SVG', () => {
+  const svg = (attrs: string, before = '') => `${before}<svg xmlns="http://www.w3.org/2000/svg" ${attrs}><path d="M0 0h1"/></svg>`;
+  it('the size an <img> draws it at: width and height in any unit, the viewBox for what is missing', () => {
+    expect(svgSize(svg('viewBox="0 0 24 24"'))).toEqual({ w: 24, h: 24, sized: false, viewBox: { x: 0, y: 0, w: 24, h: 24 } });
+    expect(svgSize(svg('width="100" height="50px"'))).toEqual({ w: 100, h: 50, sized: true, viewBox: undefined });
+    const pt = svgSize(svg('width="12pt" height="1in" viewBox="0,0,16,8"'))!;
+    expect([pt.w, pt.h, pt.sized, pt.viewBox]).toEqual([16, 96, true, { x: 0, y: 0, w: 16, h: 8 }]);
+    // one side given: the other from the viewBox's ratio; a percentage is no size
+    expect(svgSize(svg('width="48" viewBox="0 0 24 12"'))).toMatchObject({ w: 48, h: 24, sized: false });
+    expect(svgSize(svg('width="100%" height="32" viewBox="0 0 64 32"'))).toMatchObject({ w: 64, h: 32, sized: false });
+    // nothing at all: the browser's 300×150
+    expect(svgSize(svg(''))).toEqual({ w: 300, h: 150, sized: false });
+    expect(svgSize('not an svg')).toBeNull();
+  });
+  it('reads the root element past a declaration, comments, a doctype and quoted ">"', () => {
+    const text = svg(`width='20' data-x="a>b" height="10"`, '<?xml version="1.0"?>\n<!-- <svg width="1" height="1"> -->\n<!DOCTYPE svg>\n');
+    expect(svgSize(text)).toMatchObject({ w: 20, h: 10, sized: true });
+    expect(svgSize('<svg:svg xmlns:svg="http://www.w3.org/2000/svg" viewBox="0 0 8 4"/>')).toMatchObject({ w: 8, h: 4 });
+  });
+  it('the cursor in the SVG’s own units, the viewBox fitted and centred', () => {
+    const icon = svgSize(svg('viewBox="-12 -12 24 24"'))!;
+    expect(svgPoint(icon, 12, 6)).toEqual({ x: 0, y: -6 });
+    // a 200×100 box for a square viewBox: 50px bands left and right
+    const wide = svgSize(svg('width="200" height="100" viewBox="0 0 10 10"'))!;
+    expect(svgPoint(wide, 50, 0)).toEqual({ x: 0, y: 0 });
+    expect(svgPoint(wide, 150, 100)).toEqual({ x: 10, y: 10 });
+    expect(svgPoint(svgSize(svg('width="5" height="5"'))!, 2, 3)).toEqual({ x: 2, y: 3 });
+    expect(svgSizeText(icon)).toBe('24×24 viewBox');
+    expect(svgSizeText(svgSize(svg('width="12pt" height="10"'))!)).toBe('16×10 px');
+  });
+  it('fitting a vector enlarges small icons further than a bitmap', () => {
+    expect(fitView({ w: 1024, h: 1024 }, { w: 16, h: 16 }, 24, VECTOR_FIT_MAX).s).toBe(32);
+    expect(fitView({ w: 424, h: 424 }, { w: 24, h: 24 }, 24, VECTOR_FIT_MAX).s).toBeCloseTo(400 / 24);
+  });
+  it('picture or text: text only when git has a text diff; a conflict is text; other files are not SVGs', () => {
+    const f = (path: string, kind: FileChange['kind'], extra: Partial<FileChange> = {}): FileChange => ({ path, status: 'M', kind, additions: 0, deletions: 0, ...extra });
+    expect(svgViewOf(f('a.svg', 'text'), 'image')).toEqual({ svg: true, hasText: true, asImage: true });
+    expect(svgViewOf(f('a.svg', 'text'), 'text')).toEqual({ svg: true, hasText: true, asImage: false });
+    expect(svgViewOf(f('a.svg', 'large'), 'text').hasText).toBe(true);
+    // kept binary (.gitattributes, LFS): the picture whatever was picked
+    expect(svgViewOf(f('a.svg', 'image'), 'text')).toEqual({ svg: true, hasText: false, asImage: true });
+    expect(svgViewOf(f('a.svg', 'text', { status: 'U' }), 'image').svg).toBe(false);
+    expect(svgViewOf(f('a.svg', 'text', { conflict: { ours: [], theirs: [], base: [] } }), 'image').asImage).toBe(false);
+    expect(svgViewOf(f('a.png', 'image'), 'image').svg).toBe(false);
+    expect(svgViewOf(f('a.svg.txt', 'text'), 'image').svg).toBe(false);
   });
 });

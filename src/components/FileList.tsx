@@ -387,6 +387,7 @@ export function FileRow({ file, area, selected, onSelect, indent = 0, nameOnly, 
                 ...(file.status === '?' ? [{ label: 'Add to .gitignore', onPress: () => (isLive ? live.addToGitignore(ignorePattern(file.path)) : toast(`Added ${file.path} to .gitignore (mock)`, 'success')) }] : []),
               ]
             : []),
+          ...(insideOnly ? [{ label: 'Discard the changes inside…', danger: true, onPress: () => discardFile(file.path) }] : []),
           ...(area === 'staged' ? [{ label: 'Unstage', onPress: () => unstageFile(file.path) }] : []),
           { separator: true },
           { label: 'File history', onPress: () => (isLive ? void live.showFileHistory(file.path) : toast(`History of ${file.path} (mock)`, 'info')) },
@@ -429,17 +430,18 @@ export function FileRow({ file, area, selected, onSelect, indent = 0, nameOnly, 
               ) : null}
             </View>
           )}
-          {editable && !insideOnly ? (
+          {editable ? (
             <HoverReveal rowHovered={hovered} rest={counts}>
-              {/* on a picked file the buttons act on all the picked ones */}
-              {area === 'unstaged' && <IconButton icon="undo" size={12} title={group ? `Discard ${group.length} files` : 'Discard'} onPress={() => (group ? discardFiles(group) : discardFile(file.path))} testID={`file-discard-${file.path}`} />}
-              <IconButton
+              {/* on a picked file the buttons act on all the picked ones; a submodule with changes only inside is
+                  discarded (after asking), never staged: its changes are committed in it */}
+              {area === 'unstaged' && <IconButton icon="undo" size={12} title={group ? `Discard ${group.length} files` : insideOnly ? 'Discard the changes inside…' : 'Discard'} onPress={() => (group ? discardFiles(group) : discardFile(file.path))} testID={`file-discard-${file.path}`} />}
+              {!insideOnly && <IconButton
                 icon={area === 'unstaged' ? 'plus' : 'minus'}
                 size={13}
                 title={`${area === 'unstaged' ? 'Stage' : 'Unstage'}${group ? ` ${group.length} files` : ''}`}
                 onPress={() => (area === 'unstaged' ? stageFiles(group ?? [file.path]) : unstageFiles(group ?? [file.path]))}
                 testID={`file-${area === 'unstaged' ? 'stage' : 'unstage'}-${file.path}`}
-              />
+              />}
             </HoverReveal>
           ) : (
             counts

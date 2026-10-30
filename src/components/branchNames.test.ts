@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { Ref } from '../git/types';
-import { branchNameProblem, remoteTwin } from './branchNames';
+import { branchNameProblem, mainBranch, remoteTwin, remoteTwins } from './branchNames';
 
 describe('branchNameProblem', () => {
   it('takes what git takes', () => {
@@ -47,3 +47,51 @@ describe('remoteTwin', () => {
     expect(remoteTwin(refs, [], refs.find((r) => r.name === 'untracked')!)).toBeUndefined();
   });
 });
+
+describe('mainBranch', () => {
+  const o = [{ name: 'origin' }];
+  it('the branch origin/HEAD points to, local and remote', () => {
+    const refs: Ref[] = [
+      { name: 'master', kind: 'branch', sha: 'a', upstream: 'origin/master', behind: 2 },
+      { name: 'main', kind: 'branch', sha: 'b' },
+      { name: 'origin/HEAD', kind: 'remote', sha: 'c', target: 'origin/master' },
+      { name: 'origin/master', kind: 'remote', sha: 'c' },
+    ];
+    const m = mainBranch(refs, o);
+    expect(m?.name).toBe('master');
+    expect(m?.local?.name).toBe('master');
+    expect(m?.remote?.name).toBe('origin/master');
+  });
+  it('without origin/HEAD: main, else master; a missing side is left out', () => {
+    expect(mainBranch([{ name: 'master', kind: 'branch', sha: 'a' }, { name: 'x', kind: 'branch', sha: 'b' }], []))?.toMatchObject({ name: 'master', local: { name: 'master' }, remote: undefined });
+    const remoteOnly = mainBranch([{ name: 'feature', kind: 'branch', sha: 'a', current: true }, { name: 'origin/main', kind: 'remote', sha: 'b' }], o);
+    expect(remoteOnly?.local).toBeUndefined();
+    expect(remoteOnly?.remote?.name).toBe('origin/main');
+    expect(mainBranch([{ name: 'dev', kind: 'branch', sha: 'a' }], o)).toBeNull();
+  });
+  it('a local branch of another name tracking it stands in for the local one', () => {
+    const m = mainBranch([{ name: 'trunk-local', kind: 'branch', sha: 'a', upstream: 'origin/trunk' }, { name: 'origin/HEAD', kind: 'remote', sha: 'a', target: 'origin/trunk' }, { name: 'origin/trunk', kind: 'remote', sha: 'a' }], o);
+    expect(m?.name).toBe('trunk');
+    expect(m?.local?.name).toBe('trunk-local');
+  });
+});
+
+describe('remoteTwins', () => {
+  it('is remoteTwin of every local branch', () => {
+    const refs: Ref[] = [
+      { name: 'pub', kind: 'branch', sha: 'a', upstream: 'origin/pub' },
+      { name: 'origin/pub', kind: 'remote', sha: 'a' },
+      { name: 'renamed', kind: 'branch', sha: 'a', upstream: 'origin/other' },
+      { name: 'origin/other', kind: 'remote', sha: 'a' },
+      { name: 'gone', kind: 'branch', sha: 'a', upstream: 'origin/gone', gone: true },
+      { name: 'untracked', kind: 'branch', sha: 'a' },
+      { name: 'origin/untracked', kind: 'remote', sha: 'a' },
+      { name: 'nowhere', kind: 'branch', sha: 'a' },
+    ];
+    const o = [{ name: 'origin' }];
+    const all = remoteTwins(refs, o);
+    for (const b of refs.filter((x) => x.kind === 'branch')) expect(all.get(b.name), b.name).toBe(remoteTwin(refs, o, b));
+    expect(all.size).toBe(3);
+  });
+});
+

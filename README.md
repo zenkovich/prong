@@ -12,21 +12,25 @@ Prong is an experiment. It runs on macOS, the app is signed ad hoc (you build it
 
 ## What it does
 
-- **History.** A commit graph drawn as one layer. Merges fold and unfold. You can filter branches (all, current or selected) and search by message, author or SHA. Each commit has a menu: checkout, branch, tag, cherry-pick, revert, reset, rebase and interactive rebase.
+- **History.** A commit graph drawn as one layer; branch labels are badges in the colour of their line. Merges fold and unfold. You can filter branches (all, current or selected; a local branch comes with its branch on origin) and search by message, author or SHA. Each commit has a menu: checkout, branch, tag, cherry-pick, revert, reset, rebase and interactive rebase.
 - **Changes.**
   - Tree or list view.
-  - Stage and unstage a file, a hunk or single lines; discard.
-  - Resolve conflicts with ours / base / theirs.
+  - Stage and unstage a file, a hunk or single lines; discard, also thousands of files at once and the changes inside a submodule, with Undo.
+  - Resolve conflicts with ours / base / theirs. Abort of a merge or rebase puts everything back as it was before it started.
   - Commit, amend, or commit and push.
   - Submodules whose own files changed are listed, as in Fork.
 - **Diffs.**
   - Unified or split, with syntax highlighting.
   - Images before and after; audio and video players.
+  - SVGs as a picture (sharp at any zoom, coordinates in viewBox units) or as a text diff, one click apart.
   - Binary files, renames and submodule pointers.
   - Git LFS files show as the files they point to; an object not on your machine is downloaded for the preview.
 - **Everyday git.**
-  - Fetch, pull and push with progress.
+  - Fetch, pull and push with progress; any running command can be stopped.
+  - The main branch, local and on origin, at the top of the sidebar.
+  - Pull, push and sync buttons on a branch row. Sync stashes your changes, pulls, pushes and puts the changes back. A branch you are not on is fast-forwarded without checking it out.
   - Stashes, branches, tags, remotes.
+  - A double click on a branch opens Checkout: which branch, stash or keep local changes, and merge or rebase when its local branch is behind the remote one.
   - Submodules: update, sync, open.
   - Blame, file history, undo.
   - Git LFS files left as pointers (cloned without LFS, or left out by `.lfsconfig`) are restored by folder.

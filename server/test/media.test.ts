@@ -4,7 +4,7 @@ import path from 'node:path';
 import { AddressInfo } from 'node:net';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { createApi } from '../src/api.js';
-import { kindOf, parseDiff } from '../src/git/parse.js';
+import { binaryKindOf, kindOf, lfsKindOf, parseDiff } from '../src/git/parse.js';
 import { mimeOf, safeRelPath, WORKTREE } from '../src/git/repo.js';
 import { parseRange } from '../src/http-file.js';
 import { makeFixtureRepo } from './fixture.js';
@@ -32,6 +32,17 @@ describe('content kinds', () => {
     expect(other[0].kind).toBe('binary');
     const svg = parseDiff('diff --git a/i.svg b/i.svg\nindex 1..2 100644\n--- a/i.svg\n+++ b/i.svg\n@@ -1 +1 @@\n-<svg/>\n+<svg></svg>\n');
     expect(svg[0].kind).toBe('text');
+  });
+  it('an SVG is text (the interface draws it too); kept binary (.gitattributes, Git LFS) it is a picture', () => {
+    expect(kindOf('icons/a.SVG')).toBe('text');
+    expect(binaryKindOf('icons/a.svg')).toBe('image');
+    expect(binaryKindOf('a.png')).toBe('image');
+    expect(binaryKindOf('a.wav')).toBe('audio');
+    expect(binaryKindOf('a.bin')).toBe('binary');
+    expect(lfsKindOf('art/logo.svg')).toBe('image');
+    const bin = parseDiff('diff --git a/i.svg b/i.svg\nindex 1..2 100644\nBinary files a/i.svg and b/i.svg differ\n');
+    expect(bin[0].kind).toBe('image');
+    expect(bin[0].hunks).toBeUndefined();
   });
   it('maps mime types and rejects paths that escape the repository', () => {
     expect(mimeOf('a.mp4')).toBe('video/mp4');
@@ -160,6 +171,35 @@ describe('media sides and blobs', () => {
     expect(missing.status).toBe(404);
     const escape = await fetch(`${base}/api/blob?repo=${encodeURIComponent(fx.dir)}&rev=WORKTREE&file=../../etc/passwd`);
     expect(escape.status).toBe(400);
+  });
+
+  it('serves an SVG as a picture that runs nothing when opened by itself (a sandbox, not a page of the engine)', async () => {
+    const svg = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><script>fetch("/api/repo/discard")</script><circle cx="12" cy="12" r="10"/></svg>';
+    writeFileSync(path.join(fx.dir, 'media/icon.svg'), svg);
+    const r = await fetch(`${base}/api/blob?repo=${encodeURIComponent(fx.dir)}&rev=WORKTREE&file=media/icon.svg`);
+    expect(r.status).toBe(200);
+    expect(r.headers.get('content-type')).toBe('image/svg+xml');
+    expect(r.headers.get('content-security-policy')).toBe('sandbox');
+    expect(r.headers.get('x-content-type-options')).toBe('nosniff');
+    expect(await r.text()).toBe(svg);
+    rmSync(path.join(fx.dir, 'media/icon.svg'));
+  });
+
+  it('a changed SVG in the working copy is listed as text with its counts, and its diff is text', async () => {
+    writeFileSync(path.join(fx.dir, 'media/logo.svg'), '<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10">\n<rect width="10" height="10"/>\n</svg>\n');
+    await fx.repo.stageAll();
+    await fx.repo.commit('Add logo');
+    writeFileSync(path.join(fx.dir, 'media/logo.svg'), '<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10">\n<circle r="5" cx="5" cy="5"/>\n</svg>\n');
+    const st = await fx.repo.status();
+    const f = st.unstaged.find((x) => x.path === 'media/logo.svg')!;
+    expect([f.kind, f.additions, f.deletions]).toEqual(['text', 1, 1]);
+    const d = await fx.repo.fileDiff('media/logo.svg', 'unstaged');
+    expect(d!.kind).toBe('text');
+    expect(d!.hunks![0].lines.some((l) => l.kind === 'add' && l.text.includes('circle'))).toBe(true);
+    // the picture's two sides are there for the image view
+    const sides = await fx.repo.mediaSides('media/logo.svg', 'unstaged');
+    expect(sides.before && sides.after).toBeTruthy();
+    await fx.repo.discard(['media/logo.svg']);
   });
 
   it('answers media sides and blob files through the op API', async () => {

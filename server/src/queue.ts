@@ -1,6 +1,6 @@
 import { existsSync, statSync } from 'node:fs';
 import path from 'node:path';
-import { runGit } from './git/run.js';
+import { runGit, withStop } from './git/run.js';
 import type { QueueItem } from './types.js';
 
 export type { QueueItem };
@@ -20,10 +20,14 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 let seq = 0;
 
 interface Job extends QueueItem {
-  fn: () => Promise<unknown>;
+  fn: (signal: AbortSignal) => Promise<unknown>;
   resolve: (v: unknown) => void;
   reject: (e: unknown) => void;
   cancelled?: boolean;
+  /** stops it while it runs: every git it started is killed (runGit reads it through withStop) */
+  stop: AbortController;
+  /** the caller's own stop (a long operation's Stop button) */
+  signal?: AbortSignal;
 }
 
 export class RepoQueue {
@@ -43,21 +47,28 @@ export class RepoQueue {
     return this.jobs.map(({ id, label, state, since, lock, lockSince }) => ({ id, label, state, since, lock, lockSince }));
   }
 
-  /** `signal`: the user stopped it — still waiting (its turn, a lock), it leaves the queue as cancelled */
-  run<T>(label: string, fn: () => Promise<T>, signal?: AbortSignal): Promise<T> {
+  /**
+   * `signal`: the user stopped it — still waiting (its turn, a lock), it leaves the queue as cancelled; running, its
+   * git is killed. `fn` gets the signal that stops it (the caller's, or the queue's Stop).
+   */
+  run<T>(label: string, fn: (signal: AbortSignal) => Promise<T>, signal?: AbortSignal): Promise<T> {
     return new Promise<T>((resolve, reject) => {
       const id = ++seq;
-      this.jobs.push({ id, label, state: 'queued', since: Date.now(), fn, resolve: resolve as (v: unknown) => void, reject });
+      this.jobs.push({ id, label, state: 'queued', since: Date.now(), fn, resolve: resolve as (v: unknown) => void, reject, stop: new AbortController(), signal });
       signal?.addEventListener('abort', () => this.cancel(id), { once: true });
       this.changed();
       void this.pump();
     });
   }
 
-  /** a queued or lock-waiting action is dropped (a running one finishes) */
+  /** a queued or lock-waiting action is dropped; a running one is stopped (its git killed, git cleans up its locks) */
   cancel(id: number) {
     const j = this.jobs.find((x) => x.id === id);
-    if (!j || j.state === 'running') return false;
+    if (!j) return false;
+    if (j.state === 'running') {
+      j.stop.abort();
+      return true;
+    }
     j.cancelled = true;
     if (j.state === 'queued') {
       this.jobs = this.jobs.filter((x) => x !== j);
@@ -121,11 +132,12 @@ export class RepoQueue {
             job.lock = undefined;
             this.changed();
             try {
-              result = await job.fn();
+              const stop = job.signal ? AbortSignal.any([job.signal, job.stop.signal]) : job.stop.signal;
+              result = await withStop(stop, () => job.fn(stop));
               break;
             } catch (e) {
               // another git process took the lock between our check and git's: wait for it and go again
-              if (isLockError(e) && attempt < 10 && !job.cancelled) {
+              if (isLockError(e) && attempt < 10 && !job.cancelled && !job.stop.signal.aborted) {
                 await sleep(RepoQueue.pollMs);
                 continue;
               }

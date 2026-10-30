@@ -297,15 +297,22 @@ await check('history: "Uncommitted changes (N)" on top counts the changed files 
   await rowOf('Local work').waitFor();
 });
 
-await check('history: ref labels — the current branch filled with its origin cloud, a tag in <>, a local branch in []', async () => {
+await check('history: ref labels — badges in their line’s colour, bold, no brackets; the current branch with a check; a solid cloud for the remote', async () => {
   await ensureHist();
   const local = rowOf('Local work');
   expect(await local.getByTestId('ref-main').count(), 'main on Local work');
+  expect(await local.getByTestId('ref-current-main').count(), 'the current branch carries a check');
   expect(!(await local.getByTestId('ref-cloud-main').count()), 'no cloud: origin/main is one behind');
   expect(await rowOf('Remove main.txt').getByTestId('ref-origin/main').count(), 'origin/main has a label of its own (remote only)');
   expect(await rowOf('Edit notes').getByTestId('ref-v0.1').count(), 'tag v0.1');
-  expect((await rowOf('Edit notes').getByTestId('ref-v0.1').innerText()).replace(/\s/g, '') === '<v0.1>', 'tag in angle brackets');
-  expect((await rowOf('Topic two').getByTestId('ref-topic').innerText()).replace(/\s/g, '') === '[topic]', 'branch in brackets');
+  expect((await rowOf('Edit notes').getByTestId('ref-v0.1').innerText()).replace(/\s/g, '') === 'v0.1', 'a tag: its name, no brackets');
+  expect((await rowOf('Topic two').getByTestId('ref-topic').innerText()).replace(/\s/g, '') === 'topic', 'a branch: its name, no brackets');
+  // a badge in its line's colour (the graph's node on that row), bold
+  const look = await rowOf('Topic two').getByTestId('ref-topic').evaluate((el) => ({ bg: getComputedStyle(el).backgroundColor, weight: getComputedStyle(el.querySelector('div[dir="auto"]') ?? el).fontFamily }));
+  // the graph's line colours on screen (its lanes): the badge is one of them
+  const lanes = await page.evaluate(() => [...new Set([...document.querySelectorAll('svg line, svg path, svg polygon')].flatMap((n) => [n.getAttribute('stroke'), n.getAttribute('fill')]).filter((c) => /^#[0-9a-f]{6}$/i.test(c ?? '')))]);
+  const rgb = (h) => `rgb(${parseInt(h.slice(1, 3), 16)}, ${parseInt(h.slice(3, 5), 16)}, ${parseInt(h.slice(5, 7), 16)})`;
+  expect(lanes.map(rgb).includes(look.bg), `a lane colour: ${look.bg} of ${lanes.join(',')}`);
 });
 
 await check('history: a click on a branch or tag label in a row selects that commit', async () => {

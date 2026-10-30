@@ -95,6 +95,33 @@ describe('repository action queue', () => {
     unlinkSync(lock());
   });
 
+  it('a running action is stopped: its git is killed, the queue goes on', async () => {
+    const q = new RepoQueue(dir, () => {});
+    const started = Date.now();
+    // git waiting on a child of its own (an alias), as a long checkout or merge would
+    const running = q.run('wait', () => new Repo(dir).git(['-c', 'alias.wait=!sleep 8', 'wait']));
+    await sleep(300);
+    expect(q.items[0].state).toBe('running');
+    expect(q.cancel(q.items[0].id)).toBe(true);
+    await expect(running).rejects.toThrow('Stopped');
+    expect(Date.now() - started).toBeLessThan(4000);
+    await expect(q.run('next', async () => 'next')).resolves.toBe('next');
+  });
+
+  it('a discard stopped half way puts back what it had moved aside', async () => {
+    const { discardWithUndo } = await import('../src/undo.js');
+    process.env.PRONG_STATE_DIR = path.join(root, 'state');
+    for (let i = 0; i < 400; i++) writeFileSync(path.join(dir, `new${i}.txt`), `${i}\n`);
+    const repo = new Repo(dir);
+    const plan = await repo.discardPlan(Array.from({ length: 400 }, (_, i) => `new${i}.txt`));
+    const stop = new AbortController();
+    stop.abort();
+    const { withStop } = await import('../src/git/run.js');
+    await expect(withStop(stop.signal, () => discardWithUndo(repo, plan))).rejects.toThrow('Stopped');
+    for (let i = 0; i < 400; i += 57) expect(existsSync(path.join(dir, `new${i}.txt`))).toBe(true);
+    for (let i = 0; i < 400; i++) rmSync(path.join(dir, `new${i}.txt`));
+  });
+
   it('through the API: an operation blocked by a lock finishes after it is released; a fresh lock is not deleted, an old one is', async () => {
     process.env.PRONG_STATE_DIR = path.join(root, 'state');
     const { server } = createApi();

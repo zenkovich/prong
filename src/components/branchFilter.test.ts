@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
-import { filterRevs, inFilter, toggleFilterRef } from './branchFilter';
+import type { Ref } from '../git/types';
+import { filterChips, filterRevs, filterTwin, inFilter, toggleFilterRef } from './branchFilter';
 import type { GraphFilter } from './graphLayout';
 
 const all: GraphFilter = { mode: 'all', refs: [], hideRemotes: false };
@@ -26,4 +27,43 @@ describe('branch filter', () => {
     expect(filterRevs({ mode: 'current', refs: [], hideRemotes: false })).toEqual(['HEAD']);
     expect(filterRevs({ mode: 'selected', refs: ['a', 'b'], hideRemotes: false })).toEqual(['a', 'b']);
   });
+  it('a local branch comes with its remote branch: both in, both out; the remote one alone stays its own', () => {
+    const a = toggleFilterRef(all, 'feature/x', 'origin/feature/x');
+    expect(a.refs).toEqual(['feature/x', 'origin/feature/x']);
+    const b = toggleFilterRef(a, 'topic', 'origin/topic');
+    expect(b.refs).toEqual(['feature/x', 'origin/feature/x', 'topic', 'origin/topic']);
+    expect(toggleFilterRef(b, 'feature/x', 'origin/feature/x').refs).toEqual(['topic', 'origin/topic']);
+    // the remote one taken out by its own funnel: the local one stays
+    expect(toggleFilterRef(b, 'origin/topic').refs).toEqual(['feature/x', 'origin/feature/x', 'topic']);
+    // already in by its own funnel: not twice
+    expect(toggleFilterRef({ ...all, mode: 'selected', refs: ['origin/x'] }, 'x', 'origin/x').refs).toEqual(['origin/x', 'x']);
+    expect(toggleFilterRef(a, 'feature/x', 'origin/feature/x')).toEqual(all);
+  });
 });
+
+describe('filter twins and chips', () => {
+  const refs: Ref[] = [
+    { name: 'main', kind: 'branch', sha: 'a', upstream: 'origin/main' },
+    { name: 'origin/main', kind: 'remote', sha: 'a' },
+    { name: 'topic', kind: 'branch', sha: 'b' },
+    { name: 'origin/topic', kind: 'remote', sha: 'b' },
+    { name: 'solo', kind: 'branch', sha: 'c' },
+    { name: 'v1', kind: 'tag', sha: 'a' },
+  ];
+  const remotes = [{ name: 'origin' }];
+  const sel = (r: string[]) => ({ mode: 'selected' as const, refs: r, hideRemotes: false });
+  it('the twin: the upstream, else the namesake on origin; none for remote branches, tags, or with remotes hidden', () => {
+    expect(filterTwin(refs, remotes, 'main')).toBe('origin/main');
+    expect(filterTwin(refs, remotes, 'topic')).toBe('origin/topic');
+    expect(filterTwin(refs, remotes, 'solo')).toBeUndefined();
+    expect(filterTwin(refs, remotes, 'origin/main')).toBeUndefined();
+    expect(filterTwin(refs, remotes, 'v1')).toBeUndefined();
+    expect(filterTwin(refs, remotes, 'main', true)).toBeUndefined();
+  });
+  it('a branch and its twin share a chip, at the branch’s place; alone each has its own', () => {
+    expect(filterChips(sel(['origin/topic', 'main', 'v1', 'topic', 'origin/main']), refs, remotes)).toEqual([{ name: 'main', twin: 'origin/main' }, { name: 'v1' }, { name: 'topic', twin: 'origin/topic' }]);
+    expect(filterChips(sel(['main', 'origin/topic']), refs, remotes)).toEqual([{ name: 'main' }, { name: 'origin/topic' }]);
+    expect(filterChips(all, refs, remotes)).toEqual([]);
+  });
+});
+

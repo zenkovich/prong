@@ -25,6 +25,8 @@ export interface Ref {
   gone?: boolean;
   ahead?: number;
   behind?: number;
+  /** a symbolic ref (origin/HEAD): the ref it points to, "origin/main" */
+  target?: string;
 }
 
 export interface Remote {

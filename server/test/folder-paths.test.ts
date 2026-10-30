@@ -62,7 +62,7 @@ describe('a folder of files staged, unstaged and discarded at once', () => {
     await repo.discard(paths);
     expect(git(dir, 'status', '--porcelain')).toBe('');
     expect(readFileSync(path.join(dir, names[0]), 'utf8')).toBe('1\n');
-    restoreFromUndo(repo, token!);
+    await restoreFromUndo(repo, token!);
     expect(readFileSync(path.join(dir, names[2999]), 'utf8')).toBe('2\n');
     expect(existsSync(path.join(dir, 'assets/new/inside.json'))).toBe(true);
     expect(existsSync(path.join(dir, 'assets/textures/loose.json'))).toBe(true);
