@@ -43,10 +43,33 @@ export async function addSshKey(host: string, token: string, title: string, key:
   return gh<{ id: number }>(host, token, '/user/keys', { method: 'POST', body: JSON.stringify({ title, key }), headers: { 'content-type': 'application/json' } });
 }
 
-/** OAuth device flow (needs an OAuth app client id configured by the user). */
+/**
+ * Prong's own OAuth app on github.com (device flow on), the way Fork signs in: its token reaches every repository the
+ * user can reach. The GitHub App used before (`Iv23…`) reached only where it was installed — nowhere, as a rule — so
+ * pushes failed with "Write access to repository not granted". A client id is public; the device flow needs no secret.
+ */
+export const PRONG_CLIENT_ID = 'Ov23li733t6lHfwMrFOH';
+/** client ids that were Prong's before: a saved one of these is not the user's own choice, the built-in replaces it */
+const FORMER_CLIENT_IDS = new Set(['Iv23lifyjeOmrixbmyni']);
+
+/** the user's own client id as saved, '' when none (or one of Prong's former ones) */
+export function ownClientId(saved?: string | null): string {
+  const id = (saved ?? '').trim();
+  return FORMER_CLIENT_IDS.has(id) ? '' : id;
+}
+
+/** the client id for a sign-in: the user's own app if set (GitHub Enterprise needs one), else Prong's on github.com */
+export function clientIdFor(host: string, own?: string | null): string {
+  return ownClientId(own) || (host === 'github.com' ? PRONG_CLIENT_ID : '');
+}
+
+/** what Prong asks for: repositories (with their workflow files, else such a push is refused), organizations, SSH keys */
+const SCOPES = 'repo workflow read:org admin:public_key';
+
+/** OAuth device flow: the user approves a code in the browser */
 export async function deviceStart(clientId: string, host = 'github.com') {
   const url = host === 'github.com' ? 'https://github.com/login/device/code' : `https://${host}/login/device/code`;
-  const r = await fetch(url, { method: 'POST', headers: { accept: 'application/json', 'content-type': 'application/json' }, body: JSON.stringify({ client_id: clientId, scope: 'repo read:org admin:public_key' }) });
+  const r = await fetch(url, { method: 'POST', headers: { accept: 'application/json', 'content-type': 'application/json' }, body: JSON.stringify({ client_id: clientId, scope: SCOPES }) });
   if (!r.ok) throw new Error(`device flow start failed: ${r.status}`);
   return (await r.json()) as { device_code: string; user_code: string; verification_uri: string; expires_in: number; interval: number };
 }

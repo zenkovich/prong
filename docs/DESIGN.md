@@ -533,6 +533,19 @@ SVG — текстовый файл, и раньше его изменение �
   - Кнопка Discard есть на строке, в меню («Discard the changes inside…») и в виде «Changes inside the submodule». Stage по-прежнему нет. В подтверждении группы файлов есть раздел «Submodules». Discard all сабмодули не трогает.
   - После discard и Undo кэш изменений внутри сабмодулей сбрасывается (`forgetSubmoduleChanges`): иначе чтение, сделанное меньше 1,5 с назад, показывало старое.
 
+## 4.30 Вход в GitHub как у Fork: своё OAuth-приложение (2026-10-30)
+
+- Push zenkovich.space падал с 403 «Write access to repository not granted», хотя в Connection выбран аккаунт zenkovich, а сам аккаунт был в статусе ok. Причина: вход шёл через GitHub App (`Iv23…`). Её токен (`ghu_`) действует только там, куда приложение установлено, а установлено оно не было нигде. Поэтому у закрытого репозитория отказывал даже `ls-remote`. Fork входит через OAuth-приложение: его токен (`gho_`, право `repo`) действует везде, куда есть доступ у самого пользователя.
+- Встроено OAuth-приложение Prong с включённым device flow: `PRONG_CLIENT_ID = 'Ov23li733t6lHfwMrFOH'` в `server/src/github.ts`. Client id публичный, секрет для device flow не нужен. `clientIdFor(host, own)` выбирает id: свой id пользователя, если он задан (для GitHub Enterprise он обязателен), иначе встроенный для github.com. Прежний id `Iv23…`, сохранённый в настройках, не считается выбором пользователя: `ownClientId` в `loadSettings` превращает его в пустой.
+- Права входа: `repo workflow read:org admin:public_key`. Без `workflow` OAuth-токену не дают пушить коммиты, которые меняют `.github/workflows`.
+- Accounts:
+  - «Sign in with GitHub» работает без поля client id; поле стало «Your own OAuth app client id (optional…)».
+  - У аккаунта, вошедшего через GitHub App (`/api/github/access` → `kind: app`), видна пометка и «Sign in again».
+  - Sign in again для сервера без своего id открывает форму токена.
+- Clone под списком предлагает «Sign in again…».
+- Подсказка к ошибке 403 говорит, что аккаунт GitHub App надо войти заново.
+- Если в организации включено ограничение OAuth-приложений, их одобряют владельцы, как и у Fork. В o2-engine это решает пользователь, в Playrix — её владельцы.
+
 ## 4.3 Что стало настоящим (вместо заглушек)
 
 Работает через движок для живых репозиториев: открытие в редакторе / Finder / терминале (настройки External tools), история файла (`git log --follow`), blame (панель с авторами и переходом к коммиту), добавление в `.gitignore`, копирование путей и хешей в буфер, переименование ветки и upstream (диалоги), добавление / правка / удаление / prune remote, push тега, checkout тега и коммита (detached), rebase на произвольный коммит, abort merge/rebase и continue, сабмодули (раздел в сайдбаре: состояние, update/init, recursive, sync, открыть как репозиторий; в диффе указателя — subjects коммитов до/после), картинки, аудио и видео до/после в диффе (blob-эндпоинт с Range, см. 4.4), глобальная identity (`git config --global`), подпись коммитов (`commit.gpgsign`), режим pull по умолчанию, GitHub-аккаунт по токену (валидация через API, токен в Keychain) и device flow (нужен client id OAuth-приложения), список репозиториев GitHub при клонировании, загрузка публичного ключа в GitHub, SSH-ключи из `~/.ssh` (fingerprint, agent, passphrase), генерация ключа (`ssh-keygen`), добавление в агент, проверка `ssh -T`, агент через локальный Claude Code (stream-json, инструменты ограничены git/файлами; изменения интерфейса коммитятся в репозиторий исходников, версии = коммиты, revert/rollback = `git revert`).

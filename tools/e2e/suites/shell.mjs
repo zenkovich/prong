@@ -135,12 +135,12 @@ async function freshLaunch() {
 
 /** GitHub stands in: one account (made up), its sign-in state, its repositories */
 const fakeAcc = { id: 'github.com:sh-mock-user', host: 'github.com', login: 'sh-mock-user', name: 'Sh Mock', orgs: ['sh-org'] };
-async function withAccount(state, fn, repos = []) {
+async function withAccount(state, fn, repos = [], kind = 'pat') {
   const routes = [
     ['**/api/accounts', (r) => (r.request().method() === 'GET' ? r.fulfill({ json: [fakeAcc] }) : r.fallback())],
     ['**/api/accounts/check', (r) => r.fulfill({ json: { [fakeAcc.id]: { state } } })],
     ['**/api/github/repos', (r) => r.fulfill({ json: (JSON.parse(r.request().postData() ?? '{}').page ?? 1) === 1 ? repos : [] })],
-    ['**/api/github/access', (r) => r.fulfill({ json: { kind: 'pat', installations: [] } })],
+    ['**/api/github/access', (r) => r.fulfill({ json: { kind, installations: [] } })],
   ];
   for (const [u, h] of routes) await page.route(u, h);
   try {
@@ -1129,17 +1129,60 @@ await step('shell · clone: an account whose sign-in is gone says so with Sign i
   });
 });
 
-await step('shell · accounts: Sign in again of an account whose sign-in is gone opens the token form when the device sign-in has no client id', async () => {
+/** the device sign-in answered here: what the page asked GitHub (through the engine) to start with */
+async function withDeviceStub(fn) {
+  const starts = [];
+  const routes = [
+    ['**/api/github/deviceStart', (r) => (starts.push(JSON.parse(r.request().postData() ?? '{}')), r.fulfill({ json: { device_code: 'e2e-device', user_code: 'AGIN-2E2E', verification_uri: 'https://github.com/login/device', expires_in: 120, interval: 0 } }))],
+    ['**/api/github/devicePoll', (r) => r.fulfill({ json: { done: false, error: 'authorization_pending' } })],
+  ];
+  for (const [u, h] of routes) await page.route(u, h);
+  try {
+    await fn(starts);
+  } finally {
+    for (const [u, h] of routes) await page.unroute(u, h);
+  }
+}
+
+await step('shell · accounts: Sign in again of an account whose sign-in is gone goes through the browser with Prong’s own app — no client id needed (it used to open the token form)', async () => {
   await fetch(base + '/api/settings', { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ githubClientId: '' }) });
-  await withAccount('expired', async () => {
-    await tid(`account-${fakeAcc.login}`).click();
-    await waitShown('accounts-expired-note');
-    await tid(`resign-${fakeAcc.login}`).click();
-    await waitShown('token-input');
-    expect((await valueOf('token-host')) === 'github.com', 'for its host');
-    expect(!(await has('error-dialog')), 'no error (it used to fail for want of a client id)');
-    await page.keyboard.press('Escape');
-  });
+  await withAccount('expired', () =>
+    withDeviceStub(async (starts) => {
+      await tid(`account-${fakeAcc.login}`).click();
+      await waitShown('accounts-expired-note');
+      await tid(`resign-${fakeAcc.login}`).click();
+      await page.waitForFunction(() => /AGIN-2E2E/.test(document.querySelector('[data-testid="device-code"]')?.textContent ?? ''), null, { timeout: 8000 });
+      expect(!(await has('token-input')), 'not the token form');
+      expect(starts.length === 1 && starts[0].host === 'github.com' && !starts[0].clientId, 'started for github.com with no client id of its own (the engine puts in Prong’s): ' + JSON.stringify(starts));
+      expect(!(await has('error-dialog')), 'no error');
+      await tid('device-cancel').click();
+      await page.keyboard.press('Escape');
+    }),
+  );
+});
+
+await step('shell · accounts: an account signed in through a GitHub App (reaches only where it is installed) is marked and offered Sign in again; Clone offers it too', async () => {
+  await withAccount(
+    'ok',
+    () =>
+      withDeviceStub(async (starts) => {
+        await tid(`account-${fakeAcc.login}`).click();
+        await waitShown(`account-limited-${fakeAcc.login}`);
+        expect(/push elsewhere is refused/i.test(await textOf(`account-limited-${fakeAcc.login}`)), 'says what it means');
+        await tid(`resign-${fakeAcc.login}`).click();
+        await page.waitForFunction(() => /AGIN-2E2E/.test(document.querySelector('[data-testid="device-code"]')?.textContent ?? ''), null, { timeout: 8000 });
+        expect(starts.length === 1, 'the browser sign-in started');
+        await tid('device-cancel').click();
+        await page.keyboard.press('Escape');
+        await openClone('');
+        await waitShown('clone-app-note');
+        await tid('clone-resign').click();
+        await waitShown(`account-card-${fakeAcc.login}`);
+        await page.keyboard.press('Escape');
+      }),
+    [],
+    'app',
+  );
 });
 
 // ======================================================================================

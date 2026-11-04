@@ -814,9 +814,16 @@ export function createApi(opts: { log?: (s: string) => void } = {}) {
       if (req.method === 'POST' && url.pathname.startsWith('/api/github/')) {
         const op = url.pathname.slice('/api/github/'.length);
         const acc = readState<any[]>('accounts.json', []).find((a) => a.id === body.accountId);
-        if (op === 'deviceStart') return json(200, await github.deviceStart(String(body.clientId || loadSettings().githubClientId), body.host));
+        // Prong's own app on github.com unless the user set theirs (GitHub Enterprise needs one)
+        const deviceClient = () => {
+          const host = String(body.host ?? 'github.com');
+          const id = github.clientIdFor(host, String(body.clientId || loadSettings().githubClientId || ''));
+          if (!id) throw new HttpError(400, `Signing in to ${host} in the browser needs an OAuth app of that server: put its client id under Preferences → GitHub, or sign in with a token.`);
+          return id;
+        };
+        if (op === 'deviceStart') return json(200, await github.deviceStart(deviceClient(), body.host));
         if (op === 'devicePoll') {
-          const clientId = String(body.clientId || loadSettings().githubClientId);
+          const clientId = deviceClient();
           const r = await github.devicePoll(clientId, String(body.deviceCode), body.host);
           if (r.access_token) {
             const host = String(body.host ?? 'github.com');

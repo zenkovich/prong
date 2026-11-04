@@ -182,10 +182,11 @@ export function CloneDialog({ initialUrl }: { initialUrl?: string }) {
                 <View style={{ marginTop: 8, padding: 8, backgroundColor: t.info + '14' }} testID="clone-app-note">
                   <Txt size={FONT.xs}>
                     {account?.login} is signed in through a GitHub App: the list holds public repositories and those of the accounts and organizations the app is installed on (
-                    {installedOn.length ? installedOn.join(', ') : 'none yet'}). An organization’s private repositories (Playrix, say) appear once the app is installed there — its owners approve that — or
-                    after signing in with a personal access token. Cloning by URL works either way: your SSH key decides, not this list.
+                    {installedOn.length ? installedOn.join(', ') : 'none yet'}), and pushes elsewhere are refused. Sign in again: Prong’s sign-in reaches every repository you can (an organization that
+                    restricts apps, Playrix say, asks its owners to approve it), as does a personal access token. Cloning by URL works either way: your SSH key decides, not this list.
                   </Txt>
                   <View style={{ flexDirection: 'row', marginTop: 6, flexWrap: 'wrap', gap: 6 } as any}>
+                    <Button small primary label="Sign in again…" icon="github" onPress={() => openDialog({ type: 'accounts', tab: 'github' })} testID="clone-resign" />
                     <Button small label="Sign in with a token…" icon="key" onPress={() => openDialog({ type: 'accounts', tab: 'github', token: true })} testID="clone-use-token" />
                     <Button small label={slug ? 'Install the app on an organization…' : 'Installed apps…'} icon="external" onPress={() => void live.openUrl(slug ? `https://github.com/apps/${slug}/installations/new` : 'https://github.com/settings/installations')} />
                   </View>
@@ -507,7 +508,16 @@ function GitHubPrefs({ token: startWithToken }: { token?: boolean }) {
     setDevice(null);
     setMode('list');
   };
-  const startDevice = async () => {
+  // signed in through Prong's former GitHub App: such a token reaches only where the app is installed (nowhere, as a
+  // rule), so pushes are refused; signing in again goes through Prong's OAuth app and reaches everything
+  const [limited, setLimited] = useState<Record<string, boolean>>({});
+  // an expired sign-in would only fail: it has its own notice
+  const working = accounts.filter((a) => status[a.id]?.state !== 'expired').map((a) => a.id).join(' ');
+  useEffect(() => {
+    if (!engine.online || !working) return;
+    for (const id of working.split(' ')) void live.githubAccess(id).then((r) => r && setLimited((m) => ({ ...m, [id]: r.kind === 'app' })));
+  }, [engine.online, working]);
+  const startDevice = async (signInHost = host) => {
     if (!engine.online) {
       // demo path without the engine
       setMode('device');
@@ -518,15 +528,17 @@ function GitHubPrefs({ token: startWithToken }: { token?: boolean }) {
       }, 3000);
       return;
     }
-    if (!clientId.trim()) {
-      toast('Device flow needs a GitHub OAuth app client id', 'error', 'create one at github.com/settings/developers and paste it below, or use a token');
+    // github.com: Prong's own app unless one is set here; another server needs its own
+    if (!clientId.trim() && signInHost !== 'github.com') {
+      setHost(signInHost);
+      setMode('pat');
       return;
     }
     await live.saveSettings({ githubClientId: clientId.trim() });
     const mine = ++flow.current;
     setMode('device');
     setBusy(true);
-    const ok = await live.deviceFlow(clientId.trim(), host, (code, url) => setDevice({ code, url }), () => flow.current !== mine);
+    const ok = await live.deviceFlow(clientId.trim(), signInHost, (code, url) => setDevice({ code, url }), () => flow.current !== mine);
     if (flow.current !== mine) return;
     setBusy(false);
     if (ok) setMode('list');
@@ -619,7 +631,7 @@ function GitHubPrefs({ token: startWithToken }: { token?: boolean }) {
         Accounts
       </Txt>
       <Txt muted size={FONT.sm} style={{ marginTop: 4 }}>
-        Used for the repository list when cloning and for uploading SSH keys. Git itself authenticates with your SSH keys or credential helper.
+        An account signs git in over HTTPS where a repository’s Connection names it (fetch, pull, push), lists repositories to clone and uploads SSH keys.
       </Txt>
       <View style={{ marginTop: 12 }}>
         {accounts.length === 0 && (
@@ -635,16 +647,21 @@ function GitHubPrefs({ token: startWithToken }: { token?: boolean }) {
               <Txt size={FONT.sm} muted>
                 {a.host} · {a.orgs.length ? `orgs: ${a.orgs.join(', ')}` : 'no organizations'}
               </Txt>
+              {limited[a.id] && status[a.id]?.state !== 'expired' && (
+                <Txt size={FONT.xs} color={t.warn} style={{ marginTop: 2 }} testID={`account-limited-${a.login}`}>
+                  Signed in through a GitHub App: reaches only the repositories the app is installed on, so a push elsewhere is refused. Sign in again for access to all your repositories.
+                </Txt>
+              )}
             </View>
             <AccountBadge id={a.id} />
-            {status[a.id]?.state === 'expired' && (
+            {(status[a.id]?.state === 'expired' || limited[a.id]) && (
               <Button
                 small
                 primary
                 label="Sign in again"
                 style={{ marginLeft: 8 }}
-                // the device sign-in needs a client id; without one, a token (it used to end in an error)
-                onPress={() => (clientId.trim() || !engine.online ? void startDevice() : (setHost(a.host), setMode('pat')))}
+                // in the browser (Prong's app on github.com, or the one set below); another server without one: a token
+                onPress={() => void startDevice(a.host)}
                 testID={`resign-${a.login}`}
               />
             )}
@@ -659,12 +676,12 @@ function GitHubPrefs({ token: startWithToken }: { token?: boolean }) {
         </Txt>
       )}
       <View style={{ flexDirection: 'row', marginTop: 12, flexWrap: 'wrap' }}>
-        <Button label="Sign in with GitHub (device)" icon="github" primary onPress={() => void startDevice()} testID="accounts-device" />
+        <Button label="Sign in with GitHub" icon="github" primary onPress={() => void startDevice()} testID="accounts-device" />
         <Button label="Token…" style={{ marginLeft: 8 }} onPress={() => setMode('pat')} testID="accounts-token" />
       </View>
-      <Field label="OAuth app client id (for the device flow)" style={{ marginTop: 14 }}>
+      <Field label="Your own OAuth app client id (optional: GitHub Enterprise, or another app)" style={{ marginTop: 14 }}>
         <View style={{ flexDirection: 'row' }}>
-          <Input value={clientId} onChange={setClientId} mono placeholder="Iv1.…" style={{ flex: 1 }} testID="client-id" />
+          <Input value={clientId} onChange={setClientId} mono placeholder="empty: Prong’s app on github.com" style={{ flex: 1 }} testID="client-id" />
           <Button small label="Save" style={{ marginLeft: 6 }} testID="client-id-save" onPress={() => void live.saveSettings({ githubClientId: clientId.trim() }).then(() => toast('Client id saved', 'success'))} />
         </View>
       </Field>

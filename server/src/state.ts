@@ -2,6 +2,7 @@ import type { SavedSession } from './types.js';
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import path from 'node:path';
+import { ownClientId } from './github.js';
 
 /** Small JSON documents persisted under ~/.prong (repos, workspaces, settings). */
 export const STATE_DIR = () => process.env.PRONG_STATE_DIR ?? path.join(homedir(), '.prong');
@@ -96,6 +97,7 @@ export const loadSettings = (): Settings => {
   const ui = { ...DEFAULT_UI, ...(stored.ui ?? {}) };
   // when running from the source tree the app sources are the project itself
   if (!agent.sourcesPath && process.env.PRONG_SOURCES_DEFAULT) agent.sourcesPath = process.env.PRONG_SOURCES_DEFAULT;
-  return { ...DEFAULT_SETTINGS, ...stored, agent, ui };
+  // Prong's former GitHub App id saved here is not the user's own: the built-in app replaces it
+  return { ...DEFAULT_SETTINGS, ...stored, agent, ui, githubClientId: ownClientId(stored.githubClientId) };
 };
 export const saveSettings = (s: Settings) => writeJson('settings.json', s);

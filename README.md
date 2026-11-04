@@ -35,7 +35,7 @@ Prong is an experiment. It runs on macOS, the app is signed ad hoc (you build it
   - Blame, file history, undo.
   - Git LFS files left as pointers (cloned without LFS, or left out by `.lfsconfig`) are restored by folder.
 - **Accounts.**
-  - GitHub sign-in (Device Flow or a token); clone from your repository list.
+  - GitHub sign-in in the browser (Prong’s own OAuth app, like Fork: reaches every repository you can) or a token; clone from your repository list.
   - SSH keys: generate, add to ssh-agent, upload to GitHub.
   - A connection (SSH key or account) per repository.
   - Secrets are kept in the macOS Keychain.
