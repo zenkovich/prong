@@ -54,11 +54,50 @@ export async function runAgent(o: AgentRunOptions): Promise<{ ok: boolean; text:
   // tools: git, the usual file tools and a few read-only looks (folders, whether SSH gets in); everything else
   // needs the user's terminal
   args.push('--allowedTools', o.mode === 'app' ? 'Bash(npx tsc *),Bash(npm test*),Bash(git *),Read,Edit,Write,Glob,Grep' : 'Bash(git *),Bash(ls *),Bash(ssh-add -l*),Read,Glob,Grep');
+  return streamClaude(check.path, args, o);
+}
+
+/** what the error window asks: the failure in plain words, in the user's language */
+export interface ExplainOptions {
+  title: string;
+  detail?: string;
+  /** the repository it happened in, or any folder (nothing in it is changed) */
+  cwd: string;
+  /** an English language name ("Russian"); the answer is written in it */
+  language: string;
+  /** what the repository was doing (branch, operation in progress), when known */
+  context?: string;
+  cliPath?: string;
+  model?: string;
+  onEvent: AgentRunOptions['onEvent'];
+  signal?: AbortSignal;
+}
+
+/** a fast model: the explanation is a few sentences, wanted while the error is on screen */
+export const EXPLAIN_MODEL = 'haiku';
+/** the agent may look around, never change anything */
+const EXPLAIN_TOOLS = 'Bash(git status*),Bash(git log*),Bash(git remote*),Bash(git branch*),Bash(git config --get*),Bash(git rev-parse*),Bash(git stash list*),Bash(ls *),Read,Glob,Grep';
+const explainSystem = (language: string) =>
+  `You are inside Prong, a git client. An action the user took in Prong failed; explain the error to them. If it helps, look at the repository with the read-only commands you are allowed (git status, git log, git remote -v, git branch -vv…), but change nothing and do not try to fix it. Write in ${language}, for a person, not a log: at most three short sentences — what happened and why, then the most likely way out (Prong's own buttons when they fit: Pull, Push, Fetch, Abort, Stage, Connection…, Accounts → Sign in again). Plain text: no headings, no lists, no code blocks; a command or a branch name in \`code\` at most. No greeting, no offer of more help.`;
+
+/** a short explanation of a failure; the events show what the agent is looking at meanwhile */
+export async function explainProblem(o: ExplainOptions): Promise<{ ok: boolean; text: string; costUsd?: number }> {
+  const check = await checkClaude(o.cliPath);
+  if (!check.ok || !check.path) throw new Error('Claude Code CLI not found. Install it or set the path in Settings → Agent.');
+  const output = (o.detail ?? '').trim();
+  const clipped = output.length > 6000 ? `${output.slice(0, 2500)}\n…\n${output.slice(-3500)}` : output;
+  const prompt = [`Failed: ${o.title}`, clipped && `Output:\n\`\`\`\n${clipped}\n\`\`\``, o.context].filter(Boolean).join('\n\n');
+  const args = ['-p', prompt, '--output-format', 'stream-json', '--verbose', '--append-system-prompt', explainSystem(o.language), '--model', o.model || EXPLAIN_MODEL, '--max-turns', '6', '--allowedTools', EXPLAIN_TOOLS];
+  return streamClaude(check.path, args, o);
+}
+
+/** runs Claude Code and reads its stream-json: tool calls and text as events, the final answer returned */
+async function streamClaude(bin: string, args: string[], o: { cwd: string; env?: Record<string, string>; signal?: AbortSignal; onEvent: AgentRunOptions['onEvent'] }): Promise<{ ok: boolean; text: string; costUsd?: number; sessionId?: string }> {
   let finalText = '';
   let ok = false;
   let costUsd: number | undefined;
   let sessionId: string | undefined;
-  const r = await run(check.path, args, {
+  const r = await run(bin, args, {
     signal: o.signal,
     cwd: o.cwd,
     env: { ...(o.env ?? {}), CLAUDECODE: '', CLAUDE_CODE_ENTRYPOINT: 'prong' },

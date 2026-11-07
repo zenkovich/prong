@@ -35,7 +35,7 @@ const toolbarSrc = () => readFileSync(path.join(appSources, 'src/Toolbar.tsx'), 
 const sidebarFile = path.join(appSources, 'src/Sidebar.tsx');
 const sidebarSrc = () => (existsSync(sidebarFile) ? readFileSync(sidebarFile, 'utf8') : '');
 /** page errors a check provokes on purpose (a crash, a refused revert) */
-const expectedErrors = [/e2e agent:/, /Minified React error #31/, /Objects are not valid as a React child/];
+const expectedErrors = [/e2e agent:/, /e2e explain:/, /Minified React error #31/, /Objects are not valid as a React child/];
 
 // ---------- the repositories the agent works in, the system calls, links, the clipboard ----------
 
@@ -1048,6 +1048,61 @@ await step('versions: with the rollback box off, a change that does not build st
     await tid('agent-auto-rollback').click();
     await until(async () => (await settings()).agent.autoRollbackOnBuildError === true, 'the box back on');
   }
+});
+
+// ---------- errors explained by the AI ----------
+
+/** Preferences changed behind the app's back, then read again by it (a reload) */
+async function withPrefs(patch) {
+  await fetch(base + '/api/settings', { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify(patch) });
+  await page.reload();
+  await page.waitForTimeout(1500);
+}
+const crash = (msg) => page.evaluate((m) => setTimeout(() => {
+  throw new Error(m);
+}, 0), msg);
+async function closeError() {
+  await tid('error-close').click();
+  await waitGone('error-dialog');
+}
+
+await step('errors: the AI explains one as its window opens — its status, then a few words in the language picked in Preferences; Stop; a resize grows git’s output; switched off, a button asks', async () => {
+  await withPrefs({ explainErrors: true, language: 'Russian' });
+  clearLog();
+  await crash('e2e explain: the push was rejected');
+  await tid('error-dialog').waitFor({ timeout: 5000 });
+  await tid('error-explain').waitFor({ timeout: 5000 });
+  await page.waitForFunction(() => /\(Russian\) The remote refused the push/.test(document.querySelector('[data-testid="error-explain-text"]')?.textContent ?? ''), null, { timeout: 15000 });
+  const [e] = await waitEntries(1);
+  expect(e.model === 'haiku', 'a fast model: ' + e.model);
+  expect(/explain the error to them/.test(e.raw) && /Write in Russian/.test(e.raw) && e.prompt.includes('e2e explain: the push was rejected'), 'the question, in Russian: ' + e.raw.slice(0, 300));
+  expect(e.apply === 'no', 'it changes nothing');
+  // the output box grows with the window
+  const before = (await tid('error-detail-box').boundingBox()).height;
+  const g = await page.locator('[data-testid="modal-error"] [data-testid="resize-grip"]').boundingBox();
+  await page.mouse.move(g.x + g.width / 2, g.y + g.height / 2);
+  await page.mouse.down();
+  await page.mouse.move(g.x + 40, g.y + 160, { steps: 6 });
+  await page.mouse.up();
+  await until(async () => (await tid('error-detail-box').boundingBox()).height > before + 100, `the output grew with the window: ${before} → ${(await tid('error-detail-box').boundingBox()).height}`, 3000);
+  await closeError();
+  // while it works: what it is doing; Stop ends it
+  await crash('e2e explain: slow explain please');
+  await tid('error-explain-status').waitFor({ timeout: 5000 });
+  await page.waitForFunction(() => /Looking at git status/.test(document.querySelector('[data-testid="error-explain-step"]')?.textContent ?? ''), null, { timeout: 8000 });
+  await tid('error-explain-stop').click();
+  await page.waitForFunction(() => /Stopped/.test(document.querySelector('[data-testid="error-explain-failed"]')?.textContent ?? ''), null, { timeout: 8000 });
+  await closeError();
+  // switched off: nothing runs, the window offers it
+  await withPrefs({ explainErrors: false, language: 'auto' });
+  clearLog();
+  await crash('e2e explain: off now');
+  await tid('error-explain-start').waitFor({ timeout: 5000 });
+  await page.waitForTimeout(1200);
+  expect(entries().length === 0, 'not asked: ' + entries().length);
+  await tid('error-explain-start').click();
+  await tid('error-explain-text').waitFor({ timeout: 15000 });
+  await closeError();
 });
 
 // ---------- Ask AI ----------

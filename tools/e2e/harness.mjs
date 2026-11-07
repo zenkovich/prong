@@ -293,8 +293,9 @@ process.on('exit', () => {
   } catch {}
 });
 const base = `http://127.0.0.1:${port}`;
-// the agent is a stand-in that prints Claude Code's stream events (no network, no cost)
-await fetch(base + '/api/settings', { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ agent: { cliPath: path.join(ROOT, 'tools/fake-claude.sh'), sourcesPath: appSources } }) });
+// the agent is a stand-in that prints Claude Code's stream events (no network, no cost); errors are not explained
+// by it on their own (every suite's error windows would run it): the agent suite turns that on where it checks it
+await fetch(base + '/api/settings', { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ agent: { cliPath: path.join(ROOT, 'tools/fake-claude.sh'), sourcesPath: appSources }, explainErrors: false }) });
 // workspaces: work and home both scan `root` (alpha, beta; home-root/gamma is one level deeper), lab scans home-root
 await fetch(base + '/api/workspaces', { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify([{ id: 'work', name: 'work', rootPath: root, scanDepth: 1 }, { id: 'home', name: 'home', rootPath: root, scanDepth: 1 }, { id: 'lab', name: 'lab', rootPath: path.join(root, 'home-root'), scanDepth: 1 }]) });
 

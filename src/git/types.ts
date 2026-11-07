@@ -144,7 +144,7 @@ export interface FileChange {
    * A merge conflict: the conflicting regions of each side ("⋯" between regions); `deleted`: one side removed the
    * file; `binary`: no text to show, only a side to take
    */
-  conflict?: { ours: string[]; theirs: string[]; base: string[]; deleted?: 'ours' | 'theirs'; binary?: boolean };
+  conflict?: { ours: string[]; theirs: string[]; base: string[]; deleted?: 'ours' | 'theirs'; binary?: boolean; blocks?: ConflictBlock[] };
   /** listed without its diff (a commit with very many files): the diff is loaded when the file is selected */
   lazy?: boolean;
   /** the diff was cut short (more output than the engine reads at once) */
@@ -256,3 +256,11 @@ export interface RepoSnapshot {
   /** a repository with no commits yet (git init): the branch its first commit will make (no ref names it yet) */
   unborn?: string;
 }
+
+/**
+ * The whole conflicted file as the merge left it, in order: lines both sides agree on, and each conflict with what
+ * ours, the base and theirs have there. Joined with "\n" (the merge's own lines, markers left out) it is the file.
+ */
+export type ConflictBlock = { kind: 'same'; lines: string[] } | { kind: 'conflict'; ours: string[]; base: string[]; theirs: string[] };
+/** what a conflict becomes: one side, both in either order, or the base (neither change) */
+export type ConflictChoice = 'ours' | 'theirs' | 'ours+theirs' | 'theirs+ours' | 'base';

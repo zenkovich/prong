@@ -1,17 +1,20 @@
-import React from 'react';
+import React, { useEffect } from 'react';
 import { ScrollView, View } from 'react-native';
 import { errorHint, isAccountSignInError, isSignInError } from '../state/errorHints';
-import { clearErrors, closeErrors, fullDate, openDialog, showErrors, useStore } from '../state/store';
+import { clearErrors, closeErrors, ErrorEntry, fullDate, openDialog, showErrors, useStore } from '../state/store';
 import * as live from '../state/live';
 import { FONT, useTheme } from '../theme';
 import { Icon } from '../ui/Icon';
-import { Modal } from '../ui/overlays';
-import { Button, Txt, useKeyboard } from '../ui/primitives';
+import { Modal, useModalResized } from '../ui/overlays';
+import { Button, Spinner, Txt, useKeyboard } from '../ui/primitives';
+import { Markdown } from './Markdown';
 
 /**
  * Errors in full: what failed, what to do about it, and git's own output (selectable, scrollable).
  * Opens on every error; the session's earlier errors are a step away (‹ ›), the status bar reopens it.
- * "Ask AI" hands the error to the agent, which looks into it in the repository it happened in.
+ * The agent explains it at once in a few words (in the language picked in Preferences); "Ask AI" hands it to the
+ * agent's chat, which looks into it in the repository it happened in and fixes what is safe to fix. The window
+ * grows with a resize, git's output with it.
  */
 export function ErrorDialogHost() {
   const open = useStore((s) => s.errorOpen);
@@ -40,9 +43,16 @@ function ErrorDialog({ idx }: { idx: number }) {
     else if (k.key === 'ArrowRight' && older) showErrors(older.id);
   }, { errorLayer: true });
   const copy = () => live.copyText(`${e.title}\n${e.detail ?? ''}`.trim());
+  // explained as it is shown (switched off in Preferences: on its button); an app without the engine has no agent
+  const online = useStore((s) => s.engine.online);
+  const auto = useStore((s) => s.serverSettings?.explainErrors !== false);
+  useEffect(() => {
+    if (online && auto && !e.explain) void live.explainError(e.id);
+  }, [e.id, online, auto, e.explain]);
   return (
     <Modal
       layer="error"
+      fill
       title={errors.length > 1 ? `Error ${idx + 1} of ${errors.length}` : 'Error'}
       width={680}
       onClose={closeErrors}
@@ -116,7 +126,17 @@ function ErrorDialog({ idx }: { idx: number }) {
         </>
       }
     >
-      <View testID="error-dialog">
+      <ErrorBody e={e} hint={hint} online={online} />
+    </Modal>
+  );
+}
+
+/** the window's content: the error, the AI's explanation, the hint, git's output (all the height a resize gives) */
+function ErrorBody({ e, hint, online }: { e: ErrorEntry; hint: string | null; online: boolean }) {
+  const t = useTheme();
+  const resized = useModalResized();
+  return (
+      <View testID="error-dialog" style={{ flex: resized ? 1 : undefined, flexShrink: 1, minHeight: 0 }}>
         <View style={{ flexDirection: 'row', alignItems: 'baseline', flexWrap: 'wrap' }}>
           <Txt size={FONT.lg} weight="600" color={t.del} selectable testID="error-title">
             {e.title}
@@ -130,6 +150,7 @@ function ErrorDialog({ idx }: { idx: number }) {
         <Txt size={FONT.xs} faint style={{ marginTop: 2 }}>
           {fullDate(e.at)}
         </Txt>
+        {online && <Explanation e={e} />}
         {hint && (
           <View style={{ flexDirection: 'row', marginTop: 12, padding: 10, borderWidth: 1, borderColor: t.info + '55', backgroundColor: t.info + '14' }} testID="error-hint">
             <Icon name="info" size={13} color={t.info} />
@@ -139,13 +160,54 @@ function ErrorDialog({ idx }: { idx: number }) {
           </View>
         )}
         {e.detail ? (
-          <ScrollView style={{ marginTop: 12, maxHeight: 340, borderWidth: 1, borderColor: t.border, backgroundColor: t.bg }} contentContainerStyle={{ padding: 10 }}>
+          // as tall as it needs up to 340 px; after a resize, all the height the window has
+          <ScrollView style={[{ marginTop: 12, borderWidth: 1, borderColor: t.border, backgroundColor: t.bg, flexShrink: 1, minHeight: 60 }, resized ? { flex: 1 } : { maxHeight: 340 }]} contentContainerStyle={{ padding: 10 }} testID="error-detail-box">
             <Txt size={FONT.sm} mono selectable testID="error-detail" style={{ whiteSpace: 'pre-wrap' } as any}>
               {e.detail}
             </Txt>
           </ScrollView>
         ) : null}
       </View>
-    </Modal>
+  );
+}
+
+/** the agent's few words: what it is looking at while it works, then what the error means and the way out */
+function Explanation({ e }: { e: ErrorEntry }) {
+  const t = useTheme();
+  const x = e.explain;
+  const box = { flexDirection: 'row' as const, marginTop: 12, padding: 10, borderWidth: 1, borderColor: t.accent + '55', backgroundColor: t.accent + '12' };
+  if (!x)
+    return (
+      <View style={{ flexDirection: 'row', marginTop: 10 }}>
+        <Button small icon="agent" label="Explain with AI" onPress={() => void live.explainError(e.id)} testID="error-explain-start" />
+      </View>
+    );
+  return (
+    <View style={box} testID="error-explain">
+      <View style={{ marginTop: 1 }}>{x.state === 'running' ? <Spinner size={13} color={t.accent} /> : <Icon name="agent" size={14} color={x.state === 'done' ? t.accent : t.textFaint} />}</View>
+      <View style={{ marginLeft: 8, flex: 1, minWidth: 0 }}>
+        {x.state === 'running' ? (
+          <>
+            <Txt size={FONT.sm} weight="600" testID="error-explain-status">
+              AI is looking into it…
+            </Txt>
+            <Txt size={FONT.xs} faint numberOfLines={1} style={{ marginTop: 2 }} testID="error-explain-step">
+              {x.step ?? ''}
+            </Txt>
+          </>
+        ) : x.state === 'done' ? (
+          <Markdown text={x.text ?? ''} size={FONT.sm} testID="error-explain-text" />
+        ) : (
+          <Txt size={FONT.sm} faint testID="error-explain-failed">
+            AI could not explain it: {x.text}
+          </Txt>
+        )}
+      </View>
+      {x.state === 'running' ? (
+        <Button small label="Stop" style={{ marginLeft: 8 }} onPress={() => live.stopExplaining(e.id)} testID="error-explain-stop" />
+      ) : (
+        <Button small label={x.state === 'done' ? 'Again' : 'Try again'} style={{ marginLeft: 8 }} onPress={() => void live.explainError(e.id, true)} testID="error-explain-retry" />
+      )}
+    </View>
   );
 }

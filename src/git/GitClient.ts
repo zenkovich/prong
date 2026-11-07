@@ -1,5 +1,5 @@
 import { Platform } from 'react-native';
-import { Commit, FileChange, Hunk, PullOptions, PushOptions, QueueItem, RepoAuth, RepoAuthInfo, RepoSnapshot, Sha, SavedSession, SubmoduleChanges, SyncPrefs } from './types';
+import { Commit, ConflictChoice, FileChange, Hunk, PullOptions, PushOptions, QueueItem, RepoAuth, RepoAuthInfo, RepoSnapshot, Sha, SavedSession, SubmoduleChanges, SyncPrefs } from './types';
 
 /**
  * Everything the UI needs from a git engine. The HTTP implementation talks to the local
@@ -90,6 +90,10 @@ export interface ServerSettings {
   signCommits: boolean;
   agent: { provider: 'anthropic-claude-code' | 'anthropic-api' | 'openai-compatible'; model: string; cliPath: string; sourcesPath: string; askBeforeApply: boolean; autoRollbackOnBuildError: boolean };
   githubClientId: string;
+  /** the language the AI writes in (an English name), or 'auto': the system's */
+  language?: string;
+  /** errors explained by the agent as their window opens */
+  explainErrors?: boolean;
   avatars: boolean;
   ui: UiSettings;
 }
@@ -274,6 +278,7 @@ export interface GitClient {
   unstageHunk(path: string, file: FileChange, hunk: Hunk): Promise<void>;
   discardHunk(path: string, file: FileChange, hunk: Hunk): Promise<{ undo: string | null }>;
   resolveConflict(path: string, file: string, take: 'ours' | 'theirs' | 'both'): Promise<void>;
+  resolveConflictParts(path: string, file: string, choices: ConflictChoice[]): Promise<void>;
   commit(path: string, message: string, amend: boolean): Promise<{ sha: Sha }>;
 
   fetch(path: string, remote?: string, prune?: boolean, tags?: boolean): Promise<{ opId: string }>;
@@ -393,6 +398,7 @@ export interface GitClient {
   agentCheck(): Promise<{ ok: boolean; path: string | null; version: string }>;
   /** `resume`: the Claude Code session to continue (a follow-up in the same chat and folder) */
   agentRun(prompt: string, cwd: string, mode: 'repo' | 'app', apply?: boolean, resume?: string): Promise<{ opId: string }>;
+  agentExplain(p: { title: string; detail?: string; repo?: string; context?: string; language: string }): Promise<{ opId: string }>;
 
   /** subscribe to progress events of long operations; returns unsubscribe */
   /** `onConnection`: the event stream dropped (the engine stopped) or came back */
@@ -596,6 +602,9 @@ export class HttpGitClient implements GitClient {
   }
   async resolveConflict(path: string, file: string, take: 'ours' | 'theirs' | 'both') {
     await this.op('resolveConflict', path, { file, take });
+  }
+  async resolveConflictParts(path: string, file: string, choices: ConflictChoice[]) {
+    await this.op('resolveConflictParts', path, { file, choices });
   }
   commit(path: string, message: string, amend: boolean) {
     return this.op<{ sha: Sha }>('commit', path, { message, amend });
@@ -876,6 +885,9 @@ export class HttpGitClient implements GitClient {
   }
   agentRun(prompt: string, cwd: string, mode: 'repo' | 'app', apply = true, resume?: string) {
     return this.post<{ opId: string }>('/api/agent/run', { prompt, cwd, mode, apply, resume });
+  }
+  agentExplain(p: { title: string; detail?: string; repo?: string; context?: string; language: string }) {
+    return this.post<{ opId: string }>('/api/agent/explain', p);
   }
 
   events(listener: (e: OpEvent) => void, onConnection?: (up: boolean) => void): () => void {

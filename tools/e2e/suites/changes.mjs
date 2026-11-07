@@ -155,6 +155,20 @@ const ABORT_ALL = repo('chg-abort-all', { 'a.txt': 'base\n', 'clean.txt': 'clean
   write(d, 'a.txt', 'ours\n');
   git(d, 'commit', '-qam', 'Ours');
 });
+/** a line edited in one word, and a line rewritten from scratch (the words that changed are marked only in the first) */
+const WORDS = repo('chg-words', { 'cfg.ts': 'const timeout = 3000;\nimport x from "y";\n' }, (d) => {
+  write(d, 'cfg.ts', 'const timeout = 5000;\nexport default function App() {}\n');
+});
+/** two conflicts in one file, apart, with lines both sides keep between them (resolved one by one, as in Fork) */
+const PARTS = repo('chg-parts', { 'p.txt': ['head', 'one', 'm1', 'm2', 'm3', 'm4', 'm5', 'm6', 'm7', 'm8', 'two', 'tail', ''].join('\n') }, (d) => {
+  const lines = (a, b) => ['head', a, 'm1', 'm2', 'm3', 'm4', 'm5', 'm6', 'm7', 'm8', b, 'tail', ''].join('\n');
+  git(d, 'checkout', '-q', '-b', 'other');
+  write(d, 'p.txt', lines('one theirs', 'two theirs'));
+  git(d, 'commit', '-qam', 'Theirs');
+  git(d, 'checkout', '-q', 'main');
+  write(d, 'p.txt', lines('one ours', 'two ours'));
+  git(d, 'commit', '-qam', 'Ours');
+});
 /** thousands of changed and new files (Fork discards them at once) */
 const MANY = repo('chg-many', { 'README.md': '# many\n' }, (d) => {
   for (let i = 0; i < 3000; i++) {
@@ -384,6 +398,19 @@ await check('changes: list / tree switches both lists; the tree nests the new fo
 });
 
 // ---------- the diff of each kind ----------
+
+await check('diff: inside a changed line the words that changed are marked, on both sides (unified and split), as in Fork; a line rewritten from scratch is not', async () => {
+  await openChanges('chg-words', 'file-unstaged-cfg.ts');
+  await row('unstaged', 'cfg.ts').click();
+  await waitText('5000');
+  const marks = () => page.locator('[data-testid="diff-body"] [data-testid="word-mark"]').allInnerTexts();
+  await until(async () => (await marks()).join('|') === '3000|5000', 'only 3000 and 5000 marked: ' + (await marks()).join('|'), 3000);
+  await page.getByLabel('split', { exact: true }).first().click();
+  await until(async () => (await marks()).join('|') === '3000|5000', 'split too: ' + (await marks()).join('|'), 3000);
+  await page.getByLabel('unified', { exact: true }).first().click();
+  await page.waitForTimeout(300);
+  expect(WORDS.length > 0, 'fixture');
+});
 
 await check('diff: a modified, a deleted and a new file show their lines; unified and split side by side; SQL "-- comment" lines are not lost', async () => {
   await openChanges('chg-kinds', 'file-unstaged-mod.txt');
@@ -1142,9 +1169,10 @@ await check('a merge conflict: the bar says so, the three sides show, Use theirs
   // the sides of a.txt (it used to say "No textual changes.")
   await row('unstaged', 'a.txt').click();
   await page.getByTestId('conflict-view').waitFor({ timeout: 5000 });
-  expect((await page.getByTestId('conflict-col-ours').innerText()).includes('ours a'), 'ours');
-  expect((await page.getByTestId('conflict-col-base').innerText()).includes('base a'), 'the base');
-  expect((await page.getByTestId('conflict-col-theirs').innerText()).includes('theirs a'), 'theirs');
+  expect((await page.getByTestId('conflict-1-ours').innerText()).includes('ours a'), 'ours');
+  expect((await page.getByTestId('conflict-1-theirs').innerText()).includes('theirs a'), 'theirs');
+  await page.getByTestId('conflict-show-base').click();
+  expect((await page.getByTestId('conflict-1-base').innerText()).includes('base a'), 'the base, when asked for');
   expect(!(await page.getByText('Stage file', { exact: true }).count()), 'no Stage file over a conflict');
   await page.getByTestId('conflict-theirs').click();
   await until(() => read(MERGE, 'a.txt') === 'top\ntheirs a\nend\n' && staged(MERGE).includes('a.txt'), 'a.txt: theirs, resolved');
@@ -1168,6 +1196,33 @@ await check('a merge conflict: the bar says so, the three sides show, Use theirs
   await until(() => git(MERGE, 'log', '-1', '--format=%P').trim().split(' ').length === 2, 'a merge commit');
   expect(/^Merge branch 'other'/.test(git(MERGE, 'log', '-1', '--format=%s')), 'with the prepared message');
   expect(!existsSync(path.join(MERGE, '.git/MERGE_HEAD')), 'the merge is over');
+});
+
+await check('conflicts one by one, as in Fork: the whole file with each conflict as ours | theirs, the words that differ marked; ticks pick a side or both (in the order ticked); Save writes the picks and marks it resolved', async () => {
+  try {
+    git(PARTS, 'merge', 'other');
+  } catch {
+    /* conflicts */
+  }
+  await openChanges('chg-parts', 'file-unstaged-p.txt');
+  await row('unstaged', 'p.txt').click();
+  await page.getByTestId('conflict-view').waitFor({ timeout: 5000 });
+  expect(/0 of 2 picked/.test(await page.getByTestId('conflict-progress').innerText()), 'two conflicts, none picked');
+  expect(await page.getByTestId('conflict-save').getAttribute('aria-disabled') === 'true', 'Save waits for every conflict');
+  // the agreed lines between the conflicts fold, the file's start shows
+  expect((await page.getByTestId('conflict-view').innerText()).includes('head') && (await page.getByTestId('conflict-fold').count()) === 1, 'the middle folded');
+  // what each side changed in the line is marked
+  expect((await page.locator('[data-testid="conflict-1-theirs"] [data-testid="word-mark"]').allInnerTexts()).join('') === 'theirs', 'the changed word marked');
+  // conflict 1: theirs; conflict 2: theirs ticked first, then ours: both, theirs first
+  await page.getByTestId('conflict-1-theirs').click();
+  expect((await page.getByTestId('conflict-1-result').innerText()).includes('one theirs'), 'the result under it');
+  await page.getByTestId('conflict-2-theirs').click();
+  await page.getByTestId('conflict-2-ours').click();
+  expect(/both, theirs first/i.test(await page.getByTestId('conflict-2').innerText()), 'both, theirs first');
+  expect(/2 of 2 picked/.test(await page.getByTestId('conflict-progress').innerText()), 'all picked');
+  await page.getByTestId('conflict-save').click();
+  await until(() => read(PARTS, 'p.txt') === ['head', 'one theirs', 'm1', 'm2', 'm3', 'm4', 'm5', 'm6', 'm7', 'm8', 'two theirs', 'two ours', 'tail', ''].join('\n') && staged(PARTS).includes('p.txt'), 'written from the picks and staged: ' + read(PARTS, 'p.txt'));
+  git(PARTS, 'merge', '--abort');
 });
 
 await check('a merge resolved all to our side stages nothing and still commits (Commit stayed off)', async () => {
@@ -1253,7 +1308,7 @@ await check('a conflict left by a stash apply: no Abort (there is nothing to abo
   expect(!(await page.getByTestId('conflict-abort').count()), 'no Abort button');
   await row('unstaged', 's.txt').click();
   await page.getByTestId('conflict-view').waitFor({ timeout: 5000 });
-  expect((await page.getByTestId('conflict-col-theirs').innerText()).includes('stashed') && (await page.getByTestId('conflict-col-ours').innerText()).includes('committed'), 'the stashed and the committed side');
+  expect((await page.getByTestId('conflict-1-theirs').innerText()).includes('stashed') && (await page.getByTestId('conflict-1-ours').innerText()).includes('committed'), 'the stashed and the committed side');
   await page.getByTestId('conflict-ours').click();
   await until(() => read(STASHPOP, 's.txt') === 'committed\n' && !git(STASHPOP, 'status', '--porcelain').startsWith('UU'), 'resolved to ours');
   await page.waitForFunction(() => !document.querySelector('[data-testid="conflict-bar"]'), null, { timeout: 5000 });

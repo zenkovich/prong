@@ -44,6 +44,10 @@ export interface Settings {
     autoRollbackOnBuildError: boolean;
   };
   githubClientId: string;
+  /** the language the AI writes in for the user (error explanations): an English language name, or 'auto' (the system's) */
+  language: string;
+  /** an error that opens its window is explained by the agent at once, in a few words */
+  explainErrors: boolean;
   /** author avatars from GitHub / Gravatar (cached on disk) */
   avatars: boolean;
   /** interface preferences the app persists across launches */
@@ -82,6 +86,8 @@ export const DEFAULT_SETTINGS: Settings = {
   signCommits: false,
   agent: { provider: 'anthropic-claude-code', model: '', cliPath: '', sourcesPath: '', askBeforeApply: false, autoRollbackOnBuildError: true },
   githubClientId: '',
+  language: 'auto',
+  explainErrors: true,
   avatars: true,
   ui: DEFAULT_UI,
 };

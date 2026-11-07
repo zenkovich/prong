@@ -12,9 +12,9 @@ import { filterRevs } from '../components/branchFilter';
 import { remoteTwin } from '../components/branchNames';
 import type { BlobSide, LfsPick, UiSettings } from '../git/GitClient';
 import { GhRepo, HttpGitClient, OpEvent, RebaseTodoItem, ServerSettings, Submodule, SwitchOptions } from '../git/GitClient';
-import { Commit, FetchOptions, FileChange, GitHubAccount, Hunk, PullOptions, PushOptions, QueueItem, RepoAuth, RepoInfo, SavedSession, Sha, SshKey, Workspace } from '../git/types';
+import { Commit, ConflictChoice, FetchOptions, FileChange, GitHubAccount, Hunk, PullOptions, PushOptions, QueueItem, RepoAuth, RepoInfo, SavedSession, Sha, SshKey, Workspace } from '../git/types';
 import { AgentMessage, AppVersion } from '../agent/types';
-import { applyUiPrefs, Area, closeDialog, confirm, DEFAULT_COLLAPSED_GROUPS, ErrorEntry, findCommit, openAgentChat, UndoEntry, finishAgentRun, getState, nextRevealNonce, openDialog, openRepo, RebaseTodo, RepoState, Section, setState, subscribe, toast, updateAgent, updateRepo } from './store';
+import { applyUiPrefs, Area, patchErrorExplain, closeDialog, confirm, DEFAULT_COLLAPSED_GROUPS, ErrorEntry, findCommit, openAgentChat, UndoEntry, finishAgentRun, getState, nextRevealNonce, openDialog, openRepo, RebaseTodo, RepoState, Section, setState, subscribe, toast, updateAgent, updateRepo } from './store';
 
 export const client = new HttpGitClient();
 
@@ -80,6 +80,7 @@ function onEvent(e: OpEvent) {
   if (e.event === 'ui-updated') return onUiUpdated();
   if (e.event === 'queue') return onQueue(e.repo, e.items ?? []);
   if (rebuildOp && e.opId === rebuildOp.opId) return onRebuildEvent(e);
+  if (handleExplainEvent(e)) return;
   if (handleAgentEvent(e)) return;
   const log = opLog.get(e.opId) ?? [];
   if (e.line) {
@@ -1124,6 +1125,10 @@ export function discardLines(path: string, hunkId: string, lines: number[]) {
 /** a conflicted file resolved to one side (or both, ours first) and marked resolved */
 export function resolveConflict(path: string, take: 'ours' | 'theirs' | 'both') {
   void mutate(`Resolve ${baseName(path)} (${take})`, (p) => client.resolveConflict(p, path, take), () => toast(`Resolved ${baseName(path)}: ${take === 'both' ? 'both sides' : take}`, 'success'));
+}
+/** a conflicted file resolved conflict by conflict as picked in its view, and marked resolved */
+export function resolveConflictParts(path: string, choices: ConflictChoice[]) {
+  void mutate(`Resolve ${baseName(path)}`, (p) => client.resolveConflictParts(p, path, choices), () => toast(`Resolved ${baseName(path)}: ${choices.length} conflict${choices.length === 1 ? '' : 's'} as picked`, 'success'));
 }
 /** a conflicted file the user edited by hand: staged, which tells git it is resolved */
 export function markResolved(path: string) {
@@ -2438,6 +2443,102 @@ async function startAgentRun(clean: string, mode: 'repo' | 'app', retargetable: 
   }
   agentOp = { opId: op.opId, msgId, mode, prompt: clean, cwd, retargetable, before };
   setState({ operation: { label: AGENT_OP_LABEL, progress: 0, log: [] } });
+}
+
+// ---------- errors explained by the agent ----------
+
+/** the engine labels its explanation runs so; they are the error window's, not an operation in the status bar */
+const EXPLAIN_LABEL = 'Explaining:';
+const explainOps = new Map<string, { id: number; key: string }>();
+/** events of a run that came before the request's answer named it */
+const explainEarly = new Map<string, OpEvent[]>();
+/** the same error again (after a minute it is a new entry): its explanation is not asked for twice */
+const explained = new Map<string, string>();
+
+/** the language the AI writes in for the user: the one picked in Preferences, else the system's */
+export function aiLanguage(): string {
+  const set = getState().serverSettings?.language;
+  return set && set !== 'auto' ? set : systemLanguage();
+}
+/** the system's language, by its English name ("Russian") */
+export function systemLanguage(): string {
+  try {
+    const code = (typeof navigator !== 'undefined' && navigator.language) || 'en';
+    return new Intl.DisplayNames(['en'], { type: 'language' }).of(code.split('-')[0]) ?? 'English';
+  } catch {
+    return 'English';
+  }
+}
+
+/**
+ * The agent's few words on an error, asked for as its window shows it (or with the window's button): what it is
+ * looking at while it works, then the explanation, in the user's language. `again`: asked once more.
+ */
+export async function explainError(id: number, again = false) {
+  const e = getState().errors.find((x) => x.id === id);
+  if (!e || (e.explain && !again && e.explain.state !== 'failed')) return;
+  if (e.explain?.state === 'running') return;
+  const key = `${e.title}\n${e.detail ?? ''}`;
+  const known = explained.get(key);
+  if (known && !again) return patchErrorExplain(id, { state: 'done', text: known });
+  if (!agentReady()) return patchErrorExplain(id, { state: 'failed', text: 'Claude Code is not set up: install it, or set its path in Settings → Agent.' });
+  patchErrorExplain(id, { state: 'running', step: 'Starting…' });
+  const s = getState();
+  const info = e.repo ? s.repos.find((r) => r.live && r.path === e.repo) : null;
+  const branch = info ? s.repoStates[info.id]?.refs.find((r) => r.kind === 'branch' && r.current)?.name : undefined;
+  const context = info ? `Repository: ${info.path}${branch ? `, current branch ${branch}` : ''}.` : undefined;
+  try {
+    const op = await client.agentExplain({ title: e.title, detail: e.detail, repo: e.repo, context, language: aiLanguage() });
+    explainOps.set(op.opId, { id, key });
+    patchErrorExplain(id, { state: 'running', step: 'Reading the error…', opId: op.opId });
+    const early = explainEarly.get(op.opId) ?? [];
+    explainEarly.delete(op.opId);
+    for (const ev of early) handleExplainEvent(ev);
+  } catch (err: any) {
+    patchErrorExplain(id, { state: 'failed', text: String(err?.message ?? err) });
+  }
+}
+
+/** stops an explanation under way */
+export function stopExplaining(id: number) {
+  const op = getState().errors.find((x) => x.id === id)?.explain?.opId;
+  if (op) void client.cancelOp(op).catch(() => {});
+}
+
+function handleExplainEvent(e: OpEvent): boolean {
+  const run = explainOps.get(e.opId);
+  if (!run) {
+    if (!e.label?.startsWith(EXPLAIN_LABEL)) return false;
+    const list = explainEarly.get(e.opId) ?? [];
+    list.push(e);
+    explainEarly.set(e.opId, list.slice(-50));
+    return true;
+  }
+  const cur = () => getState().errors.find((x) => x.id === run.id)?.explain;
+  if (e.line) {
+    const i = e.line.indexOf(':');
+    const kind = e.line.slice(0, i);
+    const payload = e.line.slice(i + 1);
+    const now = cur();
+    if (kind === 'result') {
+      try {
+        const text = String(JSON.parse(payload).text ?? '').trim();
+        if (text) {
+          explained.set(run.key, text);
+          patchErrorExplain(run.id, { state: 'done', text });
+        }
+      } catch {
+        /* not the engine's line */
+      }
+    } else if (now?.state === 'running' && kind === 'tool') patchErrorExplain(run.id, { ...now, step: `Looking at ${payload.replace(/^Bash\s+/, '').trim()}` });
+    else if (now?.state === 'running' && kind === 'text') patchErrorExplain(run.id, { ...now, step: 'Writing the explanation…' });
+  }
+  if (e.done) {
+    explainOps.delete(e.opId);
+    const now = cur();
+    if (now?.state === 'running') patchErrorExplain(run.id, { state: 'failed', text: e.error === 'Stopped' || e.error === 'Cancelled' ? 'Stopped.' : e.error || 'The agent gave no answer.' });
+  }
+  return true;
 }
 
 /** what an error window hands to the agent */

@@ -14,7 +14,7 @@ import { loadSession, loadSettings, loadWorkspaces, readJson as readState, saveS
 import { addKeyToAgent, deleteSecret, generateSshKey, getSecret, listSshKeys, openTerminal, openWith, reveal, setSecret, testSsh, which } from './system.js';
 import * as github from './github.js';
 import { accountToken, serializeStored, SignInExpired, storedFrom, type TokenAccount } from './tokens.js';
-import { checkClaude, runAgent } from './agent.js';
+import { checkClaude, explainProblem, runAgent } from './agent.js';
 import { getAvatar } from './avatars.js';
 import { checkIncoming } from './origin.js';
 import { AppSources, buildUi, currentUiBuild, resetUiToFactory } from './appsources.js';
@@ -386,6 +386,13 @@ export function createApi(opts: { log?: (s: string) => void } = {}) {
       if (!safeRelPath(String(b.file))) throw new HttpError(400, 'bad path');
       if (!['ours', 'theirs', 'both'].includes(b.take)) throw new HttpError(400, 'take ours, theirs or both');
       return repoOf(b).resolveConflict(String(b.file), b.take);
+    },
+    /** a conflicted file resolved conflict by conflict (the view's picks), written and marked resolved */
+    resolveConflictParts: async (b) => {
+      if (!safeRelPath(String(b.file))) throw new HttpError(400, 'bad path');
+      const choices = Array.isArray(b.choices) ? b.choices.map(String) : [];
+      if (!choices.every((c: string) => ['ours', 'theirs', 'ours+theirs', 'theirs+ours', 'base'].includes(c))) throw new HttpError(400, 'bad choices');
+      return repoOf(b).resolveConflictParts(String(b.file), choices);
     },
     commit: async (b) => ({ sha: await repoOf(b).commit(b.message, { amend: !!b.amend }) }),
     checkout: async (b) => repoOf(b).checkout(refNames([b.ref])[0]),
@@ -902,6 +909,21 @@ export function createApi(opts: { log?: (s: string) => void } = {}) {
           const r = await runAgent({ prompt: String(body.prompt ?? ''), cwd, mode, model: body.model || settings.agent.model || undefined, cliPath: settings.agent.cliPath, apply: body.apply !== false, resume: body.resume ? String(body.resume) : undefined, env, connection: auth?.describe, signal, onEvent: (e) => p(`${e.type}:${e.text}`, null) });
           result.text = r.text;
           p(`result:${JSON.stringify({ text: r.text, costUsd: r.costUsd, sessionId: r.sessionId })}`, 1);
+        });
+        return json(200, op);
+      }
+      // the error window's few words on what went wrong: read-only, a fast model, not in the repository's queue (it
+      // must not wait behind the operation that failed); its label starts with "Explaining:", which the app routes
+      if (req.method === 'POST' && url.pathname === '/api/agent/explain') {
+        const settings = loadSettings();
+        if (isTestAgent(settings.agent.cliPath) && !process.env.PRONG_TEST_MODE) throw new HttpError(400, 'The agent is set to the test stand-in (tools/fake-claude.sh). Clear the Claude Code path in Settings → Agent.');
+        const repo = expandHome(String(body.repo ?? ''));
+        const cwd = repo && existsSync(repo) ? repo : homedir();
+        const language = String(body.language ?? '').replace(/[^\p{L} ()-]/gu, '').slice(0, 40) || 'English';
+        const title = String(body.title ?? '').slice(0, 500);
+        const op = longOp(`Explaining: ${title.slice(0, 60)}`, async (p, signal) => {
+          const r = await explainProblem({ title, detail: String(body.detail ?? '').slice(0, 50000), context: body.context ? String(body.context).slice(0, 2000) : undefined, cwd, language, cliPath: settings.agent.cliPath, signal, onEvent: (e) => p(`${e.type}:${e.text}`, null) });
+          p(`result:${JSON.stringify({ text: r.text, costUsd: r.costUsd })}`, 1);
         });
         return json(200, op);
       }

@@ -156,7 +156,7 @@ describe('Changes: merge conflicts', () => {
     const fx = await conflicted('sides');
     const f = (await fx.repo.fileDiff('a.txt', 'unstaged'))!;
     expect(f.status).toBe('U');
-    expect(f.conflict).toEqual({ ours: ['ours'], base: ['base'], theirs: ['theirs'] });
+    expect(f.conflict).toMatchObject({ ours: ['ours'], base: ['base'], theirs: ['theirs'] });
     const d = (await fx.repo.fileDiff('gone.txt', 'unstaged'))!;
     expect(d.conflict?.deleted).toBe('theirs');
     expect(await fx.repo.conflictOf('README-none')).toBeNull();

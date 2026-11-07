@@ -1,5 +1,6 @@
 import { useMemo, useSyncExternalStore } from 'react';
-import { Commit, FetchOptions, FileChange, GitHubAccount, PullOptions, PushOptions, QueueItem, RepoAuth, RepoInfo, RepoSnapshot, Sha, SshKey, Stash, SyncPrefs, Workspace } from '../git/types';
+import { Commit, ConflictChoice, FetchOptions, FileChange, GitHubAccount, PullOptions, PushOptions, QueueItem, RepoAuth, RepoInfo, RepoSnapshot, Sha, SshKey, Stash, SyncPrefs, Workspace } from '../git/types';
+import { blocksOf, composeLines } from '../git/conflictBlocks';
 import { buildSmallSnapshot, buildSnapshot, cloneFile, fakeSha, WORKSPACES } from '../git/mock/fixtures';
 import { SCHEMES, ThemeName, UI_SCALES, THEMES } from '../theme';
 import { AgentMessage, AgentSettings, AgentTarget, AppMods, AppVersion, FACTORY_MODS } from '../agent/types';
@@ -173,6 +174,11 @@ export interface ErrorEntry {
   action?: { label: string; run: () => void };
   /** the repository on screen when it happened (path): where the agent looks into it */
   repo?: string;
+  /**
+   * The agent's few words on it: `running` with what it is looking at (`step`), `done` with the `text`, `failed`
+   * with why, `off` when it was not asked (switched off, no agent)
+   */
+  explain?: { state: 'running' | 'done' | 'failed'; text?: string; step?: string; opId?: string };
 }
 
 export interface Operation {
@@ -443,6 +449,10 @@ export function reportError(title: string, detail?: string, action?: ErrorEntry[
   const e: ErrorEntry = { id: ++errorSeq, title, detail: detail?.slice(0, 50000), at: now, count: 1, action, repo: shown?.live ? shown.path : undefined };
   setState((s) => ({ errors: [e, ...s.errors].slice(0, 50), errorOpen: e.id }));
   return e.id;
+}
+/** the agent's explanation of an error, as it goes */
+export function patchErrorExplain(id: number, explain: ErrorEntry['explain']) {
+  setState((s) => ({ errors: s.errors.map((e) => (e.id === id ? { ...e, explain } : e)) }));
 }
 /** open the error dialog on one entry, or on the newest */
 export function showErrors(id?: number) {
@@ -1249,6 +1259,18 @@ export function markResolved(path: string) {
     const resolved: FileChange = { ...f, status: 'M', conflict: undefined };
     return { unstaged: r.unstaged.filter((x) => x !== f), staged: [...r.staged.filter((x) => x.path !== path), resolved].sort(byPath) };
   });
+}
+/** a conflicted file resolved conflict by conflict (the view's picks); a mock repository: staged with the result */
+export function resolveConflictParts(path: string, choices: ConflictChoice[]) {
+  if (live.isLiveActive()) return live.resolveConflictParts(path, choices);
+  updateRepo((r) => {
+    const f = r.unstaged.find((x) => x.path === path);
+    if (!f?.conflict) return {};
+    const result = composeLines(f.conflict.blocks ?? blocksOf(f.conflict), choices);
+    const resolved: FileChange = { ...f, status: 'M', conflict: undefined, additions: result.length, deletions: 0, hunks: [{ id: `${path}-resolved`, header: `@@ -0,0 +1,${result.length} @@`, lines: result.map((t, i) => ({ kind: 'add' as const, newNo: i + 1, text: t })) }] };
+    return { unstaged: r.unstaged.filter((x) => x !== f), staged: [...r.staged.filter((x) => x.path !== path), resolved].sort(byPath) };
+  });
+  toast(`Resolved ${path.split('/').pop()}`, 'success');
 }
 export function resolveConflict(path: string, take: 'ours' | 'theirs' | 'both') {
   if (live.isLiveActive()) return live.resolveConflict(path, take);

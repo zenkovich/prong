@@ -16,11 +16,11 @@ Prong is an experiment. It runs on macOS, the app is signed ad hoc (you build it
 - **Changes.**
   - Tree or list view.
   - Stage and unstage a file, a hunk or single lines; discard, also thousands of files at once and the changes inside a submodule, with Undo.
-  - Resolve conflicts with ours / base / theirs. Abort of a merge or rebase puts everything back as it was before it started.
+  - Resolve conflicts as in Fork, in the file's own view: take a side of the whole file, or go through the file conflict by conflict, ticking ours, theirs or both. Abort of a merge or rebase puts everything back as it was before it started.
   - Commit, amend, or commit and push.
   - Submodules whose own files changed are listed, as in Fork.
 - **Diffs.**
-  - Unified or split, with syntax highlighting.
+  - Unified or split, with syntax highlighting; inside a changed line the words that changed are marked.
   - Images before and after; audio and video players.
   - SVGs as a picture (sharp at any zoom, coordinates in viewBox units) or as a text diff, one click apart.
   - Binary files, renames and submodule pointers.
@@ -42,7 +42,7 @@ Prong is an experiment. It runs on macOS, the app is signed ad hoc (you build it
 - **Workspaces.** Separate sets of repositories (for example `@work` and `@home`), each with its own tabs, filled by scanning a root folder.
 - **Agent.**
   - ⌘J opens the agent bar. The full panel has a Markdown chat, the version log and the settings.
-  - A failed git command offers **Ask AI**, which sends the error and git's output to the agent.
+  - An error window explains the error at once in a few plain words, in the language picked in Preferences (a fast model that only looks). **Ask AI** sends the error and git's output to the agent to fix it.
 - **Look.**
   - A monospace terminal style in five colour schemes, light and dark.
   - Interface scale from 80 to 150 %.

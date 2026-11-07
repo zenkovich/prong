@@ -1,15 +1,17 @@
 import React, { memo, useEffect, useMemo, useState } from 'react';
 import { Platform, Pressable, ScrollView, StyleSheet, View } from 'react-native';
 import * as live from '../state/live';
-import { DiffLine, FileChange, Hunk } from '../git/types';
-import { discardFile, discardHunk, discardLines, loadLarge, markResolved, relTime, resolveConflict, revealCommit, setDiffMode, setSection, setSvgView, stageFile, stageHunk, stageLines, toast, toggleHunk, unstageFile, unstageHunk, unstageLines, useRepo, useStore } from '../state/store';
+import { ConflictBlock, ConflictChoice, DiffLine, FileChange, Hunk } from '../git/types';
+import { discardFile, discardHunk, discardLines, loadLarge, markResolved, relTime, resolveConflict, resolveConflictParts, revealCommit, setDiffMode, setSection, setSvgView, stageFile, stageHunk, stageLines, toast, toggleHunk, unstageFile, unstageHunk, unstageLines, useRepo, useStore } from '../state/store';
 import { FONT, useTheme } from '../theme';
 import { Icon } from '../ui/Icon';
-import { Badge, Button, Chevron, FadeIn, PressScale, Segmented, Txt, useKeyboard, webCursor } from '../ui/primitives';
+import { Badge, Button, Checkbox, Chevron, FadeIn, PressScale, Segmented, Txt, useKeyboard, webCursor } from '../ui/primitives';
 import { insideText, statusColor } from './FileList';
 import { langOf, LangDef, tokenize, TokenKind } from './highlight';
 import { lineRange } from '../git/lineStaging';
 import { coversWholeFile } from '../git/diffContext';
+import { cutAtMarks, hunkMarks, Marks, wordDiff } from '../git/wordDiff';
+import { blocksOf, choiceOf, pickedLines } from '../git/conflictBlocks';
 import { MediaPreview } from './media/MediaPreview';
 import { svgViewOf } from './media/mediaMath';
 import { ErrorBoundary } from '../ui/ErrorBoundary';
@@ -622,6 +624,8 @@ function LineBox({ l, picked, onPick, children, style }: { l: DiffLine | null; p
 
 const UnifiedHunk = memo(function UnifiedHunk({ hunk, lang, picked, onLine }: { hunk: Hunk; lang: Lang; picked: number[]; onLine?: (i: number, shift: boolean) => void }) {
   const t = useTheme();
+  // the words that changed inside a changed line (Fork's darker marks)
+  const marks = useMemo(() => hunkMarks(hunk.lines), [hunk]);
   return (
     <View>
       {hunk.lines.map((l, i) => (
@@ -635,27 +639,29 @@ const UnifiedHunk = memo(function UnifiedHunk({ hunk, lang, picked, onLine }: { 
           <Txt size={FONT.sm} mono color={l.kind === 'add' ? t.add : l.kind === 'del' ? t.del : t.textFaint} style={{ width: 16, textAlign: 'center' }}>
             {l.kind === 'add' ? '+' : l.kind === 'del' ? '−' : ' '}
           </Txt>
-          <Code text={l.text} lang={lang} />
+          <Code text={l.text} lang={lang} marks={marks.get(i)} markColor={l.kind === 'add' ? t.add : t.del} />
         </LineBox>
       ))}
     </View>
   );
 });
 
-function SplitSide({ l, side, lang, picked, onPick }: { l: DiffLine | null; side: 'l' | 'r'; lang: Lang; picked: boolean; onPick?: (shift: boolean) => void }) {
+function SplitSide({ l, side, lang, picked, onPick, marks }: { l: DiffLine | null; side: 'l' | 'r'; lang: Lang; picked: boolean; onPick?: (shift: boolean) => void; marks?: Marks }) {
   const t = useTheme();
   return (
     <LineBox l={l} picked={picked} onPick={onPick} style={[styles.splitSide, { borderColor: t.border }, side === 'l' && { borderRightWidth: 1 }]}>
       <Txt size={FONT.xs} faint mono style={styles.gutter}>
         {l ? (side === 'l' ? l.oldNo ?? '' : l.newNo ?? '') : ''}
       </Txt>
-      {l ? <Code text={l.text} lang={lang} /> : <View style={{ flex: 1 }} />}
+      {l ? <Code text={l.text} lang={lang} marks={l.kind === 'ctx' ? undefined : marks} markColor={l.kind === 'add' ? t.add : t.del} /> : <View style={{ flex: 1 }} />}
     </LineBox>
   );
 }
 
 const SplitHunk = memo(function SplitHunk({ hunk, lang, picked, onLine }: { hunk: Hunk; lang: Lang; picked: number[]; onLine?: (i: number, shift: boolean) => void }) {
   const pairs = useMemo(() => pairLines(hunk.lines), [hunk]);
+  const marks = useMemo(() => hunkMarks(hunk.lines), [hunk]);
+  const markOf = (l: DiffLine | null) => (l ? marks.get(hunk.lines.indexOf(l)) : undefined);
   const pick = (l: DiffLine | null) => {
     const i = l ? hunk.lines.indexOf(l) : -1;
     return { picked: i >= 0 && picked.includes(i), onPick: onLine && i >= 0 ? (shift: boolean) => onLine(i, shift) : undefined };
@@ -664,8 +670,8 @@ const SplitHunk = memo(function SplitHunk({ hunk, lang, picked, onLine }: { hunk
     <View>
       {pairs.map(([a, b], i) => (
         <View key={i} style={{ flexDirection: 'row' }}>
-          <SplitSide l={a} side="l" lang={lang} {...pick(a && a.kind !== 'ctx' ? a : null)} />
-          <SplitSide l={b} side="r" lang={lang} {...pick(b && b.kind !== 'ctx' ? b : null)} />
+          <SplitSide l={a} side="l" lang={lang} marks={markOf(a)} {...pick(a && a.kind !== 'ctx' ? a : null)} />
+          <SplitSide l={b} side="r" lang={lang} marks={markOf(b)} {...pick(b && b.kind !== 'ctx' ? b : null)} />
         </View>
       ))}
     </View>
@@ -697,21 +703,40 @@ function pairLines(lines: DiffLine[]): [DiffLine | null, DiffLine | null][] {
 
 type Lang = LangDef;
 
-const Code = memo(function Code({ text, lang }: { text: string; lang: Lang }) {
+/** a line in its syntax colours; `marks`: the characters that changed in it, on a stronger `markColor` ground */
+const Code = memo(function Code({ text, lang, marks, markColor }: { text: string; lang: Lang; marks?: Marks; markColor?: string }) {
   const t = useTheme();
   const colors = useMemo<Record<TokenKind, string>>(
     () => ({ plain: t.text, kw: t.kw, str: t.str, num: t.info, cm: t.textFaint, fn: t.tag, type: t.tagColor, prop: t.info, tag: t.tagColor, attr: t.kw, punct: t.textMuted, heading: t.accent, emph: t.kw, link: t.info, meta: t.tag }),
     [t],
   );
   const tokens = useMemo(() => tokenize(text, lang), [text, lang]);
+  // each token cut where a mark starts or ends: the colour stays the token's, the ground shows the change
+  const pieces = useMemo(() => {
+    const out: [string, boolean][][] = [];
+    for (let i = 0, at = 0; i < tokens.length; at += tokens[i].text.length, i++) out.push(cutAtMarks(at, tokens[i].text, marks));
+    return out;
+  }, [tokens, marks]);
+  const mark = markColor ? { backgroundColor: markColor + '4d', borderRadius: 2 } : undefined;
   return (
     <Txt size={FONT.sm} mono style={{ flex: 1 }}>
       {tokens.length
-        ? tokens.map((tok, i) => (
-            <Txt key={i} size={FONT.sm} mono color={colors[tok.kind]} weight={tok.kind === 'heading' || tok.kind === 'emph' ? '700' : undefined} style={tok.kind === 'cm' ? { fontStyle: 'italic' } : undefined}>
-              {tok.text}
-            </Txt>
-          ))
+        ? tokens.map((tok, i) => {
+            const style = tok.kind === 'cm' ? { fontStyle: 'italic' as const } : undefined;
+            const weight = tok.kind === 'heading' || tok.kind === 'emph' ? '700' : undefined;
+            const p = pieces[i];
+            if (p.length === 1 && !p[0][1])
+              return (
+                <Txt key={i} size={FONT.sm} mono color={colors[tok.kind]} weight={weight} style={style}>
+                  {tok.text}
+                </Txt>
+              );
+            return p.map(([piece, marked], k) => (
+              <Txt key={`${i}.${k}`} size={FONT.sm} mono color={colors[tok.kind]} weight={weight} style={marked ? [style, mark] : style} testID={marked ? 'word-mark' : undefined}>
+                {piece}
+              </Txt>
+            ));
+          })
         : ' '}
     </Txt>
   );
@@ -723,47 +748,106 @@ const Code = memo(function Code({ text, lang }: { text: string; lang: Lang }) {
 
 // ---------- conflict ----------
 
-function ConflictCol({ title, lines, color, action, lang, testID }: { title: string; lines: string[]; color: string; action?: () => void; lang: Lang; testID?: string }) {
+type Pick = { ours: boolean; theirs: boolean; theirsFirst: boolean };
+type ConflictPart = Extract<ConflictBlock, { kind: 'conflict' }>;
+/** unchanged lines shown on each side of a conflict before the rest fold away */
+const AROUND = 3;
+
+/** lines of the file both sides agree on: a few next to each conflict, the rest folded (a click unfolds them) */
+function SameLines({ lines, first, last, lang, startNo }: { lines: string[]; first: boolean; last: boolean; lang: Lang; startNo: number }) {
   const t = useTheme();
+  const [open, setOpen] = useState(false);
+  const head = first ? 0 : AROUND;
+  const tail = last ? 0 : AROUND;
+  // folded when that hides at least two lines (one folded line would take as much room as it)
+  const fold = !open && lines.length - head - tail >= 2;
+  const row = (l: string, i: number) => (
+    <View key={i} style={styles.line}>
+      <Txt size={FONT.xs} faint mono style={styles.gutter}>
+        {startNo + i}
+      </Txt>
+      <Code text={l} lang={lang} />
+    </View>
+  );
+  if (!fold) return <View>{lines.map((l, i) => row(l, i))}</View>;
+  const hidden = lines.length - head - tail;
   return (
-    <View style={[styles.conflictCol, { borderColor: t.border }]} testID={testID}>
-      <View style={[styles.conflictHead, { backgroundColor: color + '22', borderColor: t.border }]}>
-        <Txt size={FONT.xs} weight="700" color={color}>
-          {title}
+    <View>
+      {lines.slice(0, head).map((l, i) => row(l, i))}
+      <PressScale onPress={() => setOpen(true)} scaleTo={1} hoverStyle={{ backgroundColor: t.hover }} style={{ paddingVertical: 2, paddingLeft: 50 }} label={`Show ${hidden} unchanged lines`} testID="conflict-fold">
+        <Txt size={FONT.xs} color={t.info}>
+          ⋯ {hidden} unchanged line{hidden === 1 ? '' : 's'}
         </Txt>
-        <View style={{ flex: 1 }} />
-        {action && <Button small label="Take" onPress={action} />}
-      </View>
-      {/* the conflicting regions only ("⋯" between two), so no line numbers of the file */}
-      {lines.length === 0 ? (
-        <Txt size={FONT.xs} faint style={{ padding: 8 }}>
-          (nothing here)
-        </Txt>
-      ) : (
-        lines.map((l, i) =>
-          l === '⋯' ? (
-            <Txt key={i} size={FONT.xs} faint style={{ textAlign: 'center', paddingVertical: 2 }}>
-              ⋯
-            </Txt>
-          ) : (
-            <View key={i} style={[styles.line, { paddingLeft: 8 }]}>
-              <Code text={l} lang={lang} />
-            </View>
-          ),
-        )
-      )}
+      </PressScale>
+      {lines.slice(lines.length - tail).map((l, i) => row(l, lines.length - tail + i))}
     </View>
   );
 }
 
+/** one side of a conflict: its lines (the words that differ from the other side marked), ticked in or not */
+function ConflictSide({ title, lines, other, color, on, onToggle, lang, testID }: { title: string; lines: string[]; other: string[]; color: string; on: boolean; onToggle: () => void; lang: Lang; testID: string }) {
+  const t = useTheme();
+  // the k-th line against the other side's k-th: what this side changed in it
+  const marks = useMemo(() => lines.map((l, i) => (other[i] !== undefined ? wordDiff(other[i], l)?.b : undefined)), [lines, other]);
+  return (
+    <Pressable onPress={onToggle} style={[styles.conflictCol, { borderColor: on ? color : t.border, opacity: on ? 1 : 0.78 }, webCursor('pointer')]} testID={testID}>
+      <View style={[styles.conflictHead, { backgroundColor: color + (on ? '33' : '14'), borderColor: t.border }]}>
+        {/* the whole side is the button: a tick drawn here, not a second button inside it */}
+        <View style={[styles.tick, { borderColor: on ? color : t.borderStrong, backgroundColor: on ? color : 'transparent' }]} testID={on ? `${testID}-ticked` : undefined}>
+          {on && <Icon name="check" size={10} color={t.bg} strokeWidth={3} />}
+        </View>
+        <Txt size={FONT.xs} weight="700" color={color} style={{ marginLeft: 6 }}>
+          {title}
+        </Txt>
+      </View>
+      {lines.length === 0 ? (
+        <Txt size={FONT.xs} faint style={{ padding: 8 }}>
+          (nothing: this side removed these lines)
+        </Txt>
+      ) : (
+        lines.map((l, i) => (
+          <View key={i} style={[styles.line, { paddingLeft: 8, backgroundColor: on ? color + '14' : 'transparent' }]}>
+            <Code text={l} lang={lang} marks={marks[i]} markColor={color} />
+          </View>
+        ))
+      )}
+    </Pressable>
+  );
+}
+
 /**
- * A conflicted file: what each side has where they conflict, a side to take (or both), or — after editing the file
- * by hand — Mark resolved. A file one side deleted, or a binary one, only offers the sides.
+ * A conflicted file, as Fork shows it: on top, a side to take whole (or both, or Mark resolved after editing it
+ * yourself); below, the whole file with each conflict as ours | theirs: tick the side (or both, in the order
+ * ticked) and see the result under it; Save writes the file and marks it resolved. A file one side deleted, or a
+ * binary one, only offers the sides.
  */
 function ConflictView({ file }: { file: FileChange }) {
   const t = useTheme();
   const c = file.conflict!;
   const text = !c.deleted && !c.binary;
+  const lang = useMemo(() => langOf(file.path), [file.path]);
+  const blocks = useMemo(() => (text ? blocksOf(c) : []), [c, text]);
+  const parts = useMemo(() => blocks.filter((b): b is ConflictPart => b.kind === 'conflict'), [blocks]);
+  // the picks belong to this file as the merge left it: another file, or the same one merged again, starts over
+  const key = `${file.path}:${parts.length}:${parts.map((p) => p.ours.length + p.theirs.length).join(',')}`;
+  const [picks, setPicks] = useState<{ key: string; p: (Pick | undefined)[] }>({ key, p: [] });
+  const cur = picks.key === key ? picks.p : [];
+  const setPick = (k: number, p: Pick | undefined) => setPicks({ key, p: Object.assign([...cur], { [k]: p }) });
+  const toggle = (k: number, side: 'ours' | 'theirs') => {
+    const was = cur[k] ?? { ours: false, theirs: false, theirsFirst: false };
+    const next = { ...was, [side]: !was[side] };
+    // ticked second, it goes second: theirs first when it was ticked before ours
+    if (next.ours && next.theirs && !(was.ours && was.theirs)) next.theirsFirst = side === 'ours';
+    setPick(k, next);
+  };
+  const all = (side: 'ours' | 'theirs') => setPicks({ key, p: parts.map(() => ({ ours: side === 'ours', theirs: side === 'theirs', theirsFirst: false })) });
+  const picked = parts.filter((_, k) => cur[k]).length;
+  const choices = parts.map((_, k) => (cur[k] ? choiceOf(cur[k]!.ours, cur[k]!.theirs, cur[k]!.theirsFirst) : null));
+  const save = () => {
+    if (choices.some((x) => !x)) return;
+    resolveConflictParts(file.path, choices as ConflictChoice[]);
+  };
+  const [showBase, setShowBase] = useState(false);
   const what =
     c.deleted === 'theirs'
       ? 'Conflict: they deleted this file, you changed it. Keep yours (Use ours), delete it (Use theirs), or edit it and mark it resolved.'
@@ -771,27 +855,110 @@ function ConflictView({ file }: { file: FileChange }) {
         ? 'Conflict: you deleted this file, they changed it. Delete it (Use ours), keep theirs (Use theirs), or edit it and mark it resolved.'
         : c.binary
           ? 'Conflict in a binary file: take one side, or put the right version in place and mark it resolved.'
-          : 'Merge conflict. Choose a side, keep both, or edit the file and mark it resolved.';
+          : `${parts.length} conflict${parts.length === 1 ? '' : 's'} in this file. Take one side whole, or pick a side for each conflict below and save.`;
+  // where each block starts in the result, as far as it is known (a conflict not picked yet adds no lines), and
+  // which conflict a block is
+  const layout: { at: number; n: number; result: string[] | null }[] = [];
+  for (let i = 0, no = 1, k = 0; i < blocks.length; i++) {
+    const b = blocks[i];
+    if (b.kind === 'same') {
+      layout.push({ at: no, n: -1, result: null });
+      no += b.lines.length;
+      continue;
+    }
+    const p = cur[k];
+    const result = p ? pickedLines(b, choiceOf(p.ours, p.theirs, p.theirsFirst)) : null;
+    layout.push({ at: no, n: k++, result });
+    no += result?.length ?? 0;
+  }
   return (
     <View style={{ padding: 12 }} testID="conflict-view">
       <View style={[styles.notice, { borderColor: t.warn + '66', backgroundColor: t.warn + '14', marginBottom: 12, flexWrap: 'wrap' }]}>
         <Icon name="warning" size={18} color={t.warn} />
         <Txt style={{ marginLeft: 10, flex: 1, minWidth: 220 }}>{what}</Txt>
-        <View style={{ flexDirection: 'row', marginLeft: 10, marginVertical: 2 }}>
-          <Button small label="Use ours" onPress={() => resolveConflict(file.path, 'ours')} testID="conflict-ours" />
-          <Button small label="Use theirs" style={{ marginLeft: 6 }} onPress={() => resolveConflict(file.path, 'theirs')} testID="conflict-theirs" />
+        <View style={{ flexDirection: 'row', marginLeft: 10, marginVertical: 2, flexWrap: 'wrap' }}>
+          <Button small label={text ? 'Use ours (whole file)' : 'Use ours'} onPress={() => resolveConflict(file.path, 'ours')} testID="conflict-ours" />
+          <Button small label={text ? 'Use theirs (whole file)' : 'Use theirs'} style={{ marginLeft: 6 }} onPress={() => resolveConflict(file.path, 'theirs')} testID="conflict-theirs" />
           {text && <Button small label="Both" style={{ marginLeft: 6 }} onPress={() => resolveConflict(file.path, 'both')} testID="conflict-both" />}
-          <Button small primary label="Mark resolved" style={{ marginLeft: 6 }} onPress={() => markResolved(file.path)} testID="conflict-resolved" />
+          <Button small label="Mark resolved" style={{ marginLeft: 6 }} onPress={() => markResolved(file.path)} testID="conflict-resolved" />
         </View>
       </View>
-      {text && (
-        <View style={{ flexDirection: 'row' }}>
-          <ConflictCol lang={langOf(file.path)} title="OURS (HEAD)" lines={c.ours} color={t.accent} action={() => resolveConflict(file.path, 'ours')} testID="conflict-col-ours" />
-          <View style={{ width: 8 }} />
-          <ConflictCol lang={langOf(file.path)} title="BASE" lines={c.base} color={t.textMuted} testID="conflict-col-base" />
-          <View style={{ width: 8 }} />
-          <ConflictCol lang={langOf(file.path)} title="THEIRS" lines={c.theirs} color={t.add} action={() => resolveConflict(file.path, 'theirs')} testID="conflict-col-theirs" />
-        </View>
+      {text && parts.length > 0 && (
+        <>
+          <View style={[styles.conflictBar, { borderColor: t.border, backgroundColor: t.panelAlt }]}>
+            <Txt size={FONT.sm} weight="600" testID="conflict-progress">
+              {picked} of {parts.length} picked
+            </Txt>
+            <Button small label="All ours" style={{ marginLeft: 10 }} onPress={() => all('ours')} testID="conflict-all-ours" />
+            <Button small label="All theirs" style={{ marginLeft: 6 }} onPress={() => all('theirs')} testID="conflict-all-theirs" />
+            <Checkbox checked={showBase} onChange={setShowBase} label="Show base" testID="conflict-show-base" />
+            <View style={{ flex: 1 }} />
+            <Button small primary label="Save and mark resolved" disabled={picked < parts.length} onPress={save} testID="conflict-save" />
+          </View>
+          {blocks.map((b, i) => {
+            const { at, n, result } = layout[i];
+            // the file's final newline is not a line of its own
+            if (b.kind === 'same') return <SameLines key={i} lines={i === blocks.length - 1 && b.lines[b.lines.length - 1] === '' ? b.lines.slice(0, -1) : b.lines} first={i === 0} last={i === blocks.length - 1} lang={lang} startNo={at} />;
+            const p = cur[n];
+            return (
+              <View key={i} style={[styles.conflictBlock, { borderColor: p ? t.border : t.warn + '88' }]} testID={`conflict-${n + 1}`}>
+                <View style={{ flexDirection: 'row', alignItems: 'center', paddingHorizontal: 8, paddingVertical: 4 }}>
+                  <Txt size={FONT.xs} label color={p ? t.textMuted : t.warn}>
+                    Conflict {n + 1} of {parts.length}
+                    {p ? (p.ours && p.theirs ? (p.theirsFirst ? ' · both, theirs first' : ' · both, ours first') : p.ours ? ' · ours' : p.theirs ? ' · theirs' : ' · neither: the base') : ' · pick a side'}
+                  </Txt>
+                  <View style={{ flex: 1 }} />
+                  {p && <Button small label="Undo pick" onPress={() => setPick(n, undefined)} testID={`conflict-${n + 1}-clear`} />}
+                </View>
+                <View style={{ flexDirection: 'row', paddingHorizontal: 8 }}>
+                  <ConflictSide title="OURS (HEAD)" lines={b.ours} other={b.theirs} color={t.accent} on={!!p?.ours} onToggle={() => toggle(n, 'ours')} lang={lang} testID={`conflict-${n + 1}-ours`} />
+                  {showBase && (
+                    <>
+                      <View style={{ width: 8 }} />
+                      <View style={[styles.conflictCol, { borderColor: t.border }]} testID={`conflict-${n + 1}-base`}>
+                        <View style={[styles.conflictHead, { backgroundColor: t.textMuted + '14', borderColor: t.border }]}>
+                          <Txt size={FONT.xs} weight="700" color={t.textMuted}>
+                            BASE
+                          </Txt>
+                        </View>
+                        {b.base.map((l, j) => (
+                          <View key={j} style={[styles.line, { paddingLeft: 8 }]}>
+                            <Code text={l} lang={lang} />
+                          </View>
+                        ))}
+                      </View>
+                    </>
+                  )}
+                  <View style={{ width: 8 }} />
+                  <ConflictSide title="THEIRS" lines={b.theirs} other={b.ours} color={t.add} on={!!p?.theirs} onToggle={() => toggle(n, 'theirs')} lang={lang} testID={`conflict-${n + 1}-theirs`} />
+                </View>
+                <View style={{ margin: 8, marginTop: 6, borderWidth: 1, borderColor: t.border, backgroundColor: t.bg }} testID={`conflict-${n + 1}-result`}>
+                  <Txt size={FONT.xs} label faint style={{ paddingHorizontal: 8, paddingTop: 4 }}>
+                    Result
+                  </Txt>
+                  {!result ? (
+                    <Txt size={FONT.xs} faint style={{ padding: 8 }}>
+                      Tick ours, theirs or both (in the order they go).
+                    </Txt>
+                  ) : result.length === 0 ? (
+                    <Txt size={FONT.xs} faint style={{ padding: 8 }}>
+                      (no lines)
+                    </Txt>
+                  ) : (
+                    result.map((l, j) => (
+                      <View key={j} style={styles.line}>
+                        <Txt size={FONT.xs} faint mono style={styles.gutter}>
+                          {at + j}
+                        </Txt>
+                        <Code text={l} lang={lang} />
+                      </View>
+                    ))
+                  )}
+                </View>
+              </View>
+            );
+          })}
+        </>
       )}
     </View>
   );
@@ -805,6 +972,9 @@ const styles = StyleSheet.create({
   gutter: { width: 42, textAlign: 'right', paddingRight: 8 },
   splitSide: { flex: 1, flexDirection: 'row', alignItems: 'center', minHeight: 20, paddingRight: 8 },
   notice: { flexDirection: 'row', alignItems: 'center', padding: 12, borderWidth: 1, borderRadius: 0 },
-  conflictCol: { flex: 1, borderWidth: 1, borderRadius: 0, overflow: 'hidden' },
+  conflictCol: { flex: 1, minWidth: 0, borderWidth: 1, borderRadius: 0, overflow: 'hidden' },
+  tick: { width: 14, height: 14, borderWidth: 1, alignItems: 'center', justifyContent: 'center' },
+  conflictBlock: { borderWidth: 1, borderRadius: 0, marginVertical: 6 },
+  conflictBar: { flexDirection: 'row', alignItems: 'center', flexWrap: 'wrap', paddingHorizontal: 8, paddingVertical: 4, borderWidth: 1, marginBottom: 6, gap: 6 } as any,
   conflictHead: { flexDirection: 'row', alignItems: 'center', height: 28, paddingHorizontal: 8, borderBottomWidth: 1 },
 });

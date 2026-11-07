@@ -2,7 +2,7 @@ import { appendFileSync, copyFileSync, existsSync, linkSync, mkdirSync, mkdtempS
 import { createHash } from 'node:crypto';
 import { homedir, tmpdir } from 'node:os';
 import path from 'node:path';
-import type { Commit, FileChange, FileStatus, Hunk, RepoSnapshot, Sha, Stash, SubmoduleChanges } from '../types.js';
+import type { Commit, ConflictBlock, ConflictChoice, FileChange, FileStatus, Hunk, RepoSnapshot, Sha, Stash, SubmoduleChanges } from '../types.js';
 import { binaryKindOf, hunkPatch, joinSubmoduleChanges, kindOf, LFS_POINTER_MAX, type LfsPointer, LOG_FORMAT, parseLfsPointer, parseDiff, parseLog, parseNumstat, parseRaw, parseRefs, parseRemotes, parseStashList, parseStatus, REC, REF_FORMAT, STASH_FORMAT } from './parse.js';
 import { inRuns, progressOf, runGit, runGitLines, runGitToFile, RunOptions, withoutProgress } from './run.js';
 import type { NetAuth } from '../auth.js';
@@ -1391,21 +1391,60 @@ export class Repo {
     const st = await this.stages(file);
     if (!st[1] && !st[2] && !st[3]) return null;
     if (!st[2] || !st[3]) return { ours: [], base: [], theirs: [], deleted: !st[2] ? 'ours' : 'theirs' };
-    const merged = await this.mergeStages(st, 'diff3');
-    if (!merged) return { ours: [], base: [], theirs: [], binary: true };
+    const blocks = await this.conflictBlocks(st);
+    if (!blocks) return { ours: [], base: [], theirs: [], binary: true };
     const out: Record<'ours' | 'base' | 'theirs', string[]> = { ours: [], base: [], theirs: [] };
-    let side: 'none' | 'ours' | 'base' | 'theirs' = 'none';
     let regions = 0;
-    for (const l of merged.toString('utf8').split('\n')) {
-      if (side === 'none' && l.startsWith('<<<<<<< ours')) {
-        if (regions++) for (const k of ['ours', 'base', 'theirs'] as const) out[k].push('⋯');
-        side = 'ours';
-      } else if (side === 'ours' && l.startsWith('||||||| base')) side = 'base';
-      else if ((side === 'ours' || side === 'base') && l === '=======') side = 'theirs';
-      else if (side === 'theirs' && l.startsWith('>>>>>>> theirs')) side = 'none';
-      else if (side !== 'none') out[side].push(l);
+    for (const b of blocks) {
+      if (b.kind !== 'conflict') continue;
+      if (regions++) for (const k of ['ours', 'base', 'theirs'] as const) out[k].push('⋯');
+      for (const k of ['ours', 'base', 'theirs'] as const) out[k].push(...b[k]);
     }
-    return out;
+    return { ...out, blocks };
+  }
+
+  /**
+   * The file as `git merge-file --diff3` merges the stages: what both sides agree on, and each conflict with ours,
+   * the base and theirs. Null when a side is binary. The same stages always give the same blocks, so a choice per
+   * conflict made in the view is applied to exactly these.
+   */
+  private async conflictBlocks(st: Record<number, string>): Promise<ConflictBlock[] | null> {
+    const merged = await this.mergeStages(st, 'diff3');
+    if (!merged) return null;
+    const blocks: ConflictBlock[] = [];
+    let same: string[] = [];
+    let cur: { ours: string[]; base: string[]; theirs: string[] } | null = null;
+    let side: 'ours' | 'base' | 'theirs' = 'ours';
+    for (const l of merged.toString('utf8').split('\n')) {
+      if (!cur && l.startsWith('<<<<<<< ours')) {
+        if (same.length) blocks.push({ kind: 'same', lines: same });
+        same = [];
+        cur = { ours: [], base: [], theirs: [] };
+        side = 'ours';
+      } else if (cur && side === 'ours' && l.startsWith('||||||| base')) side = 'base';
+      else if (cur && side !== 'theirs' && l === '=======') side = 'theirs';
+      else if (cur && side === 'theirs' && l.startsWith('>>>>>>> theirs')) {
+        blocks.push({ kind: 'conflict', ...cur });
+        cur = null;
+      } else if (cur) cur[side].push(l);
+      else same.push(l);
+    }
+    if (same.length) blocks.push({ kind: 'same', lines: same });
+    return blocks;
+  }
+
+  /**
+   * Resolves a conflicted text file conflict by conflict, as the view picked: each conflict becomes one side, both
+   * (in either order) or the base; the rest of the file is what both sides agree on. Written and marked resolved.
+   */
+  async resolveConflictParts(file: string, choices: ConflictChoice[]) {
+    const st = await this.stages(file);
+    if (!st[2] || !st[3]) throw new Error(`${file} was deleted on one side: take ours or theirs`);
+    const blocks = await this.conflictBlocks(st);
+    if (!blocks) throw new Error(`${file} is binary: take ours or theirs`);
+    const text = composeConflict(blocks, choices);
+    writeFileSync(path.join(this.dir, file), text);
+    await this.git(['add', '--', file]);
   }
 
   /**
@@ -2208,3 +2247,25 @@ function shellQuote(s: string) {
 }
 
 export { kindOf };
+
+/** the file a choice per conflict makes: the agreed lines as they are, each conflict replaced by what was picked */
+export function composeConflict(blocks: ConflictBlock[], choices: ConflictChoice[]): string {
+  const conflicts = blocks.filter((b) => b.kind === 'conflict').length;
+  if (choices.length !== conflicts) throw new Error(`The file changed: ${conflicts} conflicts now, ${choices.length} choices. Look at it again.`);
+  const out: string[] = [];
+  let k = 0;
+  for (const b of blocks) {
+    if (b.kind === 'same') {
+      out.push(...b.lines);
+      continue;
+    }
+    const c = choices[k++];
+    if (c === 'ours') out.push(...b.ours);
+    else if (c === 'theirs') out.push(...b.theirs);
+    else if (c === 'ours+theirs') out.push(...b.ours, ...b.theirs);
+    else if (c === 'theirs+ours') out.push(...b.theirs, ...b.ours);
+    else if (c === 'base') out.push(...b.base);
+    else throw new Error(`bad choice for conflict ${k}: ${String(c)}`);
+  }
+  return out.join('\n');
+}

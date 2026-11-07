@@ -33,6 +33,16 @@ case "$prompt" in
         exit 0 ;;
     esac ;;
 esac
+case "$system" in
+  *"explain the error to them"*)
+    # the error window's explanation: a look at the repository, then a few words in the language asked for
+    lang=$(printf '%s' "$system" | sed -n 's/.*Write in \([^,]*\),.*/\1/p')
+    echo '{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"git status"}}]}}'
+    case "$prompt" in *"slow explain"*) sleep 30 ;; *) sleep 0.4 ;; esac
+    case "$prompt" in *"explain-fail"*) echo "fake explain failure" >&2; exit 3 ;; esac
+    printf '{"type":"result","subtype":"success","result":"(%s) The remote refused the push: someone pushed first. Press `Pull`, then push again.","total_cost_usd":0.0004}\n' "$lang"
+    exit 0 ;;
+esac
 echo '{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Read","input":{"file_path":"/repo/src/state/store.ts"}}]}}'
 sleep 0.3
 echo '{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"npx tsc --noEmit"}}]}}'

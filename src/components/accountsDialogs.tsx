@@ -352,6 +352,24 @@ export function AccountsDialog({ tab: initial = 'github', token }: { tab?: 'gith
   );
 }
 
+/** the languages the AI can answer in: the value is the English name the agent is told */
+const AI_LANGUAGES: [string, string][] = [
+  ['auto', 'System'],
+  ['English', 'English'],
+  ['Russian', 'Русский'],
+  ['Ukrainian', 'Українська'],
+  ['German', 'Deutsch'],
+  ['French', 'Français'],
+  ['Spanish', 'Español'],
+  ['Portuguese', 'Português'],
+  ['Italian', 'Italiano'],
+  ['Polish', 'Polski'],
+  ['Turkish', 'Türkçe'],
+  ['Chinese', '中文'],
+  ['Japanese', '日本語'],
+  ['Korean', '한국어'],
+];
+
 function GeneralPrefs() {
   const t = useTheme();
   const theme = useStore((s) => s.theme);
@@ -425,6 +443,29 @@ function GeneralPrefs() {
       <View style={{ marginTop: 12 }}>
         <Checkbox checked={settings?.avatars ?? true} onChange={(v) => void live.saveSettings({ avatars: v })} label="Author avatars from GitHub / Gravatar (cached by the engine)" testID="pref-avatars" />
       </View>
+      <Txt weight="600" style={{ marginTop: 18 }}>
+        AI
+      </Txt>
+      <Field label="Language of the AI’s answers" style={{ marginTop: 8 }}>
+        <View style={{ width: 260 }}>
+          <Select
+            value={settings?.language ?? 'auto'}
+            options={AI_LANGUAGES.map(([value, label]) => ({ value, label: value === 'auto' ? `System (${live.systemLanguage()})` : label }))}
+            onChange={(v) => void live.saveSettings({ language: v })}
+            testID="pref-language"
+          />
+        </View>
+      </Field>
+      <Checkbox
+        checked={settings?.explainErrors !== false}
+        onChange={(v) => void live.saveSettings({ explainErrors: v })}
+        label="Explain errors with AI as they happen"
+        testID="pref-explain-errors"
+      />
+      <Txt size={FONT.xs} faint style={{ marginLeft: 24, marginTop: 2 }}>
+        A few plain words in the error window on what went wrong and the way out (Claude Code, a fast model; it only
+        looks, never changes anything). Off: the window has an “Explain with AI” button.
+      </Txt>
       <Txt weight="600" style={{ marginTop: 18 }}>
         Git identity (global)
       </Txt>
