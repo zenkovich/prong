@@ -213,6 +213,18 @@ describe('live: agent routing', () => {
     expect(getState().agent.notices[0]).toMatchObject({ ok: true, title: 'Interface updated', target: 'app' });
   });
 
+  it('a change to the engine says the app must be built again: the interface rebuild does not carry it', async () => {
+    setState((s) => ({ engine: { ...s.engine, ui: 'static', stale: false } }));
+    vi.spyOn(client, 'agentRun').mockResolvedValue({ opId: 'app9' });
+    vi.spyOn(client, 'appRecord').mockResolvedValue({ sha: 'd'.repeat(40), files: ['server/src/git/repo.ts', 'src/components/FileList.tsx'] });
+    const rebuild = vi.spyOn(client, 'appRebuild').mockResolvedValue({ opId: 'rb9' });
+    await agentSend('сделай панель изменений шире');
+    handleAgentEvent({ opId: 'app9', done: true } as any);
+    await vi.waitFor(() => expect(rebuild).toHaveBeenCalled());
+    expect(getState().agent.messages.at(-1)!.actions?.at(-1)).toBe('⚠ engine change: rebuild the app to run it');
+    expect(getState().engine.stale).toBe(true);
+  });
+
   it('a build that fails rolls the change back and says so', async () => {
     setState((s) => ({ engine: { ...s.engine, ui: 'static' }, agent: { ...s.agent, settings: { ...s.agent.settings, autoRollbackOnBuildError: true } } }));
     vi.spyOn(client, 'agentRun').mockResolvedValue({ opId: 'app2' });

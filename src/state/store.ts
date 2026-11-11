@@ -3,7 +3,7 @@ import { Commit, ConflictChoice, FetchOptions, FileChange, GitHubAccount, PullOp
 import { blocksOf, composeLines } from '../git/conflictBlocks';
 import { buildSmallSnapshot, buildSnapshot, cloneFile, fakeSha, WORKSPACES } from '../git/mock/fixtures';
 import { SCHEMES, ThemeName, UI_SCALES, THEMES } from '../theme';
-import { AgentMessage, AgentSettings, AgentTarget, AppMods, AppVersion, FACTORY_MODS } from '../agent/types';
+import { AgentAttachment, AgentMessage, AgentSettings, AgentTarget, AppMods, AppVersion, FACTORY_MODS } from '../agent/types';
 import { plan as planCommand } from '../agent/mockAgent';
 import * as live from './live';
 import type { ServerSettings, Submodule, SwitchOptions } from '../git/GitClient';
@@ -225,10 +225,12 @@ export interface AgentState {
   busy: boolean;
   versions: AppVersion[];
   settings: AgentSettings;
+  /** files pasted or dropped on the input, going with the next message */
+  attachments: AgentAttachment[];
 }
 
 export interface AppState {
-  engine: { online: boolean; git: string; version: string; ui?: 'static' | 'dev'; uiBuild?: 'factory' | 'agent' };
+  engine: { online: boolean; git: string; version: string; ui?: 'static' | 'dev'; uiBuild?: 'factory' | 'agent'; stale?: boolean };
   serverSettings: ServerSettings | null;
   agentAvailable: { ok: boolean; path: string | null; version: string } | null;
   scanning: string | null;
@@ -301,6 +303,7 @@ let state: AppState = {
     target: 'auto',
     session: null,
     busy: false,
+    attachments: [],
     versions: [],
     messages: [
       {
@@ -317,6 +320,7 @@ let state: AppState = {
       sourcesPath: '~/Library/Application Support/Prong/src',
       askBeforeApply: false,
       autoRollbackOnBuildError: true,
+      fullAccess: true,
       connected: true,
       cliVersion: '2.1.4',
     },
@@ -2024,8 +2028,11 @@ export function agentSend(text: string) {
     return;
   }
   const clean = text.trim();
-  if (!clean || state.agent.busy) return;
-  pushMessage({ role: 'user', text: clean });
+  const files = state.agent.attachments.filter((x) => x.state === 'ready');
+  if ((!clean && !files.length) || state.agent.busy) return;
+  pushMessage({ role: 'user', text: clean, attachments: files.length ? files : undefined });
+  updateAgent({ attachments: [] });
+  if (!clean) return;
   if (state.engine.online) {
     // the offline demo agent never stands in for a missing Claude Code: it ran its scripted commands (create a
     // branch, commit, rebase, push) in the real repository

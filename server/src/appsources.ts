@@ -3,6 +3,7 @@ import { createHash } from 'node:crypto';
 import { cpSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { runGit, RunOptions } from './git/run.js';
 
 /**
@@ -237,6 +238,45 @@ export function currentUiBuild(factory = process.env.PRONG_WEB_DIR): string | nu
 
 export function resetUiToFactory() {
   rmSync(pointer(), { force: true });
+}
+
+/**
+ * Whether the engine that runs now is older than the sources' own `server/`. The app rebuilds its interface after
+ * every agent version, but the engine is the compiled copy inside Prong.app: a change to git's side only reaches it
+ * after `macos/build.sh` and a restart. Without this the fix looks ignored (a discard that still keeps a folder),
+ * so the app says it plainly. False when the engine runs from the sources themselves (a dev run), which reload on
+ * their own terms.
+ */
+let staleCheck: { at: number; sources: string; stale: boolean } | null = null;
+export function engineOlderThanSources(sources: string, maxAge = 15000): boolean {
+  if (!sources) return false;
+  if (staleCheck && staleCheck.sources === sources && Date.now() - staleCheck.at < maxAge) return staleCheck.stale;
+  const stale = readStale(sources);
+  staleCheck = { at: Date.now(), sources, stale };
+  return stale;
+}
+function readStale(sources: string): boolean {
+  try {
+    const here = path.dirname(fileURLToPath(import.meta.url));
+    const src = path.join(sources, 'server', 'src');
+    if (!existsSync(src)) return false;
+    // running from the sources (tsx, the tests): this is the engine they describe
+    if ((path.resolve(here) + path.sep).startsWith(path.resolve(src) + path.sep)) return false;
+    return newestFile(src) > newestFile(here);
+  } catch {
+    return false;
+  }
+}
+/** the newest mtime among the engine's own files in `dir` (its tree is small: no node_modules there) */
+function newestFile(dir: string): number {
+  let newest = 0;
+  for (const e of readdirSync(dir, { withFileTypes: true })) {
+    if (e.name.startsWith('.') || e.name === 'node_modules') continue;
+    const p = path.join(dir, e.name);
+    if (e.isDirectory()) newest = Math.max(newest, newestFile(p));
+    else if (/\.(ts|js)$/.test(e.name)) newest = Math.max(newest, statSync(p).mtimeMs);
+  }
+  return newest;
 }
 
 /**

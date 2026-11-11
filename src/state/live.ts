@@ -13,12 +13,19 @@ import { remoteTwin } from '../components/branchNames';
 import type { BlobSide, LfsPick, UiSettings } from '../git/GitClient';
 import { GhRepo, HttpGitClient, OpEvent, RebaseTodoItem, ServerSettings, Submodule, SwitchOptions } from '../git/GitClient';
 import { Commit, ConflictChoice, FetchOptions, FileChange, GitHubAccount, Hunk, PullOptions, PushOptions, QueueItem, RepoAuth, RepoInfo, SavedSession, Sha, SshKey, Workspace } from '../git/types';
-import { AgentMessage, AppVersion } from '../agent/types';
+import { AgentAttachment, AgentMessage, AppVersion } from '../agent/types';
 import { applyUiPrefs, Area, patchErrorExplain, closeDialog, confirm, DEFAULT_COLLAPSED_GROUPS, ErrorEntry, findCommit, openAgentChat, UndoEntry, finishAgentRun, getState, nextRevealNonce, openDialog, openRepo, RebaseTodo, RepoState, Section, setState, subscribe, toast, updateAgent, updateRepo } from './store';
 
 export const client = new HttpGitClient();
 
 // ---------- engine status & events ----------
+
+/**
+ * Prong rebuilds its interface after every agent version, but not the git engine: the desktop app runs the copy
+ * compiled into Prong.app. A change under server/ (discard, status, push…) therefore does nothing until the app is
+ * built again — said in these words wherever it matters, so a working fix never looks ignored.
+ */
+export const ENGINE_REBUILD = 'Prong rebuilds its interface itself, but the git engine is the copy compiled into the app: run macos/build.sh in the sources and start Prong again for changes under server/ to take effect.';
 
 let unsubscribe: (() => void) | null = null;
 const opLog = new Map<string, string[]>();
@@ -26,7 +33,9 @@ const opLog = new Map<string, string[]>();
 export async function bootstrap() {
   try {
     const h = await client.health();
-    setState({ engine: { online: !!h.ok, git: h.git ?? '', version: h.version ?? '', ui: h.ui, uiBuild: h.uiBuild } });
+    setState({ engine: { online: !!h.ok, git: h.git ?? '', version: h.version ?? '', ui: h.ui, uiBuild: h.uiBuild, stale: h.engineStale } });
+    // the engine inside the app is older than the sources: the agent's fixes to git's side are not running yet
+    if (h.engineStale) toast('The engine is older than the sources', 'info', ENGINE_REBUILD);
     const known = await client.listRepos();
     setState((s) => {
       const existing = new Set(s.repos.map((r) => r.path));
@@ -1800,7 +1809,7 @@ export async function syncServerState() {
       accounts: accounts.map(toAccount),
       sshKeys: keys.map(toKey),
       agentAvailable: agentCheck,
-      agent: { ...s.agent, settings: { ...s.agent.settings, provider: settings.agent.provider, model: settings.agent.model ?? '', cliPath: settings.agent.cliPath ?? '', sourcesPath: settings.agent.sourcesPath ?? '', askBeforeApply: settings.agent.askBeforeApply, autoRollbackOnBuildError: settings.agent.autoRollbackOnBuildError, connected: !!agentCheck?.ok, cliVersion: agentCheck?.version?.replace(/\s*\(Claude Code\)/, '') ?? '' } },
+      agent: { ...s.agent, settings: { ...s.agent.settings, provider: settings.agent.provider, model: settings.agent.model ?? '', cliPath: settings.agent.cliPath ?? '', sourcesPath: settings.agent.sourcesPath ?? '', askBeforeApply: settings.agent.askBeforeApply, autoRollbackOnBuildError: settings.agent.autoRollbackOnBuildError, fullAccess: settings.agent.fullAccess !== false, connected: !!agentCheck?.ok, cliVersion: agentCheck?.version?.replace(/\s*\(Claude Code\)/, '') ?? '' } },
     };
   });
   // the engine's copy of the UI preferences wins over the local mirror
@@ -2396,7 +2405,7 @@ export function agentReady() {
 }
 
 let agentMsgId = 0;
-let agentOp: { opId: string; msgId: number; mode: 'repo' | 'app'; prompt: string; cwd: string; retargetable: boolean; before?: Record<string, string> } | null = null;
+let agentOp: { opId: string; msgId: number; mode: 'repo' | 'app'; prompt: string; cwd: string; retargetable: boolean; before?: Record<string, string>; attachments: string[] } | null = null;
 /** the interface rebuild after an app change; its success arrives as the engine's `ui-updated` broadcast */
 let rebuildOp: { opId: string; msgId: number | null; versionSha: string | null; cwd: string } | null = null;
 
@@ -2409,25 +2418,67 @@ function patchAgentMessage(id: number, fn: (m: AgentMessage) => AgentMessage) {
   updateAgent((a) => ({ messages: a.messages.map((m) => (m.id === id ? fn(m) : m)) }));
 }
 
+// ---------- files attached to an agent message ----------
+
+/** at most this many on one message; each up to the engine's limit (25 MB) */
+const MAX_ATTACHMENTS = 10;
+const MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024;
+let attachSeq = 0;
+const patchDraft = (id: string, patch: Partial<AgentAttachment>) => updateAgent((a) => ({ attachments: a.attachments.map((x) => (x.id === id ? { ...x, ...patch } : x)) }));
+
+/**
+ * Files pasted or dropped on the agent's input: shown at once, kept by the engine (the agent gets their paths and
+ * reads them, images included). Without the engine (the demo) they are only shown.
+ */
+export function attachAgentFiles(files: File[]) {
+  const room = MAX_ATTACHMENTS - getState().agent.attachments.length;
+  if (room <= 0) return toast(`At most ${MAX_ATTACHMENTS} files on one message`, 'info');
+  if (files.length > room) toast(`Only ${room} more file${room === 1 ? '' : 's'} attached: at most ${MAX_ATTACHMENTS} on one message`, 'info');
+  for (const f of files.slice(0, room)) {
+    const id = `att-${++attachSeq}`;
+    const mime = f.type || 'application/octet-stream';
+    const name = f.name || (mime.startsWith('image/') ? `pasted-image.${mime.split('/')[1] ?? 'png'}` : 'pasted');
+    if (f.size > MAX_ATTACHMENT_BYTES) {
+      toast(`${name} is too large to attach`, 'error', `${Math.round(f.size / 1024 / 1024)} MB: the limit is ${MAX_ATTACHMENT_BYTES / 1024 / 1024} MB`);
+      continue;
+    }
+    const preview = mime.startsWith('image/') && typeof URL !== 'undefined' && URL.createObjectURL ? URL.createObjectURL(f) : undefined;
+    updateAgent((a) => ({ attachments: [...a.attachments, { id, name, mime, size: f.size, state: engineOnline() ? 'uploading' : 'ready', url: preview }] }));
+    if (!engineOnline()) continue;
+    void client.uploadAttachment(f, name, mime).then(
+      (r) => patchDraft(id, { state: 'ready', file: r.file, name: r.name, url: mime.startsWith('image/') ? client.attachmentUrl(r.file) : undefined }),
+      (e) => patchDraft(id, { state: 'failed', error: String(e?.message ?? e) }),
+    );
+  }
+}
+export function removeAgentAttachment(id: string) {
+  updateAgent((a) => ({ attachments: a.attachments.filter((x) => x.id !== id) }));
+}
+
 export async function agentSend(text: string) {
   const s = getState();
   const clean = text.trim();
-  if (!clean || s.agent.busy) return;
+  const files = s.agent.attachments.filter((x) => x.state === 'ready');
+  if ((!clean && !files.length) || s.agent.busy) return;
+  if (s.agent.attachments.some((x) => x.state === 'uploading')) return toast('Wait for the attached files to upload', 'info');
   const auto = s.agent.target === 'auto';
   const last = s.agent.session;
   // a reply ("да, сделай", "почему?") goes on where the conversation is: same target, same repository
   const reply = auto && !!last && !mentionsTarget(clean);
   const mode: 'repo' | 'app' = s.agent.target === 'app' ? 'app' : s.agent.target === 'repo' ? 'repo' : reply ? last!.mode : classifyAgentTarget(clean);
-  pushAgentMessage({ role: 'user', text: clean, target: mode });
+  // files only: the agent is asked to look at them
+  const ask = clean || 'Посмотри приложенное.';
+  pushAgentMessage({ role: 'user', text: clean, target: mode, attachments: files.length ? files : undefined });
+  updateAgent({ attachments: [] });
   // a message in the chat continues the conversation (Claude Code remembers it) when it runs in the same place
-  await startAgentRun(clean, mode, auto && !reply, '', reply && mode === 'repo' ? last!.cwd : undefined, true);
+  await startAgentRun(ask, mode, auto && !reply, '', reply && mode === 'repo' ? last!.cwd : undefined, true, files.map((x) => x.file!).filter(Boolean));
 }
 
 /**
  * Starts a Claude Code run; `retargetable` lets the agent bounce an AUTO request to the other target once.
  * `hint` is appended to the prompt the agent sees (not to the recorded version message).
  */
-async function startAgentRun(clean: string, mode: 'repo' | 'app', retargetable: boolean, hint = '', repoPath?: string, followUp = false) {
+async function startAgentRun(clean: string, mode: 'repo' | 'app', retargetable: boolean, hint = '', repoPath?: string, followUp = false, attachments: string[] = []) {
   const s = getState();
   const cwd = mode === 'repo' ? repoPath ?? liveInfo()?.path : s.agent.settings.sourcesPath;
   // the chat's last session, when it ran in the same place: Claude Code remembers what was said and done
@@ -2452,13 +2503,13 @@ async function startAgentRun(clean: string, mode: 'repo' | 'app', retargetable: 
     }
     before = prep.before;
   }
-  const op = await guard('Agent', () => client.agentRun(clean + hint, cwd, mode, !s.agent.settings.askBeforeApply, resume));
+  const op = await guard('Agent', () => client.agentRun(clean + hint, cwd, mode, !s.agent.settings.askBeforeApply, resume, ...(attachments.length ? [attachments] : [])));
   if (!op) {
     patchAgentMessage(msgId, (m) => ({ ...m, text: 'Не удалось запустить Claude Code. Проверьте путь к бинарю в Settings.' }));
     finishAgentRun(msgId, { ok: false, error: 'Claude Code did not start' });
     return;
   }
-  agentOp = { opId: op.opId, msgId, mode, prompt: clean, cwd, retargetable, before };
+  agentOp = { opId: op.opId, msgId, mode, prompt: clean, cwd, retargetable, before, attachments };
   setState({ operation: { label: AGENT_OP_LABEL, progress: 0, log: [] } });
 }
 
@@ -2629,7 +2680,7 @@ export async function agentStop() {
 /** Called from the SSE handler for events that belong to the running agent op. Returns true when consumed. */
 export function handleAgentEvent(e: OpEvent): boolean {
   if (!agentOp || e.opId !== agentOp.opId) return false;
-  const { msgId, mode, prompt, cwd, retargetable, before } = agentOp;
+  const { msgId, mode, prompt, cwd, retargetable, before, attachments } = agentOp;
   if (e.line) {
     const i = e.line.indexOf(':');
     const kind = e.line.slice(0, i);
@@ -2661,11 +2712,11 @@ export function handleAgentEvent(e: OpEvent): boolean {
         // it named the target it is already in: ask once more, plainly
         patchAgentMessage(msgId, (m) => ({ ...m, text: 'Агент сослался на текущую цель, повторяю запрос…' }));
         updateAgent({ status: 'Asking again…' });
-        void startAgentRun(prompt, mode, false, mode === 'app' ? "\n\n(You are already working in Prong's own sources: make this change here.)" : "\n\n(This is the user's repository: do this here.)");
+        void startAgentRun(prompt, mode, false, mode === 'app' ? "\n\n(You are already working in Prong's own sources: make this change here.)" : "\n\n(This is the user's repository: do this here.)", undefined, false, attachments);
       } else {
         patchAgentMessage(msgId, (m) => ({ ...m, text: marker === 'app' ? 'Это задача про интерфейс Prong, запускаю в исходниках приложения…' : 'Это задача про репозиторий, запускаю в его рабочей папке…', target: marker }));
         updateAgent({ status: marker === 'app' ? 'Switching to the app sources…' : 'Switching to the repository…' });
-        void startAgentRun(prompt, marker, false);
+        void startAgentRun(prompt, marker, false, '', undefined, false, attachments);
       }
       return true;
     }
@@ -2711,6 +2762,12 @@ async function applyAppChange(msgId: number, prompt: string, cwd: string, before
   await loadAppVersions();
   const version = getState().agent.versions.find((x) => x.sha === v!.sha);
   patchAgentMessage(msgId, (m) => ({ ...m, versionId: version?.id, actions: [...(m.actions ?? []), `version v${version?.n ?? '?'} · ${v!.files.join(', ')}`] }));
+  // a change to the engine: the rebuild below only makes the interface, so the app has to be built again for it
+  if (v.files.some((f) => f.startsWith('server/')) && getState().engine.ui === 'static') {
+    patchAgentMessage(msgId, (m) => ({ ...m, actions: [...(m.actions ?? []), '⚠ engine change: rebuild the app to run it'] }));
+    setState((s) => ({ engine: { ...s.engine, stale: true } }));
+    toast('The engine changed', 'info', ENGINE_REBUILD);
+  }
   if (getState().engine.ui !== 'static') {
     finishAgentRun(msgId, { ok: true });
     return;

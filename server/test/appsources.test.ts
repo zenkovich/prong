@@ -1,9 +1,10 @@
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { AddressInfo } from 'node:net';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import { AppSources, buildUi, currentUiBuild, resetUiToFactory } from '../src/appsources.js';
+import { fileURLToPath } from 'node:url';
+import { AppSources, buildUi, currentUiBuild, engineOlderThanSources, resetUiToFactory } from '../src/appsources.js';
 import { runGit } from '../src/git/run.js';
 
 let root: string;
@@ -171,6 +172,31 @@ describe('interface build', () => {
     await expect(buildUi(dir)).rejects.toThrow(/SyntaxError: Unexpected token/);
     expect(currentUiBuild()).toBe(good);
     resetUiToFactory();
+  });
+});
+
+/**
+ * The desktop app rebuilds its interface after every version but runs the engine compiled into it: a change under
+ * server/ only takes effect after a rebuild of the app, and the interface says so (health's engineStale).
+ */
+describe('an engine older than the sources', () => {
+  const sourcesWithEngine = (name: string, when: number) => {
+    const dir = path.join(root, name);
+    mkdirSync(path.join(dir, 'server/src/git'), { recursive: true });
+    const f = path.join(dir, 'server/src/git/repo.ts');
+    writeFileSync(f, 'export const x = 1;\n');
+    utimesSync(f, new Date(when), new Date(when));
+    return dir;
+  };
+  it('sources newer than the running engine are stale, older ones are not, and sources of its own never are', () => {
+    expect(engineOlderThanSources(sourcesWithEngine('newer-engine', Date.now() + 60_000), 0)).toBe(true);
+    expect(engineOlderThanSources(sourcesWithEngine('older-engine', Date.now() - 86_400_000), 0)).toBe(false);
+    // no engine sources there, and no sources folder at all: nothing to compare
+    expect(engineOlderThanSources(makeSources('no-engine'), 0)).toBe(false);
+    expect(engineOlderThanSources('', 0)).toBe(false);
+    // the engine of this test runs from these very sources (not a packaged copy)
+    const own = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
+    expect(engineOlderThanSources(own, 0)).toBe(false);
   });
 });
 

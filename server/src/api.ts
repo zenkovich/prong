@@ -15,9 +15,10 @@ import { addKeyToAgent, deleteSecret, generateSshKey, getSecret, listSshKeys, op
 import * as github from './github.js';
 import { accountToken, serializeStored, SignInExpired, storedFrom, type TokenAccount } from './tokens.js';
 import { checkClaude, explainProblem, runAgent } from './agent.js';
+import { attachDir, attachmentPath, attachmentsNote, saveAttachment } from './attachments.js';
 import { getAvatar } from './avatars.js';
 import { checkIncoming } from './origin.js';
-import { AppSources, buildUi, currentUiBuild, resetUiToFactory } from './appsources.js';
+import { AppSources, buildUi, currentUiBuild, engineOlderThanSources, resetUiToFactory } from './appsources.js';
 import type { FileChange, Hunk } from './types.js';
 
 /**
@@ -663,8 +664,16 @@ export function createApi(opts: { log?: (s: string) => void } = {}) {
     try {
       if (req.method === 'GET' && url.pathname === '/api/health') {
         const v = await runGit(['--version'], { cwd: homedir(), allowFail: true });
-        // ui: 'static' when the engine serves the interface (desktop app), 'dev' behind a Metro dev server
-        return json(200, { ok: true, git: v.stdout.trim(), version: '0.1.0', ui: WEB_DIR ? 'static' : 'dev', uiBuild: WEB_DIR && currentUiBuild(WEB_DIR) ? 'agent' : 'factory' });
+        // ui: 'static' when the engine serves the interface (desktop app), 'dev' behind a Metro dev server.
+        // engineStale: the sources' server/ is newer than this engine — the app must be rebuilt for it to run
+        return json(200, {
+          ok: true,
+          git: v.stdout.trim(),
+          version: '0.1.0',
+          ui: WEB_DIR ? 'static' : 'dev',
+          uiBuild: WEB_DIR && currentUiBuild(WEB_DIR) ? 'agent' : 'factory',
+          engineStale: engineOlderThanSources(expandHome(String(loadSettings().agent.sourcesPath ?? ''))),
+        });
       }
       if (req.method === 'GET' && url.pathname === '/api/events') {
         res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive' });
@@ -731,6 +740,21 @@ export function createApi(opts: { log?: (s: string) => void } = {}) {
         if (!a.data) return json(404, { error: 'no avatar' });
         res.writeHead(200, { 'content-type': a.mime, 'cache-control': 'private, max-age=86400', 'content-length': a.data.length });
         res.end(a.data);
+        return;
+      }
+      // a file attached to an agent message: its bytes are the body (name and type in the query), not JSON
+      if (req.method === 'POST' && url.pathname === '/api/agent/attachments') {
+        try {
+          return json(200, await saveAttachment(req, url.searchParams.get('name') ?? '', String(url.searchParams.get('mime') ?? 'application/octet-stream').slice(0, 100)));
+        } catch (e: any) {
+          throw new HttpError(e?.status ?? 400, e?.message ?? String(e));
+        }
+      }
+      if (req.method === 'GET' && url.pathname === '/api/agent/attachment') {
+        const full = attachmentPath(url.searchParams.get('f') ?? '');
+        if (!full) return json(404, { error: 'no such attachment' });
+        // shown in the chat as an <img>; opened by itself, a file of the user's runs in a sandbox, never as a page of the engine
+        serveFile(req, res, full, mimeOf(full), { 'content-security-policy': 'sandbox', 'x-content-type-options': 'nosniff' });
         return;
       }
       const body = req.method === 'POST' || req.method === 'PUT' || req.method === 'DELETE' ? await readJson(req) : {};
@@ -907,8 +931,11 @@ export function createApi(opts: { log?: (s: string) => void } = {}) {
         // in a repository the agent's git fetch / push / ls-remote sign in as Prong's do (its SSH key or account)
         const auth = mode === 'repo' && Repo.isRepo(cwd) && Repo.auth ? await Repo.auth(cwd) : null;
         const env = gitEnvOf(auth);
+        // the files attached to the message: by their stored names, told to the agent by path, readable by it
+        const attached = strings(body.attachments, 20).map(attachmentPath).filter((x): x is string => !!x);
+        const prompt = String(body.prompt ?? '') + attachmentsNote(attached);
         const op = longOp(`Agent: ${String(body.prompt ?? '').slice(0, 40)}`, async (p, signal) => {
-          const r = await runAgent({ prompt: String(body.prompt ?? ''), cwd, mode, model: body.model || settings.agent.model || undefined, cliPath: settings.agent.cliPath, apply: body.apply !== false, resume: body.resume ? String(body.resume) : undefined, env, connection: auth?.describe, signal, onEvent: (e) => p(`${e.type}:${e.text}`, null) });
+          const r = await runAgent({ prompt, addDir: attached.length ? attachDir() : undefined, cwd, mode, model: body.model || settings.agent.model || undefined, cliPath: settings.agent.cliPath, apply: body.apply !== false, full: settings.agent.fullAccess !== false, resume: body.resume ? String(body.resume) : undefined, env, connection: auth?.describe, signal, onEvent: (e) => p(`${e.type}:${e.text}`, null) });
           result.text = r.text;
           p(`result:${JSON.stringify({ text: r.text, costUsd: r.costUsd, sessionId: r.sessionId })}`, 1);
         });

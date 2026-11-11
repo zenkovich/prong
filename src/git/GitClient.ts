@@ -88,7 +88,7 @@ export interface ServerSettings {
   /** after a checkout, pull, merge… the submodules whose recorded commit changed follow it */
   autoUpdateSubmodules?: boolean;
   signCommits: boolean;
-  agent: { provider: 'anthropic-claude-code' | 'anthropic-api' | 'openai-compatible'; model: string; cliPath: string; sourcesPath: string; askBeforeApply: boolean; autoRollbackOnBuildError: boolean };
+  agent: { provider: 'anthropic-claude-code' | 'anthropic-api' | 'openai-compatible'; model: string; cliPath: string; sourcesPath: string; askBeforeApply: boolean; autoRollbackOnBuildError: boolean; fullAccess?: boolean };
   githubClientId: string;
   /** the language the AI writes in (an English name), or 'auto': the system's */
   language?: string;
@@ -105,6 +105,8 @@ export interface EngineHealth {
   ui?: 'static' | 'dev';
   /** which interface the engine serves: the one built into the app, or the agent's latest build */
   uiBuild?: 'factory' | 'agent';
+  /** the sources' server/ is newer than the engine running now: it takes a rebuild of the app to run it */
+  engineStale?: boolean;
 }
 export interface AppVersionInfo {
   sha: string;
@@ -398,7 +400,9 @@ export interface GitClient {
   githubDevicePoll(clientId: string, deviceCode: string, host?: string): Promise<{ done: boolean; account?: ServerAccount; error?: string }>;
   agentCheck(): Promise<{ ok: boolean; path: string | null; version: string }>;
   /** `resume`: the Claude Code session to continue (a follow-up in the same chat and folder) */
-  agentRun(prompt: string, cwd: string, mode: 'repo' | 'app', apply?: boolean, resume?: string): Promise<{ opId: string }>;
+  agentRun(prompt: string, cwd: string, mode: 'repo' | 'app', apply?: boolean, resume?: string, attachments?: string[]): Promise<{ opId: string }>;
+  uploadAttachment(data: Blob, name: string, mime: string): Promise<{ file: string; name: string; mime: string; size: number }>;
+  attachmentUrl(file: string): string;
   agentExplain(p: { title: string; detail?: string; repo?: string; context?: string; language: string }): Promise<{ opId: string }>;
 
   /** subscribe to progress events of long operations; returns unsubscribe */
@@ -884,8 +888,18 @@ export class HttpGitClient implements GitClient {
   agentCheck() {
     return this.get<{ ok: boolean; path: string | null; version: string }>('/api/agent/check');
   }
-  agentRun(prompt: string, cwd: string, mode: 'repo' | 'app', apply = true, resume?: string) {
-    return this.post<{ opId: string }>('/api/agent/run', { prompt, cwd, mode, apply, resume });
+  agentRun(prompt: string, cwd: string, mode: 'repo' | 'app', apply = true, resume?: string, attachments?: string[]) {
+    return this.post<{ opId: string }>('/api/agent/run', { prompt, cwd, mode, apply, resume, attachments });
+  }
+  /** a file for an agent message: its bytes as the body, kept by the engine (a week) */
+  async uploadAttachment(data: Blob, name: string, mime: string) {
+    const r = await fetch(`${this.baseUrl}/api/agent/attachments?name=${encodeURIComponent(name)}&mime=${encodeURIComponent(mime)}`, { method: 'POST', headers: { 'content-type': 'application/octet-stream' }, body: data });
+    const out = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(out?.error ?? `upload failed (${r.status})`);
+    return out as { file: string; name: string; mime: string; size: number };
+  }
+  attachmentUrl(file: string) {
+    return `${this.baseUrl}/api/agent/attachment?f=${encodeURIComponent(file)}`;
   }
   agentExplain(p: { title: string; detail?: string; repo?: string; context?: string; language: string }) {
     return this.post<{ opId: string }>('/api/agent/explain', p);

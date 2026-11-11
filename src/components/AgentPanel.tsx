@@ -1,7 +1,7 @@
 import React, { useEffect, useRef, useState } from 'react';
-import { ScrollView, StyleSheet, View } from 'react-native';
-import { SUGGESTIONS } from '../agent/mockAgent';
-import { AgentMessage, AgentTarget, AppVersion } from '../agent/types';
+import { Image, ScrollView, StyleSheet, View } from 'react-native';
+import { useFileTarget } from '../ui/fileDrop';
+import { AgentAttachment, AgentMessage, AgentTarget, AppVersion } from '../agent/types';
 import { Markdown } from './Markdown';
 import {
   agentSend,
@@ -88,13 +88,18 @@ function Chat() {
   }, [agent.messages.length, agent.busy]);
   // the agent message of the run in progress (its steps stay unfolded)
   const runningId = agent.busy ? [...agent.messages].reverse().find((m) => m.role === 'agent')?.id : undefined;
+  const ready = agent.attachments.some((x) => x.state === 'ready');
+  const uploading = agent.attachments.some((x) => x.state === 'uploading');
+  const canSend = (!!text.trim() || ready) && !uploading && !agent.busy;
   const send = () => {
-    if (!text.trim() || agent.busy) return;
+    if (!canSend) return;
     agentSend(text);
     setText('');
   };
+  // files pasted into the field or dropped anywhere on the chat go with the next message (no button for it)
+  const { box: dropBox, over: dragging } = useFileTarget(live.attachAgentFiles);
   return (
-    <View style={{ flex: 1 }}>
+    <View ref={dropBox} style={{ flex: 1 }} testID="agent-chat">
       <ScrollView ref={scroll} style={{ flex: 1 }} contentContainerStyle={{ padding: 10 }}>
         {agent.messages.map((m) => (
           <Message key={m.id} m={m} running={m.id === runningId} />
@@ -111,16 +116,18 @@ function Chat() {
         )}
       </ScrollView>
       <View style={[styles.composer, { borderColor: t.border, backgroundColor: t.panelAlt }]}>
-        <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={{ paddingBottom: 6 }}>
-          {SUGGESTIONS.filter((s) => agent.target === 'auto' || s.target === agent.target).map((s) => (
-            <PressScale key={s.text} onPress={() => setText(s.text)} scaleTo={0.97} style={[styles.chip, { borderColor: t.borderStrong }]} hoverStyle={{ borderColor: t.accent }} testID="agent-suggestion">
-              <Txt size={FONT.xs} muted>
-                {s.text}
-              </Txt>
-            </PressScale>
-          ))}
-        </ScrollView>
-        <Input value={text} onChange={setText} placeholder={agent.target === 'app' ? 'что изменить в интерфейсе' : agent.target === 'repo' ? 'что сделать в репозитории' : 'команда для репозитория или интерфейса'} slash onSubmit={send} autoFocus enterSends testID="agent-chat-input" />
+        {agent.attachments.length > 0 && <Attachments items={agent.attachments} onRemove={live.removeAgentAttachment} />}
+        <Input
+          value={text}
+          onChange={setText}
+          placeholder={`${agent.target === 'app' ? 'что изменить в интерфейсе' : agent.target === 'repo' ? 'что сделать в репозитории' : 'команда для репозитория или интерфейса'} · картинку можно вставить или перетащить`}
+          slash
+          onSubmit={send}
+          autoFocus
+          enterSends
+          inputMinHeight={112}
+          testID="agent-chat-input"
+        />
         <View style={{ flexDirection: 'row', alignItems: 'center', marginTop: 6 }}>
           <Segmented<AgentTarget> value={agent.target} onChange={setAgentTarget} options={[{ value: 'auto', label: 'auto' }, { value: 'repo', label: 'repo' }, { value: 'app', label: 'app' }]} />
           <View style={{ flex: 1 }} />
@@ -128,9 +135,72 @@ function Chat() {
           <PressScale onPress={clearAgentChat} disabled={agent.busy} scaleTo={0.9} style={{ padding: 4, marginRight: 4, opacity: agent.busy ? 0.4 : 1 }} hoverStyle={{ backgroundColor: t.hover }} label="Clear chat" testID="agent-clear">
             <Icon name="trash" size={12} />
           </PressScale>
-          <Button small primary label="Send" icon="send" onPress={send} disabled={!text.trim() || agent.busy} testID="agent-chat-send" />
+          <Button small primary label="Send" icon="send" onPress={send} disabled={!canSend} testID="agent-chat-send" />
         </View>
       </View>
+      {/* where dropped files go */}
+      {dragging && (
+        <View pointerEvents="none" style={[StyleSheet.absoluteFill, styles.dropZone, { borderColor: t.accent, backgroundColor: t.accentSoft }]} testID="agent-drop-zone">
+          <Txt weight="600" color={t.accent}>
+            Drop to attach
+          </Txt>
+          <Txt size={FONT.xs} muted style={{ marginTop: 2 }}>
+            the agent sees images and PDFs, and reads the rest
+          </Txt>
+        </View>
+      )}
+    </View>
+  );
+}
+
+const kb = (n: number) => (n >= 1024 * 1024 ? `${(n / 1024 / 1024).toFixed(1)} MB` : `${Math.max(1, Math.round(n / 1024))} KB`);
+
+/**
+ * Files attached to a message: an image as its picture, another file as its name. `onRemove`: still a draft (×
+ * takes it off; uploading or failed shows so).
+ */
+export function Attachments({ items, onRemove, size = 56 }: { items: AgentAttachment[]; onRemove?: (id: string) => void; size?: number }) {
+  const t = useTheme();
+  return (
+    <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 6, marginBottom: 6 } as any} testID="agent-attachments">
+      {items.map((a) => {
+        const image = a.mime.startsWith('image/') && !!a.url;
+        const failed = a.state === 'failed';
+        const open = () => a.url && a.state === 'ready' && live.openUrl(a.url);
+        return (
+          <View key={a.id} style={{ position: 'relative' }} testID="agent-attachment">
+            <PressScale
+              onPress={open}
+              scaleTo={0.97}
+              label={failed ? `${a.name}: ${a.error ?? 'not uploaded'}` : `${a.name} · ${kb(a.size)}`}
+              style={[image ? { width: size, height: size } : styles.fileChip, { borderWidth: 1, borderColor: failed ? t.del : t.borderStrong, backgroundColor: t.bg, overflow: 'hidden' }]}
+            >
+              {image ? (
+                <Image source={{ uri: a.url }} style={{ width: size, height: size }} resizeMode="cover" accessibilityLabel={a.name} />
+              ) : (
+                <>
+                  <Txt size={FONT.xs} numberOfLines={1} style={{ maxWidth: 150 }}>
+                    {a.name}
+                  </Txt>
+                  <Txt size={10} faint>
+                    {failed ? 'not uploaded' : kb(a.size)}
+                  </Txt>
+                </>
+              )}
+              {a.state === 'uploading' && (
+                <View style={[StyleSheet.absoluteFill, { alignItems: 'center', justifyContent: 'center', backgroundColor: t.bg + 'aa' }]}>
+                  <Spinner size={12} />
+                </View>
+              )}
+            </PressScale>
+            {onRemove && (
+              <PressScale onPress={() => onRemove(a.id)} scaleTo={0.9} outerStyle={styles.attachXAt} style={[styles.attachX, { backgroundColor: t.panel, borderColor: t.borderStrong }]} hoverStyle={{ borderColor: t.del }} label={`Remove ${a.name}`} testID="agent-attachment-remove">
+                <Icon name="x" size={9} />
+              </PressScale>
+            )}
+          </View>
+        );
+      })}
     </View>
   );
 }
@@ -164,6 +234,7 @@ function Message({ m, running }: { m: AgentMessage; running: boolean }) {
           {relTime(m.time)}
         </Txt>
       </View>
+      {m.attachments?.length ? <Attachments items={m.attachments} size={96} /> : null}
       {m.text ? <Markdown text={m.text} testID="agent-msg-text" /> : null}
       {running
         ? steps.slice(-4).map((a, i) => <Step key={i} text={a} />)
@@ -408,7 +479,7 @@ function Settings() {
   const [checking, setChecking] = useState(false);
   const persist = (patch: Partial<typeof s>) => {
     updateAgentSettings(patch);
-    if (engine.online) void live.saveSettings({ agent: { provider: patch.provider ?? s.provider, model: patch.model ?? s.model, cliPath: patch.cliPath ?? s.cliPath, sourcesPath: patch.sourcesPath ?? s.sourcesPath, askBeforeApply: patch.askBeforeApply ?? s.askBeforeApply, autoRollbackOnBuildError: patch.autoRollbackOnBuildError ?? s.autoRollbackOnBuildError } });
+    if (engine.online) void live.saveSettings({ agent: { provider: patch.provider ?? s.provider, model: patch.model ?? s.model, cliPath: patch.cliPath ?? s.cliPath, sourcesPath: patch.sourcesPath ?? s.sourcesPath, askBeforeApply: patch.askBeforeApply ?? s.askBeforeApply, autoRollbackOnBuildError: patch.autoRollbackOnBuildError ?? s.autoRollbackOnBuildError, fullAccess: patch.fullAccess ?? s.fullAccess } });
   };
   const check = async () => {
     setChecking(true);
@@ -473,6 +544,24 @@ function Settings() {
         <Button small label="Open as repository" icon="branch" disabled={!engine.online || !s.sourcesPath} onPress={() => void live.openPath(s.sourcesPath)} testID="agent-sources-open" />
         <Button small label="Open in editor" icon="edit" disabled={!engine.online || !s.sourcesPath} onPress={() => live.openInEditor(s.sourcesPath)} testID="agent-sources-editor" />
       </View>
+      {/* the interface is rebuilt after every version, the git engine is not: it is the copy compiled into the app */}
+      {engine.stale && (
+        <View style={{ flexDirection: 'row', marginTop: 10, padding: 8, borderWidth: 1, borderColor: t.warn + '55', backgroundColor: t.warn + '14' }} testID="agent-engine-stale">
+          <Icon name="warning" size={13} color={t.warn} />
+          <Txt size={FONT.xs} style={{ marginLeft: 8, flex: 1, lineHeight: 15 }}>
+            {live.ENGINE_REBUILD}
+          </Txt>
+        </View>
+      )}
+      <Txt label faint style={{ marginTop: 14 }}>
+        ── access
+      </Txt>
+      <View style={{ marginTop: 4 }}>
+        <Checkbox checked={s.fullAccess} onChange={(v) => persist({ fullAccess: v })} label="Full access: the agent runs any command without asking" testID="agent-full-access" />
+        <Txt size={FONT.xs} faint style={{ marginLeft: 24, marginTop: 2, lineHeight: 15 }}>
+          Tests, builds, installs, scripts: whatever the task needs, so it checks its own work instead of leaving commands for you. Off: git and the file tools only. The error window’s short explanation always only looks.
+        </Txt>
+      </View>
       <View style={{ marginTop: 10 }}>
         <Checkbox checked={s.askBeforeApply} onChange={(v) => persist({ askBeforeApply: v })} label="Plan only: do not let the agent edit files (review in chat first)" testID="agent-plan-only" />
         <Checkbox checked={s.autoRollbackOnBuildError} onChange={(v) => persist({ autoRollbackOnBuildError: v })} label="Roll back an interface change whose build fails" testID="agent-auto-rollback" />
@@ -484,8 +573,8 @@ function Settings() {
   );
 }
 
-function toServerAgent(s: { provider: any; model: string; cliPath: string; sourcesPath: string; askBeforeApply: boolean; autoRollbackOnBuildError: boolean }) {
-  return { provider: s.provider, model: s.model, cliPath: s.cliPath, sourcesPath: s.sourcesPath, askBeforeApply: s.askBeforeApply, autoRollbackOnBuildError: s.autoRollbackOnBuildError };
+function toServerAgent(s: { provider: any; model: string; cliPath: string; sourcesPath: string; askBeforeApply: boolean; autoRollbackOnBuildError: boolean; fullAccess: boolean }) {
+  return { provider: s.provider, model: s.model, cliPath: s.cliPath, sourcesPath: s.sourcesPath, askBeforeApply: s.askBeforeApply, autoRollbackOnBuildError: s.autoRollbackOnBuildError, fullAccess: s.fullAccess };
 }
 
 function Field({ label, children }: { label: string; children: React.ReactNode }) {
@@ -506,6 +595,10 @@ const styles = StyleSheet.create({
   tab: { paddingHorizontal: 12, height: 26, justifyContent: 'center', borderBottomWidth: 2, borderBottomColor: 'transparent' },
   msg: { borderLeftWidth: 2, paddingLeft: 8, paddingVertical: 4, marginBottom: 10 },
   composer: { borderTopWidth: 1, padding: 10 },
+  dropZone: { borderWidth: 2, borderStyle: 'dashed', alignItems: 'center', justifyContent: 'center', margin: 4 },
+  fileChip: { height: 56, justifyContent: 'center', paddingHorizontal: 8 },
+  attachXAt: { position: 'absolute', top: -6, right: -6, zIndex: 2 },
+  attachX: { width: 16, height: 16, borderWidth: 1, alignItems: 'center', justifyContent: 'center' },
   chip: { borderWidth: 1, paddingHorizontal: 6, height: 20, justifyContent: 'center', marginRight: 6 },
   logHead: { flexDirection: 'row', alignItems: 'center', padding: 10, borderBottomWidth: 1 },
 });
