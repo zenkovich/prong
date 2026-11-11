@@ -1591,6 +1591,16 @@ await check('Discard of thousands of files: 3 000 changed and 500 new go at once
   const listed = await page.getByTestId('discard-summary').innerText();
   expect(/^\d+ files · \d+ changed in assets\/d1\/$/.test(listed), 'the dialog counts them: ' + listed);
   expect((await page.getByTestId('discard-files').locator('[data-testid^="discard-file-assets/d1/"]').count()) > 0, 'files of the folder drawn');
+  // the window dragged bigger by its corner: the list of files takes the height it gained
+  {
+    const before = (await page.getByTestId('discard-files').boundingBox()).height;
+    const g = await page.locator('[data-testid="discard-dialog"] [data-testid="resize-grip"]').boundingBox();
+    await page.mouse.move(g.x + g.width / 2, g.y + g.height / 2);
+    await page.mouse.down();
+    await page.mouse.move(g.x + 40, g.y + 200, { steps: 6 });
+    await page.mouse.up();
+    await until(async () => (await page.getByTestId('discard-files').boundingBox()).height > before + 100, `the list grew with the window: ${before} → ${(await page.getByTestId('discard-files').boundingBox()).height}`, 3000);
+  }
   await page.getByTestId('confirm-ok').click();
   await until(() => !git(MANY, 'status', '--porcelain').includes('assets/d1/'), 'the folder discarded', 30000);
   expect(git(MANY, 'status', '--porcelain').includes('assets/d2/'), 'the others stay');

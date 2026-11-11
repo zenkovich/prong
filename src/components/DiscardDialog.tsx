@@ -42,11 +42,53 @@ export function DiscardDialog({ title, note, confirmLabel, paths, what, onConfir
   onConfirm: (opts: { staged: boolean }) => void;
 }) {
   const t = useTheme();
+  const [staged, setStaged] = useState(true);
+
+  const go = () => {
+    closeDialog();
+    onConfirm({ staged });
+  };
+  // Enter answers with the dialog's button, as every confirmation does (Escape cancels: the Modal's)
+  useKeyboard((e) => {
+    if (e.key === 'Enter' && !e.meta && !e.shift && !e.consumed) {
+      e.preventDefault();
+      e.consume();
+      go();
+    }
+  });
+  return (
+    <Modal
+      title={title}
+      width={560}
+      fill
+      icon={<Icon name="warning" size={16} color={t.warn} />}
+      testID="discard-dialog"
+      footer={
+        <>
+          <Button label="Cancel" onPress={closeDialog} testID="confirm-cancel" />
+          <Button label={confirmLabel ?? 'Discard'} danger style={{ marginLeft: 8 }} onPress={go} testID="confirm-ok" />
+        </>
+      }
+    >
+      {/* the body is its own component: only inside the Modal does it see whether the window was dragged bigger */}
+      <DiscardBody note={note} paths={paths} what={what} staged={staged} onStaged={setStaged} />
+    </Modal>
+  );
+}
+
+/** what the discard drops, filling the window: the files (list or tree) and a block per submodule */
+function DiscardBody({ note, paths, what, staged, onStaged }: {
+  note: string;
+  paths: string[];
+  what?: string;
+  staged: boolean;
+  onStaged: (v: boolean) => void;
+}) {
+  const t = useTheme();
   const repo = useRepo();
   const resized = useModalResized();
   const [view, setView] = useState<'list' | 'tree'>(repo.fileView);
   const [collapsed, setCollapsed] = useState<Record<string, boolean>>({});
-  const [staged, setStaged] = useState(true);
   const files = useMemo(() => {
     const by = new Map(repo.unstaged.map((f) => [f.path, f]));
     return paths.map((p) => by.get(p) ?? by.get(p.replace(/\/+$/, '')) ?? missing(p));
@@ -87,32 +129,7 @@ export function DiscardDialog({ title, note, confirmLabel, paths, what, onConfir
   const count = rows ? rows.length : plain.length;
   const win = useVirtualWindow(count, ROW, { overscan: 20 });
 
-  const go = () => {
-    closeDialog();
-    onConfirm({ staged });
-  };
-  // Enter answers with the dialog's button, as every confirmation does (Escape cancels: the Modal's)
-  useKeyboard((e) => {
-    if (e.key === 'Enter' && !e.meta && !e.shift && !e.consumed) {
-      e.preventDefault();
-      e.consume();
-      go();
-    }
-  });
   return (
-    <Modal
-      title={title}
-      width={560}
-      fill
-      icon={<Icon name="warning" size={16} color={t.warn} />}
-      testID="discard-dialog"
-      footer={
-        <>
-          <Button label="Cancel" onPress={closeDialog} testID="confirm-cancel" />
-          <Button label={confirmLabel ?? 'Discard'} danger style={{ marginLeft: 8 }} onPress={go} testID="confirm-ok" />
-        </>
-      }
-    >
       <View style={{ flex: resized ? 1 : undefined, flexShrink: 1, minHeight: 0 }}>
         <Txt muted testID="confirm-message">
           {note}
@@ -182,14 +199,13 @@ export function DiscardDialog({ title, note, confirmLabel, paths, what, onConfir
         )}
         {stagedInside > 0 && (
           <View style={{ marginTop: 8 }}>
-            <Checkbox checked={staged} onChange={setStaged} label={`Discard what is staged inside too (${plural(stagedInside, 'file')})`} testID="discard-staged" />
+            <Checkbox checked={staged} onChange={onStaged} label={`Discard what is staged inside too (${plural(stagedInside, 'file')})`} testID="discard-staged" />
             <Txt size={FONT.xs} faint style={{ marginLeft: 23 }}>
               {staged ? 'The submodule goes back to its commit, index and all (Undo puts both back).' : 'git keeps the staged version: those files stay as they are staged in the submodule.'}
             </Txt>
           </View>
         )}
       </View>
-    </Modal>
   );
 }
 
