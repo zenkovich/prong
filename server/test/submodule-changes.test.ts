@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
@@ -58,10 +58,10 @@ describe('submodule changes', () => {
   it('reads each submodule: edited, new and staged files counted and named; the quiet ones and the clean one left out', async () => {
     const list = await new Repo(sup).submoduleChanges(0);
     expect(list).toEqual([
-      { path: 'libs/edited', modified: 1, untracked: 0, files: [{ path: 'core.txt', status: 'M' }] },
-      { path: 'libs/fresh', modified: 0, untracked: 1, files: [{ path: 'new.txt', status: '?' }] },
-      { path: 'libs/moved', modified: 1, untracked: 0, files: [{ path: 'core.txt', status: 'M' }] },
-      { path: 'libs/staged', modified: 1, untracked: 0, files: [{ path: 'added.txt', status: 'A' }] },
+      { path: 'libs/edited', modified: 1, untracked: 0, staged: 0, files: [{ path: 'core.txt', status: 'M' }] },
+      { path: 'libs/fresh', modified: 0, untracked: 1, staged: 0, files: [{ path: 'new.txt', status: '?' }] },
+      { path: 'libs/moved', modified: 1, untracked: 0, staged: 0, files: [{ path: 'core.txt', status: 'M' }] },
+      { path: 'libs/staged', modified: 1, untracked: 0, staged: 1, files: [{ path: 'added.txt', status: 'A', staged: true }] },
     ]);
   });
 
@@ -113,6 +113,26 @@ describe('submodule changes', () => {
 
   it('a project with no submodules reads nothing', async () => {
     expect(await new Repo(origin).submoduleChanges(0)).toEqual([]);
+  });
+
+  it('a removed submodule’s folder is deleted by a discard; a checkout of its own is still left alone', async () => {
+    const other = superWith('super-gone', ['libs/gone']);
+    execFileSync('git', ['clone', '-q', origin, path.join(other, 'vendor')]);
+    // the submodule is dropped from the project: its folder stays behind, a `.git` file pointing into .git/modules
+    git(other, 'rm', '--cached', '-q', 'libs/gone');
+    git(other, 'config', '-f', '.gitmodules', '--remove-section', 'submodule.libs/gone');
+    git(other, 'commit', '-qam', 'Drop the submodule');
+    const r = new Repo(other);
+    const paths = (await r.status()).unstaged.map((f) => f.path);
+    expect(paths).toContain('libs/gone/');
+    expect(paths).toContain('vendor/');
+    const plan = await r.discardPlan(['libs/gone/', 'vendor/']);
+    expect(plan.remove).toEqual(['libs/gone/']);
+    expect(plan.nested).toEqual(['vendor/']);
+    const { kept } = await r.discard(['libs/gone/', 'vendor/']);
+    expect(kept).toEqual(['vendor/']);
+    expect(existsSync(path.join(other, 'libs/gone'))).toBe(false);
+    expect(existsSync(path.join(other, 'vendor/.git'))).toBe(true);
   });
 
   it('a submodule not checked out has nothing of its own', async () => {

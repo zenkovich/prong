@@ -52,13 +52,15 @@ function prune() {
   }
 }
 
-/** every file under a folder of the working tree, skipping nested repositories' .git */
+/** every file under a folder of the working tree, skipping nested repositories' .git folder */
 function walk(abs: string, rel: string, out: string[]) {
   for (const name of readdirSync(abs)) {
-    if (name === '.git') continue;
     const a = path.join(abs, name);
     const r = rel ? `${rel}/${name}` : name;
     const st = lstatSync(a);
+    // a whole history is not copied; a `.git` file (a submodule's pointer to it) is a few bytes and brings the
+    // folder back as it was
+    if (name === '.git' && !st.isFile()) continue;
     if (st.isDirectory()) walk(a, r, out);
     else out.push(r);
   }

@@ -5,7 +5,7 @@ import * as live from '../state/live';
 import { closeDialog, useRepo } from '../state/store';
 import { FONT, useTheme } from '../theme';
 import { Icon } from '../ui/Icon';
-import { Modal } from '../ui/overlays';
+import { Modal, useModalResized } from '../ui/overlays';
 import { Button, Checkbox, Chevron, Row, Segmented, Txt, useKeyboard } from '../ui/primitives';
 import { FileIcon, FolderIcon } from '../ui/FileIcon';
 import { rowTop, useVirtualWindow } from '../ui/virtual';
@@ -30,7 +30,8 @@ const movesBack = (f: FileChange) => !f.inside?.only && !!f.submodule && f.submo
 /**
  * Discard asking first: what it drops, file by file, as the list or the tree of the Changes panel (the same icons,
  * status letters and folders), and a block per submodule saying what happens inside it — with the tick that drops
- * what is staged in it as well (on by default; without it git keeps the staged version).
+ * what is staged in it as well (on by default; without it git keeps the staged version). Dragged bigger by its
+ * corner, the list of files takes every pixel the window gained.
  */
 export function DiscardDialog({ title, note, confirmLabel, paths, what, onConfirm }: {
   title: string;
@@ -42,6 +43,7 @@ export function DiscardDialog({ title, note, confirmLabel, paths, what, onConfir
 }) {
   const t = useTheme();
   const repo = useRepo();
+  const resized = useModalResized();
   const [view, setView] = useState<'list' | 'tree'>(repo.fileView);
   const [collapsed, setCollapsed] = useState<Record<string, boolean>>({});
   const [staged, setStaged] = useState(true);
@@ -101,6 +103,7 @@ export function DiscardDialog({ title, note, confirmLabel, paths, what, onConfir
     <Modal
       title={title}
       width={560}
+      fill
       icon={<Icon name="warning" size={16} color={t.warn} />}
       testID="discard-dialog"
       footer={
@@ -110,72 +113,82 @@ export function DiscardDialog({ title, note, confirmLabel, paths, what, onConfir
         </>
       }
     >
-      <Txt muted testID="confirm-message">
-        {note}
-      </Txt>
-      {/* one file and nothing else: the line above already names it, so the list of one row is left out */}
-      {plain.length > (subs.length ? 0 : 1) && (
-        <>
-          <View style={{ flexDirection: 'row', alignItems: 'center', marginTop: 10 }}>
-            <Txt size={FONT.sm} style={{ flex: 1 }} numberOfLines={1} testID="discard-summary">
-              {plural(plain.length, 'file')}
-              {counts ? ` · ${counts}` : ''}
-              {what ? ` in ${what}` : ''}
-            </Txt>
-            <Segmented value={view} onChange={setView} options={[{ value: 'list', icon: 'list' }, { value: 'tree', icon: 'tree' }]} />
-          </View>
-          <ScrollView
-            style={{ maxHeight: 260, marginTop: 4, borderWidth: 1, borderColor: t.border, backgroundColor: t.bg }}
-            onScroll={win.onScroll}
-            onLayout={win.onLayout}
-            scrollEventThrottle={16}
-            testID="discard-files"
-          >
-            <View style={{ height: count * ROW }}>
-              {rows
-                ? rows.slice(win.first, win.last).map((r, k) => (
-                    <View key={rowKey(r)} style={rowTop(win.first + k, ROW)}>
-                      {r.node.file ? (
-                        <FileLine file={r.node.file} indent={r.depth * 14} nameOnly />
-                      ) : (
-                        <Row
-                          height={ROW}
-                          indent={r.depth * 14}
-                          onPress={() => setCollapsed((c) => ({ ...c, [`tree:discard:${r.node.path}`]: r.open }))}
-                          testID={`discard-folder-${r.node.path}`}
-                        >
-                          <Chevron open={r.open} color={t.textMuted} />
-                          <FolderIcon name={r.node.name} open={r.open} />
-                          <Txt size={FONT.sm} muted style={{ marginLeft: 5, flex: 1 }} numberOfLines={1}>
-                            {r.node.name}
-                          </Txt>
-                          <Txt size={FONT.xs} mono faint>
-                            {under.get(r.node.path) ?? 0}
-                          </Txt>
-                        </Row>
-                      )}
-                    </View>
-                  ))
-                : plain.slice(win.first, win.last).map((f, k) => (
-                    <View key={f.path} style={rowTop(win.first + k, ROW)}>
-                      <FileLine file={f} />
-                    </View>
-                  ))}
+      <View style={{ flex: resized ? 1 : undefined, flexShrink: 1, minHeight: 0 }}>
+        <Txt muted testID="confirm-message">
+          {note}
+        </Txt>
+        {/* one file and nothing else: the line above already names it, so the list of one row is left out */}
+        {plain.length > (subs.length ? 0 : 1) && (
+          <>
+            <View style={{ flexDirection: 'row', alignItems: 'center', marginTop: 10 }}>
+              <Txt size={FONT.sm} style={{ flex: 1 }} numberOfLines={1} testID="discard-summary">
+                {plural(plain.length, 'file')}
+                {counts ? ` · ${counts}` : ''}
+                {what ? ` in ${what}` : ''}
+              </Txt>
+              <Segmented value={view} onChange={setView} options={[{ value: 'list', icon: 'list' }, { value: 'tree', icon: 'tree' }]} />
             </View>
+            <ScrollView
+              style={[
+                { marginTop: 4, borderWidth: 1, borderColor: t.border, backgroundColor: t.bg },
+                // the window dragged bigger: the list fills what the blocks below it leave, instead of staying 260 tall
+                resized ? { flex: 1, minHeight: 60 } : { maxHeight: 260 },
+              ]}
+              onScroll={win.onScroll}
+              onLayout={win.onLayout}
+              scrollEventThrottle={16}
+              testID="discard-files"
+            >
+              <View style={{ height: count * ROW }}>
+                {rows
+                  ? rows.slice(win.first, win.last).map((r, k) => (
+                      <View key={rowKey(r)} style={rowTop(win.first + k, ROW)}>
+                        {r.node.file ? (
+                          <FileLine file={r.node.file} indent={r.depth * 14} nameOnly />
+                        ) : (
+                          <Row
+                            height={ROW}
+                            indent={r.depth * 14}
+                            onPress={() => setCollapsed((c) => ({ ...c, [`tree:discard:${r.node.path}`]: r.open }))}
+                            testID={`discard-folder-${r.node.path}`}
+                          >
+                            <Chevron open={r.open} color={t.textMuted} />
+                            <FolderIcon name={r.node.name} open={r.open} />
+                            <Txt size={FONT.sm} muted style={{ marginLeft: 5, flex: 1 }} numberOfLines={1}>
+                              {r.node.name}
+                            </Txt>
+                            <Txt size={FONT.xs} mono faint>
+                              {under.get(r.node.path) ?? 0}
+                            </Txt>
+                          </Row>
+                        )}
+                      </View>
+                    ))
+                  : plain.slice(win.first, win.last).map((f, k) => (
+                      <View key={f.path} style={rowTop(win.first + k, ROW)}>
+                        <FileLine file={f} />
+                      </View>
+                    ))}
+              </View>
+            </ScrollView>
+          </>
+        )}
+        {subs.length > 0 && (
+          <ScrollView style={{ flexShrink: 1 }} contentContainerStyle={{ flexGrow: 0 }}>
+            {subs.map((f) => (
+              <SubmoduleBlock key={f.path} file={f} staged={staged} />
+            ))}
           </ScrollView>
-        </>
-      )}
-      {subs.map((f) => (
-        <SubmoduleBlock key={f.path} file={f} staged={staged} />
-      ))}
-      {stagedInside > 0 && (
-        <View style={{ marginTop: 8 }}>
-          <Checkbox checked={staged} onChange={setStaged} label={`Discard what is staged inside too (${plural(stagedInside, 'file')})`} testID="discard-staged" />
-          <Txt size={FONT.xs} faint style={{ marginLeft: 23 }}>
-            {staged ? 'The submodule goes back to its commit, index and all (Undo puts both back).' : 'git keeps the staged version: those files stay as they are staged in the submodule.'}
-          </Txt>
-        </View>
-      )}
+        )}
+        {stagedInside > 0 && (
+          <View style={{ marginTop: 8 }}>
+            <Checkbox checked={staged} onChange={setStaged} label={`Discard what is staged inside too (${plural(stagedInside, 'file')})`} testID="discard-staged" />
+            <Txt size={FONT.xs} faint style={{ marginLeft: 23 }}>
+              {staged ? 'The submodule goes back to its commit, index and all (Undo puts both back).' : 'git keeps the staged version: those files stay as they are staged in the submodule.'}
+            </Txt>
+          </View>
+        )}
+      </View>
     </Modal>
   );
 }

@@ -1289,10 +1289,35 @@ export class Repo {
       if (xy[1] === 'D' || (staged && !existsSync(path.join(this.dir, rel)))) plan.absent.push(rel);
     }
     // a repository of its own inside (git lists it as "dir/"): its history is not a change to drop, and the copy for
-    // Undo cannot hold its .git — left alone, as `git clean` leaves it
-    for (const u of new Set(untracked)) (existsSync(path.join(this.dir, u.replace(/\/+$/, ''), '.git')) ? plan.nested : plan.remove).push(u);
+    // Undo cannot hold its .git — left alone, as `git clean` leaves it. What a removed submodule left behind is not
+    // one of those: it is simply deleted (gitDirOf)
+    for (const u of new Set(untracked)) (this.isLooseRepo(u) ? plan.nested : plan.remove).push(u);
     if (picked) plan.submodules = await this.submodulePlans([...picked].map((p) => p.replace(/\/+$/, '')), !!opts.subStaged);
     return plan;
+  }
+  /**
+   * An untracked folder git lists as one ("dir/") holding a repository of its own, which a discard leaves alone —
+   * unless it is what a submodule removed from here left behind: its `.git` is a file naming a folder under this
+   * repository's own `.git/modules`, its history lives there and not in the folder, so a discard simply deletes it
+   * (git used to leave such leftovers for ever, change after change).
+   */
+  private isLooseRepo(rel: string): boolean {
+    const dir = path.join(this.dir, rel.replace(/\/+$/, ''));
+    const git = path.join(dir, '.git');
+    let st;
+    try {
+      st = statSync(git);
+    } catch {
+      return false; // no .git: an ordinary new folder
+    }
+    if (st.isDirectory()) return true;
+    if (!st.isFile()) return false;
+    const m = readFileSync(git, 'utf8').match(/^gitdir:\s*(.+)$/m);
+    if (!m) return true;
+    const target = path.resolve(dir, m[1].trim());
+    const modules = path.join(this.gitDirPath(), 'modules') + path.sep;
+    // a worktree or a clone pointing elsewhere keeps its own history: left alone
+    return !target.startsWith(modules);
   }
   /**
    * The submodules among `paths`: one whose commit is not the one recorded here goes back to it (as `git submodule
