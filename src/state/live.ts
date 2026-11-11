@@ -1210,6 +1210,8 @@ export function followAllBranches(remote?: string) {
 /**
  * Pull into the current branch: its upstream, or the branch of the remote the dialog picked; merge, rebase or
  * fast-forward only (the Preferences' pull mode unless given); local changes stashed around it when asked.
+ * It fetches the remote as it goes — the branch list and the commits of its other branches come up to date with the
+ * pull, pruning what the server dropped (the Fetch dialog's setting), so no separate fetch is needed afterwards.
  */
 export function pull(opts: PullOptions | 'merge' | 'rebase' | 'ff' = {}) {
   closeDialog();
@@ -1226,7 +1228,7 @@ export function pull(opts: PullOptions | 'merge' | 'rebase' | 'ff' = {}) {
   if (!from) return toast(`${cur.name} tracks no remote branch`, 'info', 'Pick the branch to pull in the Pull dialog, or set an upstream.');
   const before = headState(id);
   void guard('Pull', async () =>
-    track(await client.pull(pathOf(id), strategy, { remote: o.remote, branch: o.remote ? o.branch : undefined, autostash }), `Pulling ${from} into ${cur.name} (${strategy === 'ff' ? 'fast-forward' : strategy})`, async (ok) => {
+    track(await client.pull(pathOf(id), strategy, { remote: o.remote, branch: o.remote ? o.branch : undefined, autostash, prune: o.prune ?? s.syncPrefs.fetchPrune }), `Pulling ${from} into ${cur.name} (${strategy === 'ff' ? 'fast-forward' : strategy})`, async (ok) => {
       if (!ok) return;
       const after = headState(id);
       const u = moveBack(`Pull ${from}`)({ before, after });

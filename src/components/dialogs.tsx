@@ -693,6 +693,7 @@ function PullDialog() {
                 {autostash ? `${plural(changes, 'local change')} go to the stash and come back after the pull` : `${plural(changes, 'local change')}: git stops if the pulled commits touch the same files`}
               </Note>
             )}
+            <Note>{`${remote} is fetched along the way${prefs.fetchPrune ? ', branches gone from it dropped' : ''}: its other branches and their commits come up to date too`}</Note>
           </>
         )}
       </View>

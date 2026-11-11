@@ -79,6 +79,11 @@ export interface PullOptions {
   branch?: string;
   /** local changes go to the stash before and come back after (--autostash) */
   autostash?: boolean;
+  /**
+   * the pull refreshes the remote's branches too (it always does) and drops the ones gone from the server
+   * (`fetch.prune`); the Fetch dialog's pruning setting unless given
+   */
+  prune?: boolean;
 }
 export interface PushOptions {
   remote?: string;

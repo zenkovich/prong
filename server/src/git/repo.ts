@@ -1605,11 +1605,22 @@ export class Repo {
   /**
    * Into the current branch: its upstream, or `branch` of `remote` (as Fork's Pull picks them). `autostash`: local
    * changes are stashed before and put back after (`--autostash`); `tags`: every tag of the remote too.
+   *
+   * A pull also brings the remote itself up to date, so the branch list and the history show what the server has now
+   * and not only the branch that was merged. The pull's own fetch does it, with `fetch.prune` so the branches the
+   * remote deleted go (`prune`, as the Fetch dialog's pruning); a pull of one named branch is the only one git
+   * narrows to a single ref, so that one fetches the remote's branches first. Nothing beyond that is asked for: that
+   * one remote, no tags unless wanted, the history as shallow as it is.
    */
-  async pull(strategy: 'merge' | 'rebase' | 'ff' = 'merge', onProgress?: Progress, opts: { remote?: string; branch?: string; autostash?: boolean; tags?: boolean } = {}) {
+  async pull(strategy: 'merge' | 'rebase' | 'ff' = 'merge', onProgress?: Progress, opts: { remote?: string; branch?: string; autostash?: boolean; tags?: boolean; prune?: boolean } = {}) {
     const flag = strategy === 'rebase' ? '--rebase' : strategy === 'ff' ? '--ff-only' : '--no-rebase';
-    const args = ['pull', '--progress', flag, ...(opts.autostash ? ['--autostash'] : []), ...(opts.tags ? ['--tags'] : []), ...(opts.remote ? [opts.remote, ...(opts.branch ? [opts.branch] : [])] : [])];
-    await this.withoutGoneBranches(() => this.net(args, { onLine: (l) => onProgress?.(l, progressOf(l)) }), onProgress);
+    const prune = opts.prune !== false;
+    const line = (l: string) => onProgress?.(l, progressOf(l));
+    const args = ['-c', `fetch.prune=${prune}`, 'pull', '--progress', flag, ...(opts.autostash ? ['--autostash'] : []), ...(opts.tags ? ['--tags'] : []), ...(opts.remote ? [opts.remote, ...(opts.branch ? [opts.branch] : [])] : [])];
+    await this.withoutGoneBranches(async () => {
+      if (opts.remote && opts.branch) await this.net(['fetch', '--progress', ...(prune ? ['--prune'] : []), ...(opts.tags ? ['--tags'] : []), opts.remote], { onLine: line });
+      await this.net(args, { onLine: line });
+    }, onProgress);
   }
   /**
    * Completes a shallow clone: `git fetch --unshallow` brings the history `clone --depth` left out, so blame,

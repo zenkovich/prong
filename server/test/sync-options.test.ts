@@ -79,6 +79,37 @@ describe('fetch, pull and push options', () => {
     expect(git(work, 'stash', 'list')).toBe('');
   });
 
+  it('pull: the remote comes along — its new branches arrive, the ones it dropped go (prune off: they stay)', async () => {
+    const repo = new Repo(work);
+    const seen = (b: string) => git(work, 'for-each-ref', '--format=%(refname:short)', `refs/remotes/origin/${b}`);
+    git(seed, 'push', '-q', 'origin', 'main:doomed', 'main:doomed2', 'main:kept');
+    await repo.fetch('origin', true);
+    expect([seen('doomed'), seen('doomed2'), seen('kept')]).toEqual(['origin/doomed', 'origin/doomed2', 'origin/kept']);
+    // a branch born on the server after that fetch, and one deleted there
+    git(seed, 'switch', '-q', '-c', 'late');
+    commit(seed, 'late.txt', 'l\n', 'late work');
+    git(seed, 'push', '-q', 'origin', 'late');
+    git(seed, 'switch', '-q', 'main');
+    git(origin, 'update-ref', '-d', 'refs/heads/doomed');
+    // the dialog's pull names one branch, so git would fetch that ref alone: the remote is fetched first
+    await repo.pull('ff', undefined, { remote: 'origin', branch: 'feature' });
+    expect(seen('late')).toBe('origin/late');
+    expect(git(work, 'log', '-1', '--format=%s', 'refs/remotes/origin/late')).toBe('late work');
+    expect(seen('doomed')).toBe('');
+    // the quick pull (the upstream) brings them through its own fetch, pruning as it goes
+    git(seed, 'push', '-q', 'origin', 'main:later');
+    git(origin, 'update-ref', '-d', 'refs/heads/doomed2');
+    await repo.pull('ff');
+    expect(seen('later')).toBe('origin/later');
+    expect(seen('doomed2')).toBe('');
+    // pruning off (the Fetch dialog's setting): the branches still arrive, the gone one stays
+    git(seed, 'push', '-q', 'origin', 'main:latest');
+    git(origin, 'update-ref', '-d', 'refs/heads/kept');
+    await repo.pull('ff', undefined, { prune: false });
+    expect(seen('latest')).toBe('origin/latest');
+    expect(seen('kept')).toBe('origin/kept');
+  });
+
   it('push: any local branch, under another name on the remote, tracking it', async () => {
     const repo = new Repo(work);
     git(work, 'branch', 'not-current', 'HEAD~1');

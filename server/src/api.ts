@@ -609,7 +609,7 @@ export function createApi(opts: { log?: (s: string) => void } = {}) {
       const strategy = b.strategy === 'rebase' || b.strategy === 'ff' ? b.strategy : 'merge';
       const remote = b.remote ? remoteName(b.remote) : undefined;
       const branch = remote && b.branch ? refNames([b.branch])[0] : undefined;
-      return longOp(`Pulling${branch ? ` ${remote}/${branch}` : ''} (${strategy})`, (p) => r.withRollback(() => r.pull(strategy, p, { remote, branch, autostash: !!b.autostash, tags: !!b.tags })), r.dir);
+      return longOp(`Pulling${branch ? ` ${remote}/${branch}` : ''} (${strategy})`, (p) => r.withRollback(() => r.pull(strategy, p, { remote, branch, autostash: !!b.autostash, tags: !!b.tags, prune: b.prune !== false })), r.dir);
     },
     push: async (b) => {
       const r = repoOf(b);

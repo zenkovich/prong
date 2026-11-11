@@ -1393,7 +1393,8 @@ export function pull(opts: PullOptions | 'merge' | 'rebase' | 'ff' = {}) {
   closeDialog();
   const r = activeRepo();
   const b = r ? currentBranch(r) : null;
-  runOperation(`Pulling ${b?.name ?? ''} (${strategy})`, 1200, ['From github.com:zenkovich/prong', 'Already up to date.'], () => {
+  // the pull fetches the remote as it goes (see live.pull): its branches come along, not only the pulled one
+  runOperation(`Pulling ${b?.name ?? ''} (${strategy})`, 1200, ['From github.com:zenkovich/prong', ' * [new branch]      feature/blame -> origin/feature/blame', '   a1f3c2d..9be41ac  main       -> origin/main', 'Already up to date.'], () => {
     if (b && (b.behind ?? 0) > 0) {
       updateRepo((rr) => ({ refs: rr.refs.map((x) => (x === b ? { ...x, behind: 0 } : x)) }));
       toast(`Pulled ${b.name}`, 'success', `${strategy}: ${b.behind} commit(s)`);
