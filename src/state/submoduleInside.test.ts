@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { client, discardFiles, fillAmendMessage, refresh, revealCommit, stageAll, stageFile, stageFiles } from './live';
+import { client, discardFiles, fillAmendMessage, refresh, revealCommit, stageAll, stageFile, stageFiles, submoduleDiscardText } from './live';
 import { EMPTY_REPO, getState, setState, toggleAmend } from './store';
 import type { FileChange } from '../git/types';
 
@@ -52,20 +52,25 @@ describe('submodules listed for their own files', () => {
     expect(getState().toasts.at(-1)).toMatchObject({ text: 'Nothing to stage in 2 submodules' });
   });
 
-  it('Discard asks first, naming what goes inside the submodule, then discards it; a group names its submodules; Stage all with only them says so', async () => {
+  it('Discard asks first, naming what goes inside the submodule, then discards it; a group lists it too; Stage all with only them says so', async () => {
     open([insideOnly('libs/core'), file('a.txt')]);
     const discard = vi.spyOn(client, 'discard').mockResolvedValue({ undo: null, kept: [] } as any);
     discardFiles(['libs/core']);
     expect(discard).not.toHaveBeenCalled();
     const d = getState().dialog as any;
-    expect(d).toMatchObject({ type: 'confirm', title: 'Discard the changes inside libs/core?', confirmLabel: 'Discard' });
-    expect(d.message).toContain('libs/core is at the commit recorded here: the changes in its own files are dropped (1 changed).');
-    expect(d.message).toContain('core.txt');
-    d.onConfirm();
-    await vi.waitFor(() => expect(discard).toHaveBeenCalledWith('/w/proj', ['libs/core']));
-    // with other files: the confirmation has a part for the submodule
+    // the dialog lists the paths and says what happens inside the submodule (its block, from submoduleDiscardText)
+    expect(d).toMatchObject({ type: 'discard', title: 'Discard the changes inside libs/core?', confirmLabel: 'Discard', paths: ['libs/core'] });
+    expect(submoduleDiscardText('libs/core')).toBe('libs/core is at the commit recorded here: the changes in its own files are dropped (1 changed).');
+    // the tick (on by default) goes to the engine: what is staged inside the submodule goes too
+    d.onConfirm({ staged: true });
+    await vi.waitFor(() => expect(discard).toHaveBeenCalledWith('/w/proj', ['libs/core'], { staged: true }));
+    // unticked: the staged changes inside stay
+    discardFiles(['libs/core']);
+    (getState().dialog as any).onConfirm({ staged: false });
+    await vi.waitFor(() => expect(discard).toHaveBeenCalledWith('/w/proj', ['libs/core'], { staged: false }));
+    // with other files: the submodule is among the paths, with its own block
     discardFiles(['libs/core', 'a.txt']);
-    expect((getState().dialog as any).message).toMatch(/Submodules:\nlibs\/core is at the commit recorded here/);
+    expect(getState().dialog).toMatchObject({ type: 'discard', title: 'Discard 2 files?', paths: ['libs/core', 'a.txt'] });
     setState({ dialog: null });
     open([insideOnly('libs/core')]);
     const all = vi.spyOn(client, 'stageAll');
@@ -77,9 +82,8 @@ describe('submodules listed for their own files', () => {
   it('a submodule at another commit than recorded: Discard moves it back, after saying so', () => {
     open([file('libs/core', { kind: 'submodule', submodule: { before: 'a'.repeat(40), after: 'b'.repeat(40) } })]);
     discardFiles(['libs/core']);
-    const d = getState().dialog as any;
-    expect(d).toMatchObject({ title: 'Move libs/core back?', confirmLabel: 'Move back' });
-    expect(d.message).toContain(`libs/core goes back to aaaaaaa, the commit recorded here (it is at bbbbbbb)`);
+    expect(getState().dialog).toMatchObject({ type: 'discard', title: 'Move libs/core back?', confirmLabel: 'Move back' });
+    expect(submoduleDiscardText('libs/core')).toContain('libs/core goes back to aaaaaaa, the commit recorded here (it is at bbbbbbb)');
   });
 });
 

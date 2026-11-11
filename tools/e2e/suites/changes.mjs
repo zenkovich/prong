@@ -238,6 +238,16 @@ const SUBS = repo('chg-subs', { 'app.txt': 'app\n' }, (d) => {
   write(d, 'libs/edited/core.txt', 'core\nedited inside\n');
   write(d, 'libs/fresh/new.txt', 'new\n');
 });
+// a submodule with a staged change of its own beside an untracked file: Discard's tick decides whether the staged
+// one goes too
+const SUBSTAGED = repo('chg-substaged', { 'app.txt': 'app\n' }, (d) => {
+  git(d, '-c', 'protocol.file.allow=always', 'submodule', 'add', '-q', SUBS_ORIGIN, 'libs/core');
+  git(d, 'commit', '-q', '-m', 'Add submodule');
+  const sub = path.join(d, 'libs/core');
+  write(sub, 'core.txt', 'core\nstaged inside\n');
+  git(sub, 'add', 'core.txt');
+  write(sub, 'free.txt', 'free\n');
+});
 
 /**
  * Git LFS: a picture, two sounds and a sound bank pushed to a local remote with their LFS objects, and a clone made
@@ -1510,9 +1520,11 @@ await check('Discard of a submodule at the recorded commit drops the changes ins
   await row('unstaged', 'libs/edited').hover();
   await page.getByTestId('file-discard-libs/edited').click();
   await page.getByText('Discard the changes inside libs/edited?', { exact: true }).waitFor({ timeout: 5000 });
-  // what goes, by name
+  // what goes, by name: the submodule's block and its own files as rows
   await waitText('is at the commit recorded here: the changes in its own files are dropped (1 changed)');
-  expect(/dropped \(1 changed\)\.\s+core\.txt/.test(await page.evaluate(() => document.body.innerText)), 'the file named');
+  await page.getByTestId('discard-inside-libs/edited/core.txt').waitFor({ timeout: 5000 });
+  // nothing is staged inside it: no tick to offer
+  expect((await page.getByTestId('discard-staged').count()) === 0, 'no tick without staged changes inside');
   await page.getByTestId('confirm-ok').click();
   await until(() => git(path.join(SUBS, 'libs/edited'), 'status', '--porcelain').trim() === '', 'clean inside');
   await page.waitForFunction(() => !document.querySelector('[data-testid="file-unstaged-libs/edited"]'), null, { timeout: 8000 });
@@ -1521,6 +1533,36 @@ await check('Discard of a submodule at the recorded commit drops the changes ins
   await page.getByTestId('undo-button').click();
   await until(() => read(path.join(SUBS, 'libs/edited'), 'core.txt') === 'core\nedited inside\n', 'the change is back');
   await row('unstaged', 'libs/edited').waitFor({ timeout: 8000 });
+});
+
+await check("Discard of a submodule: the tick drops what is staged inside it as well (on by default); unticked, the staged change stays", async () => {
+  const sub = path.join(SUBSTAGED, 'libs/core');
+  await openChanges('chg-substaged', 'file-unstaged-libs/core');
+  await setView('list');
+  await row('unstaged', 'libs/core').hover();
+  await page.getByTestId('file-discard-libs/core').click();
+  await page.getByText('Discard the changes inside libs/core?', { exact: true }).waitFor({ timeout: 5000 });
+  // its own files as rows, the staged one marked; the tick is there because something is staged inside
+  const line = await page.getByTestId('discard-inside-libs/core/core.txt').innerText();
+  expect(/staged/.test(line), 'the staged file is marked: ' + line);
+  await page.getByTestId('discard-staged').waitFor({ timeout: 5000 });
+  // unticked: the untracked file goes, the staged change stays staged
+  await page.getByTestId('discard-staged').click();
+  await page.getByTestId('confirm-ok').click();
+  await until(() => git(sub, 'status', '--porcelain').trim() === 'M  core.txt', 'the staged change stays: ' + git(sub, 'status', '--porcelain').trim());
+  expect(!existsSync(path.join(sub, 'free.txt')), 'the untracked file went');
+  // again, with the tick as it comes: index and files back to the recorded commit; Undo brings the staged one back
+  await refreshUi();
+  await row('unstaged', 'libs/core').hover();
+  await page.getByTestId('file-discard-libs/core').click();
+  await page.getByTestId('discard-staged').waitFor({ timeout: 5000 });
+  await page.getByTestId('confirm-ok').click();
+  await until(() => git(sub, 'status', '--porcelain').trim() === '', 'clean inside, the index too');
+  expect(read(sub, 'core.txt') === 'core\n', 'its file as committed');
+  await until(async () => /Undo Discard core/.test(await undoLabel()), 'Undo offers it: ' + (await undoLabel()));
+  await page.getByTestId('undo-button').click();
+  await until(() => git(sub, 'status', '--porcelain').trim() === 'M  core.txt', 'back, and staged again');
+  expect(read(sub, 'core.txt') === 'core\nstaged inside\n', 'the change is back');
 });
 
 await check('Discard of thousands of files: 3 000 changed and 500 new go at once (one status, files put back by name, moved aside for Undo); Undo brings them back', async () => {
@@ -1544,6 +1586,11 @@ await check('Discard of thousands of files: 3 000 changed and 500 new go at once
   await page.getByTestId('folder-unstaged-assets/d1').waitFor({ timeout: 10000 });
   await page.getByTestId('folder-unstaged-assets/d1').click({ button: 'right' });
   await page.getByText(/^Discard all \d+ files inside…$/).first().click();
+  // the dialog lists what goes: the count, and the files as a tree (only the rows on screen are drawn)
+  await page.getByTestId('discard-files').waitFor({ timeout: 10000 });
+  const listed = await page.getByTestId('discard-summary').innerText();
+  expect(/^\d+ files · \d+ changed in assets\/d1\/$/.test(listed), 'the dialog counts them: ' + listed);
+  expect((await page.getByTestId('discard-files').locator('[data-testid^="discard-file-assets/d1/"]').count()) > 0, 'files of the folder drawn');
   await page.getByTestId('confirm-ok').click();
   await until(() => !git(MANY, 'status', '--porcelain').includes('assets/d1/'), 'the folder discarded', 30000);
   expect(git(MANY, 'status', '--porcelain').includes('assets/d2/'), 'the others stay');

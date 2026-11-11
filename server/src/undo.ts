@@ -30,6 +30,8 @@ interface Manifest {
   absent: string[];
   /** submodules moved back to their recorded commit: where they were (a branch, else the commit) */
   heads?: { path: string; head: string; branch: string | null }[];
+  /** submodules whose staged changes went too: their index as a tree, put back with `read-tree` */
+  indexes?: { path: string; tree: string }[];
 }
 
 const undoRoot = () => path.join(STATE_DIR(), 'undo');
@@ -114,6 +116,24 @@ function lossOf(repo: Repo, plan: DiscardPlan) {
   }
   return { entries, absent, heads };
 }
+/**
+ * The index of every submodule whose staged changes go too (Discard's tick) kept as a tree object, so Undo puts the
+ * index back as it was (`read-tree`) and not only the files. A submodule whose index cannot be written (a conflict in
+ * it) is left out: its files still come back.
+ */
+async function indexesOf(repo: Repo, plan: DiscardPlan) {
+  const out: NonNullable<Manifest['indexes']> = [];
+  const root = path.resolve(repo.dir) + path.sep;
+  for (const sm of plan.submodules) {
+    if (!sm.inner?.reset) continue;
+    const cwd = path.join(repo.dir, sm.path);
+    if (!cwd.startsWith(root)) continue;
+    const r = await runGit(['write-tree'], { cwd, allowFail: true });
+    const tree = r.stdout.trim();
+    if (r.code === 0 && /^[0-9a-f]{40,64}$/.test(tree)) out.push({ path: sm.path, tree });
+  }
+  return out;
+}
 /** a dangling symbolic link exists for lstat, not for existsSync */
 const lstatOk = (p: string) => {
   try {
@@ -132,10 +152,12 @@ const lstatOk = (p: string) => {
 export async function discardWithUndo(repo: Repo, plan: DiscardPlan): Promise<{ undo: string | null; kept: string[]; tooLarge: boolean }> {
   prune();
   const loss = lossOf(repo, plan);
-  if (!loss.entries.length && !loss.absent.length && !loss.heads.length) return { undo: null, tooLarge: false, ...(await repo.applyDiscard(plan)) };
+  // read before the discard: afterwards the submodules' indexes are already back to HEAD
+  const indexes = await indexesOf(repo, plan);
+  if (!loss.entries.length && !loss.absent.length && !loss.heads.length && !indexes.length) return { undo: null, tooLarge: false, ...(await repo.applyDiscard(plan)) };
   mkdirSync(undoRoot(), { recursive: true });
   if (!sameDisk(repo.dir, undoRoot())) {
-    const undo = await saveCopies(repo, loss);
+    const undo = await saveCopies(repo, loss, indexes);
     return { undo, tooLarge: !undo, ...(await repo.applyDiscard(plan)) };
   }
   const token = newToken();
@@ -154,7 +176,7 @@ export async function discardWithUndo(repo: Repo, plan: DiscardPlan): Promise<{ 
       },
       true,
     );
-    const m: Manifest = { dir: repo.dir, at: Date.now(), files: loss.entries, absent: loss.absent, heads: loss.heads };
+    const m: Manifest = { dir: repo.dir, at: Date.now(), files: loss.entries, absent: loss.absent, heads: loss.heads, indexes };
     writeFileSync(path.join(dir, 'manifest.json'), JSON.stringify(m));
     const { kept } = await repo.applyDiscard(plan);
     return { undo: token, kept, tooLarge: false };
@@ -171,7 +193,7 @@ export async function discardWithUndo(repo: Repo, plan: DiscardPlan): Promise<{ 
 }
 
 /** copies of what is lost (another disk, a hunk): within the limits, else no undo */
-async function saveCopies(repo: Repo, loss: ReturnType<typeof lossOf>): Promise<string | null> {
+async function saveCopies(repo: Repo, loss: ReturnType<typeof lossOf>, indexes: NonNullable<Manifest['indexes']> = []): Promise<string | null> {
   const files: string[] = [];
   for (const e of loss.entries) {
     const abs = path.join(repo.dir, e);
@@ -190,7 +212,7 @@ async function saveCopies(repo: Repo, loss: ReturnType<typeof lossOf>): Promise<
   mkdirSync(store, { recursive: true });
   makeParents(files, store);
   await pool(files, PARALLEL, (f) => copyOne(path.join(repo.dir, f), path.join(store, f)));
-  const m: Manifest = { dir: repo.dir, at: Date.now(), files, absent: loss.absent, heads: loss.heads };
+  const m: Manifest = { dir: repo.dir, at: Date.now(), files, absent: loss.absent, heads: loss.heads, indexes };
   writeFileSync(path.join(dir, 'manifest.json'), JSON.stringify(m));
   return token;
 }
@@ -234,6 +256,11 @@ export async function restoreFromUndo(repo: Repo, token: string): Promise<{ rest
     PARALLEL,
     (p) => rm(p, { force: true }),
   );
+  // the submodules whose staged changes went too: their index as it was (the files are back already)
+  for (const i of m.indexes ?? []) {
+    const sub = path.join(repo.dir, i.path);
+    if (sub.startsWith(root)) await runGit(['read-tree', i.tree], { cwd: sub, allowFail: true });
+  }
   rmSync(dir, { recursive: true, force: true });
   // files put back inside submodules show at the next status
   repo.forgetSubmoduleChanges();

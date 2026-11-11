@@ -361,9 +361,11 @@ export function createApi(opts: { log?: (s: string) => void } = {}) {
     unstage: async (b) => repoOf(b).unstage(b.paths),
     unstageAll: async (b) => repoOf(b).unstageAll(),
     // discarding keeps what it drops first (moved aside): the result's `undo` token puts it back (undoDiscard)
+    // `staged` (on unless said otherwise, as Discard's tick is): in the submodules among the paths, what is staged
+    // inside them goes too
     discard: async (b) => {
       const r = repoOf(b);
-      return discardWithUndo(r, await r.discardPlan(strings(b.paths)));
+      return discardWithUndo(r, await r.discardPlan(strings(b.paths), { subStaged: b.staged !== false }));
     },
     discardAll: async (b) => {
       const r = repoOf(b);

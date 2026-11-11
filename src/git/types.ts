@@ -172,10 +172,12 @@ export interface FileChange {
 export interface SubmoduleInside {
   /** tracked files changed (staged or not) in the submodule, nested submodules included */
   modified: number;
+  /** how many of them are staged in the submodule's own index: a discard drops those only when asked to */
+  staged?: number;
   /** files (or folders) git does not track in the submodule */
   untracked: number;
   /** the first of them, paths inside the submodule (the engine names up to 50; the counts cover them all) */
-  files: { path: string; status: FileStatus }[];
+  files: { path: string; status: FileStatus; staged?: boolean }[];
   only?: boolean;
 }
 

@@ -30,6 +30,11 @@ export interface DiscardPlan {
   remove: string[];
   /** repositories of their own inside, listed as untracked folders: left alone */
   nested: string[];
+  /**
+   * What is staged here goes too: the index and the tracked files go back to HEAD in one `reset --hard` instead of
+   * the working tree being put back from the index. Only for a submodule's own plan (the tick in Discard).
+   */
+  reset?: boolean;
   /** submodules picked: back to the recorded commit, or at it, their own changes dropped (`inner`) */
   submodules: { path: string; recorded: string; head: string; branch: string | null; inner: DiscardPlan | null }[];
 }
@@ -461,15 +466,20 @@ export class Repo {
       if (r.code !== 0) return null;
       const st = parseStatus(r.stdout);
       const tracked = new Map<string, FileStatus>();
-      for (const f of st.staged) tracked.set(f.path, f.status);
+      // staged in the submodule's own index: a discard of the submodule drops them only when asked to
+      const staged = new Set<string>();
+      for (const f of st.staged) {
+        tracked.set(f.path, f.status);
+        staged.add(f.path);
+      }
       const untracked: string[] = [];
       for (const f of st.unstaged) {
         if (f.status === '?') untracked.push(f.path);
         else tracked.set(f.path, f.status);
       }
       if (!tracked.size && !untracked.length) return null;
-      const files = [...[...tracked].map(([p, status]) => ({ path: p, status })), ...untracked.map((p) => ({ path: p, status: '?' as FileStatus }))];
-      return { path: s.path, modified: tracked.size, untracked: untracked.length, files: files.slice(0, INSIDE_FILES) };
+      const files = [...[...tracked].map(([p, status]) => ({ path: p, status, ...(staged.has(p) ? { staged: true } : {}) })), ...untracked.map((p) => ({ path: p, status: '?' as FileStatus }))];
+      return { path: s.path, modified: tracked.size, staged: staged.size, untracked: untracked.length, files: files.slice(0, INSIDE_FILES) };
     };
     const out: (SubmoduleChanges | null)[] = [];
     let next = 0;
@@ -1229,8 +1239,11 @@ export class Repo {
    * paths in a repository of 60 000 files took 9 s per status (Fork-like speed needs the whole status, 0.3 s, and a
    * set lookup). A folder picked ("dir/") takes what is under it; a file picked inside an untracked folder git lists
    * as one ("new/") is that file.
+   *
+   * `staged`: what is staged here goes as well (the index back to HEAD, `reset`) — a submodule's own plan asks for it
+   * when Discard's tick is on. `subStaged`: the submodules among the paths plan that way.
    */
-  async discardPlan(paths: string[] | null): Promise<DiscardPlan> {
+  async discardPlan(paths: string[] | null, opts: { staged?: boolean; subStaged?: boolean } = {}): Promise<DiscardPlan> {
     const args = ['status', '--porcelain=v1', '-z', '--untracked-files=normal', '--ignore-submodules=all', '--no-renames'];
     let out = '';
     if (paths && paths.length <= FEW_PATHS) for (const run of inRuns(paths)) out += (await this.git(['--literal-pathspecs', ...args, '--', ...run])).stdout;
@@ -1255,7 +1268,8 @@ export class Repo {
       for (let i = lo; i < sorted.length && sorted[i].startsWith(dir); i++) found.push(sorted[i]);
       return found;
     };
-    const plan: DiscardPlan = { restore: [], absent: [], remove: [], nested: [], submodules: [] };
+    const staged = !!opts.staged;
+    const plan: DiscardPlan = { restore: [], absent: [], remove: [], nested: [], ...(staged ? { reset: true } : {}), submodules: [] };
     const untracked: string[] = [];
     for (const e of out.split('\0')) {
       if (e.length < 4) continue;
@@ -1266,23 +1280,27 @@ export class Repo {
         else if (rel.endsWith('/')) untracked.push(...inside(rel));
         continue;
       }
-      // only staged (nothing in the working tree to drop), or in conflict (resolved as ours / theirs instead)
-      if (xy[1] === ' ' || xy === '!!' || xy.includes('U') || xy === 'AA' || xy === 'DD' || !isPicked(rel)) continue;
+      if (xy === '!!' || !isPicked(rel)) continue;
+      // only staged (nothing in the working tree to drop), or in conflict (resolved as ours / theirs instead) —
+      // unless what is staged goes too: then every version on disk is lost and is kept aside for Undo
+      if (!staged && (xy[1] === ' ' || xy.includes('U') || xy === 'AA' || xy === 'DD')) continue;
       plan.restore.push(rel);
-      if (xy[1] === 'D') plan.absent.push(rel);
+      // deleted on disk: git says so, or (with the index going too) the file is simply not there
+      if (xy[1] === 'D' || (staged && !existsSync(path.join(this.dir, rel)))) plan.absent.push(rel);
     }
     // a repository of its own inside (git lists it as "dir/"): its history is not a change to drop, and the copy for
     // Undo cannot hold its .git — left alone, as `git clean` leaves it
     for (const u of new Set(untracked)) (existsSync(path.join(this.dir, u.replace(/\/+$/, ''), '.git')) ? plan.nested : plan.remove).push(u);
-    if (picked) plan.submodules = await this.submodulePlans([...picked].map((p) => p.replace(/\/+$/, '')));
+    if (picked) plan.submodules = await this.submodulePlans([...picked].map((p) => p.replace(/\/+$/, '')), !!opts.subStaged);
     return plan;
   }
   /**
    * The submodules among `paths`: one whose commit is not the one recorded here goes back to it (as `git submodule
    * update` leaves it, detached); one at the recorded commit has its own changes dropped (its files put back,
-   * new ones deleted), read and done inside it as for this repository.
+   * new ones deleted), read and done inside it as for this repository. `staged`: what is staged inside it goes too
+   * (Discard's tick), so its index goes back to HEAD as well.
    */
-  private async submodulePlans(paths: string[]): Promise<DiscardPlan['submodules']> {
+  private async submodulePlans(paths: string[], staged = false): Promise<DiscardPlan['submodules']> {
     if (!existsSync(path.join(this.dir, '.gitmodules'))) return [];
     const listed = (await this.git(['config', '-f', '.gitmodules', '--get-regexp', '^submodule\\..*\\.path$'], { allowFail: true })).stdout;
     const subs = new Set(listed.split('\n').map((l) => l.slice(l.indexOf(' ') + 1).trim()).filter(Boolean));
@@ -1294,14 +1312,17 @@ export class Repo {
       const head = (await sub.git(['rev-parse', '--verify', '-q', 'HEAD'], { allowFail: true })).stdout.trim() || null;
       if (!recorded || !head) continue;
       const branch = (await sub.git(['symbolic-ref', '-q', '--short', 'HEAD'], { allowFail: true })).stdout.trim() || null;
-      out.push({ path: p, recorded, head, branch, inner: head === recorded ? await sub.discardPlan(null) : null });
+      out.push({ path: p, recorded, head, branch, inner: head === recorded ? await sub.discardPlan(null, { staged }) : null });
     }
     return out;
   }
   /** does what the plan says; the nested repositories it left alone are returned */
   async applyDiscard(plan: DiscardPlan): Promise<{ kept: string[] }> {
+    // what is staged goes too (a submodule, Discard's tick): index and tracked files back to HEAD in one go. The
+    // versions on disk were moved aside for Undo first, and its index is kept as a tree (see undo.ts)
+    if (plan.reset) await this.git(['reset', '-q', '--hard', 'HEAD']);
     // tracked files back from the index, each looked up by name (not a pathspec matched against the whole index)
-    if (plan.restore.length) await this.git(['checkout-index', '-f', '-u', '-q', '-z', '--stdin'], { input: plan.restore.join('\0') + '\0' });
+    else if (plan.restore.length) await this.git(['checkout-index', '-f', '-u', '-q', '-z', '--stdin'], { input: plan.restore.join('\0') + '\0' });
     const parents = new Set<string>();
     for (const p of plan.remove) {
       const abs = path.join(this.dir, p.replace(/\/+$/, ''));
@@ -1327,8 +1348,8 @@ export class Repo {
     }
     return { kept: plan.nested };
   }
-  async discard(paths: string[]): Promise<{ kept: string[] }> {
-    return this.applyDiscard(await this.discardPlan(paths));
+  async discard(paths: string[], opts: { subStaged?: boolean } = {}): Promise<{ kept: string[] }> {
+    return this.applyDiscard(await this.discardPlan(paths, opts));
   }
   async discardAll() {
     await this.applyDiscard(await this.discardPlan(null));

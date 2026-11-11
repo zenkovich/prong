@@ -260,7 +260,8 @@ export interface GitClient {
   unstageAll(path: string): Promise<void>;
   /** `undo`: the engine kept copies of what was discarded (undoDiscard puts them back); null when too large */
   /** `kept`: repositories of their own among the paths, which a discard leaves alone */
-  discard(path: string, paths: string[]): Promise<{ undo: string | null; kept?: string[]; tooLarge?: boolean }>;
+  /** `staged`: in the submodules among the paths, what is staged inside them goes too (on unless said otherwise) */
+  discard(path: string, paths: string[], opts?: { staged?: boolean }): Promise<{ undo: string | null; kept?: string[]; tooLarge?: boolean }>;
   discardAll(path: string): Promise<{ undo: string | null; tooLarge?: boolean }>;
   undoDiscard(path: string, token: string): Promise<{ restored: number }>;
   /** the index as a tree (null while files are in conflict), and back */
@@ -561,8 +562,8 @@ export class HttpGitClient implements GitClient {
   async unstageAll(path: string) {
     await this.op('unstageAll', path);
   }
-  discard(path: string, paths: string[]) {
-    return this.op<{ undo: string | null; kept?: string[] }>('discard', path, { paths });
+  discard(path: string, paths: string[], opts: { staged?: boolean } = {}) {
+    return this.op<{ undo: string | null; kept?: string[] }>('discard', path, { paths, ...(opts.staged === undefined ? {} : { staged: opts.staged }) });
   }
   discardAll(path: string) {
     return this.op<{ undo: string | null }>('discardAll', path);

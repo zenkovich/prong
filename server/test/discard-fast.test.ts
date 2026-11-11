@@ -131,4 +131,46 @@ describe('discard: many files, Undo by moving aside, submodules', () => {
     const all = await repo.discardPlan(null);
     expect(all.submodules).toEqual([]);
   });
+
+  it("a submodule's staged changes: kept without the tick, dropped with it (index and files back to its commit), both back with Undo", async () => {
+    const core = make('core-staged');
+    writeFileSync(path.join(core, 'core.txt'), 'core\n');
+    git(core, 'add', '-A');
+    git(core, 'commit', '-qm', 'core');
+    const sup = make('super-staged');
+    git(sup, '-c', 'protocol.file.allow=always', 'submodule', 'add', '-q', core, 'libs/core');
+    git(sup, 'commit', '-qm', 'sub');
+    const at = path.join(sup, 'libs/core');
+    git(at, 'config', 'commit.gpgsign', 'false');
+    // inside it: a staged change, a new file staged, an untracked one, and an edit on top of the staged version
+    writeFileSync(path.join(at, 'core.txt'), 'core\nstaged\n');
+    writeFileSync(path.join(at, 'added.txt'), 'added\n');
+    git(at, 'add', 'core.txt', 'added.txt');
+    writeFileSync(path.join(at, 'free.txt'), 'free\n');
+    writeFileSync(path.join(at, 'core.txt'), 'core\nstaged\nand edited\n');
+    const repo = new Repo(sup);
+    // the engine reads what is staged inside, so the dialog can offer the tick
+    const inside = (await repo.submoduleChanges(0)).find((s) => s.path === 'libs/core');
+    expect(inside).toMatchObject({ modified: 2, staged: 2, untracked: 1 });
+    expect(inside!.files.filter((f) => f.staged).map((f) => f.path).sort()).toEqual(['added.txt', 'core.txt']);
+    // without the tick: only the working tree goes back to the index — the staged version stays staged
+    const keep = await repo.discardPlan(['libs/core']);
+    expect(keep.submodules[0].inner?.reset).toBeFalsy();
+    await repo.applyDiscard(keep);
+    expect(readFileSync(path.join(at, 'core.txt'), 'utf8')).toBe('core\nstaged\n');
+    expect(existsSync(path.join(at, 'free.txt'))).toBe(false);
+    expect(git(at, 'status', '--porcelain').split('\n').sort()).toEqual(['A  added.txt', 'M  core.txt']);
+    // with the tick: index and files back to the recorded commit, nothing of its own left
+    const plan = await repo.discardPlan(['libs/core'], { subStaged: true });
+    expect(plan.submodules[0].inner?.reset).toBe(true);
+    const { undo } = await discardWithUndo(repo, plan);
+    expect(git(at, 'status', '--porcelain')).toBe('');
+    expect(readFileSync(path.join(at, 'core.txt'), 'utf8')).toBe('core\n');
+    expect(existsSync(path.join(at, 'added.txt'))).toBe(false);
+    // Undo puts the files back and the index as it was (read-tree of the tree kept aside)
+    await restoreFromUndo(repo, undo!);
+    expect(readFileSync(path.join(at, 'core.txt'), 'utf8')).toBe('core\nstaged\n');
+    expect(readFileSync(path.join(at, 'added.txt'), 'utf8')).toBe('added\n');
+    expect(git(at, 'status', '--porcelain').split('\n').sort()).toEqual(['A  added.txt', 'M  core.txt']);
+  });
 });

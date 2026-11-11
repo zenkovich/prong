@@ -1017,9 +1017,9 @@ export function unstageFiles(paths: string[], what?: string) {
   if (paths.length) void mutate(filesLabel('Unstage', paths, what), (p) => client.unstage(p, paths), followFiles, { undo: 'index' });
 }
 /**
- * What discarding a submodule does, said in its confirmation: one whose commit is not the one recorded here goes back
- * to it (its own changes stay, or git refuses when they are in the way); one at the recorded commit has its own
- * changes dropped. Null for a path that is not a submodule.
+ * What discarding a submodule does, said in its block of the Discard dialog: one whose commit is not the one recorded
+ * here goes back to it (its own changes stay, or git refuses when they are in the way); one at the recorded commit has
+ * its own changes dropped (the dialog lists them). Null for a path that is not a submodule.
  */
 export function submoduleDiscardText(path: string): string | null {
   const f = repoState()?.unstaged.find((x) => x.path === path && x.kind === 'submodule');
@@ -1030,34 +1030,34 @@ export function submoduleDiscardText(path: string): string | null {
   if (!f.inside?.only && f.submodule && f.submodule.before !== f.submodule.after)
     return `${path} goes back to ${short(f.submodule.before)}, the commit recorded here (it is at ${short(f.submodule.after)})${inside ? `; its own changes (${what}) stay, or git refuses when they are in the way` : ''}.`;
   if (!inside) return null;
-  const names = inside.files.slice(0, 8).map((x) => `  ${x.path}`).join('\n');
-  const more = inside.modified + inside.untracked - Math.min(8, inside.files.length);
-  return `${path} is at the commit recorded here: the changes in its own files are dropped (${what}).\n${names}${more > 0 ? `\n  … ${more} more` : ''}`;
+  return `${path} is at the commit recorded here: the changes in its own files are dropped (${what}).`;
 }
 export function discardFiles(all: string[], what?: string) {
   const paths = all;
   if (!paths.length) return;
   if (paths.length === 1) return discardFile(paths[0]);
   const label = filesLabel('Discard', paths, what);
-  const subs = paths.map(submoduleDiscardText).filter((x): x is string => !!x);
-  confirm(
-    what ? `Discard the changes in ${what}?` : `Discard ${paths.length} files?`,
-    `${what ? `${paths.length} files: their` : 'Their'} changes are dropped. Prong keeps a copy: Undo in the toolbar (⌘Z) brings them back.\n\n${paths.slice(0, 12).join('\n')}${paths.length > 12 ? `\n… ${paths.length - 12} more` : ''}${subs.length ? `\n\nSubmodules:\n${subs.join('\n\n')}` : ''}`,
-    () => discarding(label, paths, () => updateRepo({ fileSelection: [] })),
-    'Discard',
-    true,
-  );
+  openDialog({
+    type: 'discard',
+    title: what ? `Discard the changes in ${what}?` : `Discard ${paths.length} files?`,
+    note: `${what ? `${paths.length} files: their` : 'Their'} changes are dropped. Prong keeps a copy: Undo in the toolbar (⌘Z) brings them back.`,
+    confirmLabel: 'Discard',
+    paths,
+    what,
+    onConfirm: ({ staged }) => discarding(label, paths, { staged }, () => updateRepo({ fileSelection: [] })),
+  });
 }
 /**
  * The discard itself; a repository of its own among the paths (git lists one as "dir/") is left alone by the engine
  * — its history cannot be copied for Undo — and the user is told (it used to be deleted, .git and all).
+ * `staged`: the submodules among the paths lose what is staged inside them too (the dialog's tick).
  */
-function discarding(label: string, paths: string[], after?: () => void) {
+function discarding(label: string, paths: string[], opts: { staged?: boolean } = {}, after?: () => void) {
   let kept: string[] = [];
   void mutate(
     label,
     async (p) => {
-      const r = await client.discard(p, paths);
+      const r = await client.discard(p, paths, opts);
       kept = r.kept ?? [];
       return r;
     },
@@ -1076,11 +1076,26 @@ export function ignoreFiles(patterns: string[]) {
 }
 export function discardFile(path: string) {
   const sub = submoduleDiscardText(path);
+  const label = `Discard ${baseName(path)}`;
   if (sub) {
     const moves = !insideOnly(path);
-    return confirm(moves ? `Move ${path} back?` : `Discard the changes inside ${path}?`, `${sub}\n\nProng keeps ${moves ? 'where it was' : 'a copy'}: Undo in the toolbar (⌘Z) brings ${moves ? 'it' : 'them'} back.`, () => discarding(`Discard ${baseName(path)}`, [path]), moves ? 'Move back' : 'Discard', true);
+    return openDialog({
+      type: 'discard',
+      title: moves ? `Move ${path} back?` : `Discard the changes inside ${path}?`,
+      note: `Prong keeps ${moves ? 'where it was' : 'a copy'}: Undo in the toolbar (⌘Z) brings ${moves ? 'it' : 'them'} back.`,
+      confirmLabel: moves ? 'Move back' : 'Discard',
+      paths: [path],
+      onConfirm: ({ staged }) => discarding(label, [path], { staged }),
+    });
   }
-  confirm('Discard changes?', `All changes in ${path} are dropped. Prong keeps a copy: Undo in the toolbar (⌘Z) brings them back.`, () => discarding(`Discard ${baseName(path)}`, [path]), 'Discard', true);
+  openDialog({
+    type: 'discard',
+    title: 'Discard changes?',
+    note: `All changes in ${path} are dropped. Prong keeps a copy: Undo in the toolbar (⌘Z) brings them back.`,
+    confirmLabel: 'Discard',
+    paths: [path],
+    onConfirm: () => discarding(label, [path]),
+  });
 }
 export function discardAll() {
   const r = repoState();

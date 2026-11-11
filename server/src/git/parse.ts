@@ -249,11 +249,11 @@ export function joinSubmoduleChanges(unstaged: FileChange[], list: SubmoduleChan
     const s = rest.get(f.path);
     if (!s) return f;
     rest.delete(f.path);
-    return f.kind === 'submodule' ? { ...f, inside: { modified: s.modified, untracked: s.untracked, files: s.files } } : f;
+    return f.kind === 'submodule' ? { ...f, inside: { modified: s.modified, staged: s.staged, untracked: s.untracked, files: s.files } } : f;
   });
   for (const s of [...rest.values()].sort((a, b) => (a.path < b.path ? -1 : 1))) {
     const at = out.findIndex((f) => f.status === '?' || f.path > s.path);
-    const row: FileChange = { path: s.path, status: 'M', kind: 'submodule', additions: 0, deletions: 0, inside: { modified: s.modified, untracked: s.untracked, files: s.files, only: true } };
+    const row: FileChange = { path: s.path, status: 'M', kind: 'submodule', additions: 0, deletions: 0, inside: { modified: s.modified, staged: s.staged, untracked: s.untracked, files: s.files, only: true } };
     out.splice(at < 0 ? out.length : at, 0, row);
   }
   return out;

@@ -52,6 +52,7 @@ import { Select } from './Select';
 import { ConnectionDialog } from './ConnectionDialog';
 import { DeleteBranchesDialog } from './BranchBatchDialog';
 import { LfsDialog } from './LfsDialog';
+import { DiscardDialog } from './DiscardDialog';
 import { branchNameProblem } from './branchNames';
 import { canIntegrate, checkoutPlan, defaultIntegrate, Integrate, relationText } from './checkoutPlan';
 import * as live from '../state/live';
@@ -72,6 +73,8 @@ export function DialogHost() {
       return <AccountsDialog tab={d.tab} token={d.token} />;
     case 'confirm':
       return <ConfirmDialog title={d.title} message={d.message} confirmLabel={d.confirmLabel} danger={d.danger} onConfirm={d.onConfirm} />;
+    case 'discard':
+      return <DiscardDialog title={d.title} note={d.note} confirmLabel={d.confirmLabel} paths={d.paths} what={d.what} onConfirm={d.onConfirm} />;
     case 'rebase':
       return <RebaseDialog d={d} />;
     case 'push':

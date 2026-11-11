@@ -133,7 +133,12 @@ export type Dialog =
   | { type: 'deleteBranches'; names: string[] }
   /** Git LFS files the working copy holds as pointers, to restore (`focus`: open with that file's folder picked) */
   | { type: 'lfs'; focus?: string }
-  | { type: 'confirm'; title: string; message: string; confirmLabel?: string; danger?: boolean; onConfirm: () => void };
+  | { type: 'confirm'; title: string; message: string; confirmLabel?: string; danger?: boolean; onConfirm: () => void }
+  /**
+   * Discard asking first, with the files it drops as a list or a tree (icons, status, counts) and what goes inside
+   * the submodules among them. `onConfirm` gets the tick: whether what is staged inside those submodules goes too.
+   */
+  | { type: 'discard'; title: string; note: string; confirmLabel?: string; paths: string[]; /** the folder they are, when a whole one is discarded ("src/ui/") */ what?: string; onConfirm: (opts: { staged: boolean }) => void };
 
 export interface Toast {
   id: number;
@@ -757,7 +762,15 @@ export function unstageFiles(paths: string[], what?: string) {
 export function discardFiles(paths: string[], what?: string) {
   if (live.isLiveActive()) return live.discardFiles(paths, what);
   if (paths.length === 1) return discardFile(paths[0]);
-  confirm(`Discard ${paths.length} files?`, 'Their changes are dropped (mock).', () => updateRepo((r) => ({ unstaged: r.unstaged.filter((f) => !paths.includes(f.path)), fileSelection: [] })), 'Discard', true);
+  openDialog({
+    type: 'discard',
+    title: what ? `Discard the changes in ${what}?` : `Discard ${paths.length} files?`,
+    note: 'Their changes are dropped (mock).',
+    confirmLabel: 'Discard',
+    paths,
+    what,
+    onConfirm: () => updateRepo((r) => ({ unstaged: r.unstaged.filter((f) => !paths.includes(f.path)), fileSelection: [] })),
+  });
 }
 
 export function clickRefSelection(name: string, mods: { meta: boolean; shift: boolean }, order: string[]) {
@@ -1142,13 +1155,20 @@ export function discardFile(path: string) {
   if (live.isLiveActive()) return live.discardFile(path);
   const r = activeRepo();
   if (!r) return;
-  confirm('Discard changes?', `All changes in ${path} will be lost. This cannot be undone.`, () => {
-    updateRepo((rr) => {
-      const unstaged = rr.unstaged.filter((f) => f.path !== path);
-      return { unstaged, selectedFile: rr.selectedFile === path ? unstaged[0]?.path ?? null : rr.selectedFile };
-    });
-    toast(`Discarded ${path}`, 'info');
-  }, 'Discard', true);
+  openDialog({
+    type: 'discard',
+    title: 'Discard changes?',
+    note: `All changes in ${path} will be lost. This cannot be undone.`,
+    confirmLabel: 'Discard',
+    paths: [path],
+    onConfirm: () => {
+      updateRepo((rr) => {
+        const unstaged = rr.unstaged.filter((f) => f.path !== path);
+        return { unstaged, selectedFile: rr.selectedFile === path ? unstaged[0]?.path ?? null : rr.selectedFile };
+      });
+      toast(`Discarded ${path}`, 'info');
+    },
+  });
 }
 
 export function discardAll() {
