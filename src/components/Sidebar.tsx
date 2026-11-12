@@ -7,11 +7,8 @@ import { countLeaves, PathNode, pathTree } from './pathTree';
 import {
   applyStash,
   checkout,
-  clearBranchFilter,
   clearRefSelection,
   clickRefSelection,
-  deleteBranch,
-  deleteTag,
   dropStash,
   fetch,
   filterToSelection,
@@ -23,7 +20,7 @@ import {
   pullBranch,
   pushBranch,
   pushBranchesBatch,
-  revealCommit,
+  revealRef,
   selectStash,
   setGraphFilter,
   setSection,
@@ -44,7 +41,8 @@ import { FONT, useTheme } from '../theme';
 import { Icon, IconName } from '../ui/Icon';
 import { Badge, Button, Chevron, Collapsible, HoverReveal, IconButton, Input, PressScale, Row, Segmented, Txt, useKeyboard, usePulse } from '../ui/primitives';
 import { inFilter } from './branchFilter';
-import { mainBranch, remoteTwin, remoteTwins } from './branchNames';
+import { branchMenu, tagMenu } from './refMenus';
+import { mainBranch, remoteTwins } from './branchNames';
 import { VersionGroup, versionGroups } from './versions';
 import * as live from '../state/live';
 
@@ -438,18 +436,9 @@ const TagRow = memo(function TagRow({ tag }: { tag: Ref }) {
       indent={14}
       selected={selected}
       testID={`tag-${tag.name}`}
-      onPress={() => revealCommit(tag.sha)}
-      onContextMenu={(x, y) => {
-        const isLive = live.isLiveActive();
-        showContextMenu(x, y, [
-          { label: `Checkout ${tag.name}`, onPress: () => (isLive ? live.checkoutDetached(tag.sha) : toast(`Detached HEAD at ${tag.name} (mock)`, 'info')) },
-          { label: 'Push tag', onPress: () => (isLive ? live.pushTag(tag.name) : toast(`Pushed tag ${tag.name} (mock)`, 'success')) },
-          { label: 'Create branch here…', onPress: () => openDialog({ type: 'branch', fromSha: tag.sha, fromName: tag.name }) },
-          { label: 'Copy name', onPress: () => live.copyText(tag.name) },
-          { separator: true },
-          { label: 'Delete tag', danger: true, onPress: () => deleteTag(tag.name) },
-        ]);
-      }}
+      onPress={() => void revealRef(tag.name, tag.sha)}
+      // the same menu as the tag's label on a commit row (refMenus.ts)
+      onContextMenu={(x, y) => showContextMenu(x, y, tagMenu(tag))}
     >
       {({ hovered }) => (
         <>
@@ -690,56 +679,8 @@ const BranchLeaf = memo(function BranchLeaf({ r, label, kind, indent, height = 2
   const twins = useContext(Twins);
   const hideRemotes = useRepoValue((x) => x.graphFilter.hideRemotes);
   const funnelTwin = kind === 'branch' && !hideRemotes ? twins.get(r.name) : undefined;
-  const items = () => {
-    // read at the moment the menu opens, not on every render of every row
-    const repo = getState().repoStates[getState().activeTab ?? ''];
-    const current = repo?.refs.find((x) => x.kind === 'branch' && x.current);
-    const mode = repo?.graphFilter.mode ?? 'all';
-    // the remote branch “Delete (local + remote)” takes along (none: it is on no remote)
-    const twin = repo && kind === 'branch' ? remoteTwin(repo.refs, repo.remotes, r) : undefined;
-    const graphItems = [
-      { separator: true },
-      { label: 'Show only this branch', onPress: () => showOnlyRef(r.name) },
-      ...(mode === 'selected' ? [{ label: filtered ? 'Remove from the filter' : 'Add to the filter', onPress: () => toggleBranchFilter(r.name) }] : []),
-      ...(mode !== 'all' ? [{ label: 'Clear the branch filter', onPress: clearBranchFilter }] : []),
-    ];
-    if (kind === 'branch')
-      return [
-        { label: r.current ? 'Already checked out' : `Checkout ${r.name}`, disabled: !!r.current, onPress: () => checkout(r.name) },
-        { label: `Merge ${r.name} into ${current?.name ?? 'HEAD'}`, disabled: !!r.current, onPress: () => openDialog({ type: 'merge', source: r.name }) },
-        { label: `Rebase ${current?.name ?? 'HEAD'} onto ${r.name}`, disabled: !!r.current, onPress: () => openDialog({ type: 'rebase', onto: r.name }) },
-        { separator: true },
-        { label: r.upstream ? `Push to ${r.upstream}` : 'Push…', onPress: () => pushBranch(r.name) },
-        {
-          label: r.current ? 'Pull…' : r.upstream && !r.gone ? `Pull ${r.upstream} (fast-forward)` : 'Pull (it tracks no remote branch)',
-          disabled: !r.current && (!r.upstream || r.gone),
-          onPress: () => (r.current ? openDialog({ type: 'pull' }) : pullBranch(r.name)),
-        },
-        { label: r.upstream && !r.gone ? `Sync with ${r.upstream}` : 'Sync (it tracks no remote branch)', disabled: !r.upstream || r.gone, onPress: () => syncBranch(r.name) },
-        { label: 'Set upstream…', onPress: () => openDialog({ type: 'upstream', branch: r.name }) },
-        { separator: true },
-        { label: 'Create branch here…', onPress: () => openDialog({ type: 'branch', fromSha: r.sha, fromName: r.name }) },
-        { label: 'Rename…', onPress: () => openDialog({ type: 'renameBranch', name: r.name }) },
-        { label: 'Copy branch name', onPress: () => live.copyText(r.name) },
-        { separator: true },
-        { label: 'Delete', danger: true, disabled: !!r.current, onPress: () => deleteBranch(r.name) },
-        { label: twin ? `Delete (local + ${twin})` : 'Delete (local + remote): it is on no remote', danger: true, disabled: !!r.current || !twin, onPress: () => deleteBranch(r.name, true) },
-        ...graphItems,
-      ];
-    // a remote branch checks out its local branch: the one tracking it, else the same name, else a new one (as Fork)
-    const short = r.name.slice(r.name.indexOf('/') + 1);
-    const local = repo?.refs.find((x) => x.kind === 'branch' && x.upstream === r.name) ?? repo?.refs.find((x) => x.kind === 'branch' && x.name === short);
-    return [
-      { label: local?.current ? `Already on ${local.name}` : local && local.name !== short ? `Checkout ${local.name} (tracks ${r.name})` : `Checkout ${short}`, disabled: !!local?.current, onPress: () => checkout(r.name) },
-      { label: `Merge ${r.name} into ${current?.name ?? 'HEAD'}`, onPress: () => openDialog({ type: 'merge', source: r.name }) },
-      { label: `Rebase ${current?.name ?? 'HEAD'} onto ${r.name}`, onPress: () => openDialog({ type: 'rebase', onto: r.name }) },
-      { separator: true },
-      { label: 'Create branch here…', onPress: () => openDialog({ type: 'branch', fromSha: r.sha, fromName: r.name }) },
-      { label: 'Copy branch name', onPress: () => live.copyText(r.name) },
-      { label: 'Delete remote branch', danger: true, onPress: () => deleteBranch(r.name) },
-      ...graphItems,
-    ];
-  };
+  // the same menu as the branch's label on a commit row (refMenus.ts)
+  const items = () => branchMenu(r, kind);
   return (
     <Row
       height={height}
@@ -749,7 +690,7 @@ const BranchLeaf = memo(function BranchLeaf({ r, label, kind, indent, height = 2
       testID={isPicked ? `${idPrefix}picked-${r.name}` : undefined}
       onPress={() => {
         clearRefSelection();
-        void revealCommit(r.sha);
+        void revealRef(r.name, r.sha);
       }}
       // ⌘ / Shift: pick branches for a batch action instead of jumping to the commit
       onPressMods={(m) => {

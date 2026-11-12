@@ -758,6 +758,32 @@ await step('sidebar · funnel of a local branch: its branch on the remote comes 
   await waitGone('branch-filter-bar');
 });
 
+await step('sidebar · a click on a branch the filter leaves out: it joins the filter (with its remote branch), its commit shown and selected; one in the filter leaves the filter alone', async () => {
+  const selectedSha = () => page.evaluate(() => document.querySelector('[data-testid="selected-commit"]')?.closest('[data-testid^="commit-row-"]')?.getAttribute('data-testid')?.slice('commit-row-'.length) ?? null);
+  const topic = shaOf(O.dir, 'topic');
+  const pubSha = shaOf(O.dir, 'pub');
+  await br('pub').hover();
+  await tid('funnel-pub').click();
+  await waitShown('filter-chip-pub');
+  await waitGone(`commit-row-${topic}`);
+  // in the filter: a click selects its commit, the filter stays
+  await br('pub').click();
+  await until(async () => (await selectedSha()) === pubSha, 'pub’s commit selected: ' + (await selectedSha()));
+  expect(!(await has('filter-chip-topic')), 'the filter unchanged');
+  // out of it: it joins the filter, the history shows it, its commit selected
+  await br('topic').click();
+  await waitShown('filter-chip-topic');
+  expect(await has('filter-chip-pub'), 'pub stays in the filter');
+  await waitShown(`commit-row-${topic}`);
+  await until(async () => (await selectedSha()) === topic, 'topic’s commit selected: ' + (await selectedSha()));
+  expect((await tid('funnel-topic').getAttribute('aria-label')) === 'Remove topic from the filter', 'topic’s funnel lit');
+  // a remote branch out of it joins alone
+  await br('origin/rb').click();
+  await waitShown('filter-chip-origin/rb');
+  await tid('clear-branch-filter').click();
+  await waitGone('branch-filter-bar');
+});
+
 await step('sidebar · main branch: main and origin/main sit under All Commits, above the groups; a click shows the commit, the funnel filters both', async () => {
   await waitShown('main-branch');
   const y = (id) => page.evaluate((id) => document.querySelector(`[data-testid="${id}"]`)?.getBoundingClientRect().y ?? -1, id);

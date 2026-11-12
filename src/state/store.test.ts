@@ -18,6 +18,7 @@ import {
   removeRepo,
   reportError,
   revealCommit,
+  revealRef,
   setDiffMode,
   setFileView,
   setLayout,
@@ -241,6 +242,31 @@ describe('store: branch click and branch filter', () => {
     toggleBranchFilter('dev');
     clearBranchFilter();
     expect(getState().repoStates.a.graphFilter).toMatchObject({ mode: 'all', refs: [] });
+  });
+
+  it('a click on a branch the filter leaves out puts it in the filter, then shows its commit; a branch in the filter leaves it alone', async () => {
+    toggleBranchFilter('main');
+    const before = getState().repoStates.a.graphFilter;
+    await revealRef('main', 'c3');
+    expect(getState().repoStates.a.graphFilter).toBe(before);
+    expect(getState().repoStates.a.reveal?.sha).toBe('c3');
+    await revealRef('dev', 'c2');
+    expect(getState().repoStates.a.graphFilter.refs).toEqual([...before.refs, ...(getState().repoStates.a.refs.some((x) => x.name === 'origin/dev') ? ['dev', 'origin/dev'] : ['dev'])]);
+    expect(getState().repoStates.a.selectedCommit).toBe('c2');
+  });
+
+  it('with the engine, the click waits for the widened history before it looks for the commit', async () => {
+    vi.spyOn(live, 'isLiveActive').mockReturnValue(true);
+    const order: string[] = [];
+    vi.spyOn(live, 'applyGraphFilter').mockImplementation(async () => void order.push('filter'));
+    vi.spyOn(live, 'revealCommit').mockImplementation(async () => void order.push('reveal'));
+    toggleBranchFilter('main');
+    order.length = 0;
+    await revealRef('dev', 'c2');
+    expect(order).toEqual(['filter', 'reveal']);
+    order.length = 0;
+    await revealRef('main', 'c3');
+    expect(order).toEqual(['reveal']);
   });
 
   it('with the engine, the funnel asks git for the filtered history and a click goes through the pager', () => {

@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { Ref } from '../git/types';
-import { filterChips, filterRevs, filterTwin, inFilter, toggleFilterRef } from './branchFilter';
+import { filterChips, filterRevs, filterTwin, inFilter, toggleFilterRef, withFilterRef } from './branchFilter';
 import type { GraphFilter } from './graphLayout';
 
 const all: GraphFilter = { mode: 'all', refs: [], hideRemotes: false };
@@ -20,6 +20,24 @@ describe('branch filter', () => {
   });
   it('a "current branch" filter is replaced, not extended', () => {
     expect(toggleFilterRef({ mode: 'current', refs: [], hideRemotes: true }, 'dev')).toEqual({ mode: 'selected', refs: ['dev'], hideRemotes: true });
+  });
+  it('a click on a branch the filter leaves out takes it in (with its remote branch); one already shown changes nothing', () => {
+    const sel: GraphFilter = { mode: 'selected', refs: ['main', 'origin/main'], hideRemotes: false };
+    expect(withFilterRef(sel, 'dev', 'origin/dev').refs).toEqual(['main', 'origin/main', 'dev', 'origin/dev']);
+    expect(withFilterRef(sel, 'origin/main')).toBe(sel);
+    expect(withFilterRef(sel, 'v1.0').refs).toEqual(['main', 'origin/main', 'v1.0']);
+    expect(withFilterRef({ ...sel, refs: ['origin/dev'] }, 'dev', 'origin/dev').refs).toEqual(['origin/dev', 'dev']);
+    expect(withFilterRef(all, 'dev', 'origin/dev')).toBe(all);
+    const hidden: GraphFilter = { ...all, hideRemotes: true };
+    expect(withFilterRef(hidden, 'dev')).toBe(hidden);
+  });
+  it('"current branch" and a click on another branch: the current one and the clicked one, each with its remote branch', () => {
+    const cur: GraphFilter = { mode: 'current', refs: [], hideRemotes: false };
+    expect(withFilterRef(cur, 'main', 'origin/main', { name: 'main', twin: 'origin/main' })).toBe(cur);
+    expect(withFilterRef(cur, 'dev', 'origin/dev', { name: 'main', twin: 'origin/main' })).toEqual({ mode: 'selected', refs: ['main', 'origin/main', 'dev', 'origin/dev'], hideRemotes: false });
+    expect(withFilterRef(cur, 'origin/main', undefined, { name: 'main', twin: 'origin/main' }).refs).toEqual(['main', 'origin/main']);
+    // detached HEAD: no current branch, only the clicked one
+    expect(withFilterRef(cur, 'dev').refs).toEqual(['dev']);
   });
   it('maps filters to git revisions', () => {
     expect(filterRevs(all)).toBeNull();

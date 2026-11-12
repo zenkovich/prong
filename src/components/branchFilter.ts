@@ -15,6 +15,20 @@ export function toggleFilterRef(f: GraphFilter, name: string, twin?: string): Gr
 }
 
 /**
+ * The filter with `name` in it: a click on a branch or tag in the sidebar takes it into a filter that leaves it out,
+ * so the history shows where the click went. A local branch comes with `twin`, as by its funnel. "Current branch"
+ * becomes a selection of the current branch (`current`, with its twin) and this one. The same object back when the
+ * filter already shows the ref (or shows every branch).
+ */
+export function withFilterRef(f: GraphFilter, name: string, twin?: string, current?: FilterChip): GraphFilter {
+  const pair = (n: string, t?: string) => (t && t !== n ? [n, t] : [n]);
+  if (f.mode === 'all') return f;
+  if (f.mode === 'selected') return f.refs.includes(name) ? f : { ...f, refs: [...f.refs, ...pair(name, twin).filter((r) => !f.refs.includes(r))] };
+  if (current?.name === name) return f;
+  return { ...f, mode: 'selected', refs: [...new Set([...(current ? pair(current.name, current.twin) : []), ...pair(name, twin)])] };
+}
+
+/**
  * The remote branch a local branch's funnel takes along: the one it tracks, else its namesake on origin. None for
  * a remote branch or a tag, and none while remote branches are hidden (it would filter nothing).
  */

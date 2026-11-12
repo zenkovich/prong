@@ -8,7 +8,7 @@ import { plan as planCommand } from '../agent/mockAgent';
 import * as live from './live';
 import type { ServerSettings, Submodule, SwitchOptions } from '../git/GitClient';
 import { GraphFilter } from '../components/graphLayout';
-import { filterTwin, toggleFilterRef } from '../components/branchFilter';
+import { filterTwin, toggleFilterRef, withFilterRef } from '../components/branchFilter';
 import { canIntegrate, checkoutPlan, relationText } from '../components/checkoutPlan';
 import { nextSelection } from '../components/refSelection';
 
@@ -230,7 +230,7 @@ export interface AgentState {
 }
 
 export interface AppState {
-  engine: { online: boolean; git: string; version: string; ui?: 'static' | 'dev'; uiBuild?: 'factory' | 'agent'; stale?: boolean };
+  engine: { online: boolean; git: string; version: string; ui?: 'static' | 'dev'; uiBuild?: 'factory' | 'agent'; stale?: boolean; canRestart?: boolean; rebuilding?: boolean };
   serverSettings: ServerSettings | null;
   agentAvailable: { ok: boolean; path: string | null; version: string } | null;
   scanning: string | null;
@@ -822,6 +822,26 @@ export function revealCommit(sha: Sha) {
   updateRepo({ reveal: { sha, nonce: ++revealNonce } });
 }
 export const nextRevealNonce = () => ++revealNonce;
+/**
+ * A click on a branch or tag in the sidebar: its commit, selected and scrolled to. A branch filter that leaves the
+ * ref out takes it in first (a local branch with its branch on the remote, as by its funnel), so the history shows it.
+ */
+export async function revealRef(name: string, sha: Sha) {
+  const r = activeRepo();
+  if (r) {
+    const twin = (n: string) => filterTwin(r.refs, r.remotes, n, r.graphFilter.hideRemotes);
+    const cur = r.refs.find((x) => x.kind === 'branch' && x.current);
+    const next = withFilterRef(r.graphFilter, name, twin(name), cur && { name: cur.name, twin: twin(cur.name) });
+    if (next !== r.graphFilter) {
+      const tab = state.activeTab;
+      updateRepo({ graphFilter: next });
+      if (live.isLiveActive()) await live.applyGraphFilter();
+      // another tab picked meanwhile: the click was for this one
+      if (state.activeTab !== tab) return;
+    }
+  }
+  return revealCommit(sha);
+}
 
 // ---------- repositories ----------
 
@@ -1885,7 +1905,7 @@ let noticeId = 0;
  * End of a run: clears the busy state and, unless the chat panel is open (the answer is right there),
  * leaves a card with what was done that stays until closed.
  */
-export function finishAgentRun(msgId: number, opts: { ok: boolean; error?: string; noChanges?: boolean }) {
+export function finishAgentRun(msgId: number, opts: { ok: boolean; error?: string; noChanges?: boolean; title?: string }) {
   const a = state.agent;
   const durationMs = a.startedAt ? Date.now() - a.startedAt : undefined;
   updateAgent({ busy: false, status: null, startedAt: null });
@@ -1902,7 +1922,7 @@ export function finishAgentRun(msgId: number, opts: { ok: boolean; error?: strin
     id: noticeId,
     msgId,
     ok: opts.ok,
-    title: opts.noChanges ? 'No changes' : opts.ok ? (m.target === 'app' ? 'Interface updated' : 'Done') : stopped ? 'Stopped' : opts.error && /^No |^Interface build failed/.test(opts.error) ? opts.error : 'Failed',
+    title: opts.title ?? (opts.noChanges ? 'No changes' : opts.ok ? (m.target === 'app' ? 'Interface updated' : 'Done') : stopped ? 'Stopped' : opts.error && /^No |^Interface build failed|^Prong\.app build failed/.test(opts.error) ? opts.error : 'Failed'),
     text: m.text.replace(/^\s*PRONG_TARGET:.*$/m, '').trim() || (opts.ok ? 'Finished without a reply.' : opts.error ?? 'The agent stopped.'),
     target: m.target,
     actions,
