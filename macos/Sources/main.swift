@@ -72,6 +72,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
         for candidate in preferred..<(preferred + 20) {
             let sock = socket(AF_INET, SOCK_STREAM, 0)
             if sock < 0 { continue }
+            // as Node's listen does: the connections of an engine that just quit (a restart) linger in TIME_WAIT
+            // and made the port look taken, so the new one moved to 8791 and lost the page's saved state
+            var yes: Int32 = 1
+            setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &yes, socklen_t(MemoryLayout<Int32>.size))
             var addr = sockaddr_in()
             addr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
             addr.sin_family = sa_family_t(AF_INET)
@@ -264,4 +268,10 @@ let app = NSApplication.shared
 let delegate = AppDelegate()
 app.delegate = delegate
 app.setActivationPolicy(.regular)
+// SIGTERM (the engine restarting Prong into a new build) quits as ⌘Q does: the page's storage is written and the
+// engine stopped, instead of the process just ending
+signal(SIGTERM, SIG_IGN)
+let termSource = DispatchSource.makeSignalSource(signal: SIGTERM, queue: .main)
+termSource.setEventHandler { NSApp.terminate(nil) }
+termSource.resume()
 app.run()

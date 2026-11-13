@@ -19,6 +19,7 @@ import { attachDir, attachmentPath, attachmentsNote, saveAttachment } from './at
 import { getAvatar } from './avatars.js';
 import { checkIncoming } from './origin.js';
 import { AppSources, buildUi, currentUiBuild, engineOlderThanSources, resetUiToFactory } from './appsources.js';
+import { buildApp, builtBundle, buildOutdated, newerBuildOnDisk, runningBundle, saveHandoff, scheduleRestart, shellPid, takeHandoff } from './appbuild.js';
 import type { FileChange, Hunk } from './types.js';
 
 /**
@@ -42,6 +43,9 @@ import type { FileChange, Hunk } from './types.js';
  *   GET  /api/fileicon?ext         → the OS icon for a file extension (png/svg)
  *   POST /api/app/{prepare,record,revert,versions,diff,rebuild,factory} { sources } → agent versions of Prong's own
  *        sources (shadow git repository) and the interface build the desktop app serves
+ *   POST /api/app/build { sources, ifNeeded } → macos/build.sh in the sources (a long op); POST /api/app/restart
+ *        { sources, handoff } → Prong quits and opens the new build; GET /api/app/handoff → what the instance before
+ *        handed over (once)
  *   GET  /*                  → static web build when PRONG_WEB_DIR is set (desktop app shell)
  */
 
@@ -49,7 +53,7 @@ export interface OpEvent {
   opId: string;
   label: string;
   /** broadcast notices that are not tied to an operation the client started */
-  event?: 'ui-updated' | 'queue';
+  event?: 'ui-updated' | 'queue' | 'app-restarting';
   /** `queue`: the repository and its action queue */
   repo?: string;
   items?: QueueItem[];
@@ -665,14 +669,19 @@ export function createApi(opts: { log?: (s: string) => void } = {}) {
       if (req.method === 'GET' && url.pathname === '/api/health') {
         const v = await runGit(['--version'], { cwd: homedir(), allowFail: true });
         // ui: 'static' when the engine serves the interface (desktop app), 'dev' behind a Metro dev server.
-        // engineStale: the sources' server/ is newer than this engine — the app must be rebuilt for it to run
+        // engineStale: the sources' server/ is newer than this engine — the app must be rebuilt for it to run.
+        // canRestart: this is the desktop app, which can build itself and restart into the build; newerBuild: a
+        // build of the sources newer than this run is there (macos/build.sh ran since): a restart runs it
+        const sources = expandHome(String(loadSettings().agent.sourcesPath ?? ''));
         return json(200, {
           ok: true,
           git: v.stdout.trim(),
           version: '0.1.0',
           ui: WEB_DIR ? 'static' : 'dev',
           uiBuild: WEB_DIR && currentUiBuild(WEB_DIR) ? 'agent' : 'factory',
-          engineStale: engineOlderThanSources(expandHome(String(loadSettings().agent.sourcesPath ?? ''))),
+          engineStale: engineOlderThanSources(sources),
+          canRestart: !!runningBundle() || !!process.env.PRONG_APP_BUILD_CMD,
+          newerBuild: newerBuildOnDisk(sources),
         });
       }
       if (req.method === 'GET' && url.pathname === '/api/events') {
@@ -757,6 +766,8 @@ export function createApi(opts: { log?: (s: string) => void } = {}) {
         serveFile(req, res, full, mimeOf(full), { 'content-security-policy': 'sandbox', 'x-content-type-options': 'nosniff' });
         return;
       }
+      // the chat the instance before this one handed over when it restarted into a new build: given back once
+      if (req.method === 'GET' && url.pathname === '/api/app/handoff') return json(200, takeHandoff());
       const body = req.method === 'POST' || req.method === 'PUT' || req.method === 'DELETE' ? await readJson(req) : {};
       if (req.method === 'PUT' && url.pathname === '/api/session') {
         // tabs and branch filters for the next launch: a plain object of bounded size
@@ -894,8 +905,31 @@ export function createApi(opts: { log?: (s: string) => void } = {}) {
           return json(200, { ok: true });
         }
         const sources = expandHome(String(body.sources ?? loadSettings().agent.sourcesPath ?? ''));
+        if (op === 'restart') {
+          // the chat goes over first: the window is gone a moment after this answer
+          saveHandoff(body.handoff);
+          const bundle = runningBundle();
+          if (!bundle) {
+            // a dev run (or the tests): nothing to quit here, the page reloads into whatever serves it
+            emit({ opId: 'app', label: 'Restarting Prong', event: 'app-restarting', done: true });
+            return json(200, { ok: true, restarting: false });
+          }
+          const shell = shellPid(bundle);
+          if (!shell) throw new HttpError(409, 'This engine was not started by the Prong window: quit Prong and open it again');
+          const target = sources && existsSync(builtBundle(sources)) ? builtBundle(sources) : bundle;
+          // what has to finish first (a pull, an LFS download): the restart waits for it, the page says so
+          const waitingFor = Object.values(allQueues()).flatMap((items) => items.filter((i) => i.state === 'running').map((i) => i.label));
+          emit({ opId: 'app', label: 'Restarting Prong', event: 'app-restarting', done: true });
+          scheduleRestart(target, shell, () => running.size === 0);
+          return json(200, { ok: true, restarting: true, target, waiting: running.size, waitingFor });
+        }
         if (!sources) throw new HttpError(400, 'No app sources folder configured');
         const app = new AppSources(sources);
+        if (op === 'build') {
+          // the agent built it itself (or nothing changed since): only the restart is left
+          if (body.ifNeeded && !buildOutdated(sources)) return json(200, { opId: null, skipped: 'the build is up to date' });
+          return json(200, longOp('Building Prong', (p, signal) => buildApp(sources, (l) => p(l, null), signal)));
+        }
         if (op === 'prepare') return json(200, { before: await app.prepare() });
         if (op === 'record') return json(200, await app.record(String(body.message ?? 'agent change'), body.before ?? {}));
         if (op === 'revert') return json(200, { sha: await app.revert(String(body.sha)) });

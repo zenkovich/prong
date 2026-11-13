@@ -1,8 +1,8 @@
 #!/bin/sh
 # Stand-in for the Claude Code CLI in tests: prints the stream-json events Prong reads, costs nothing.
 # The prompt (after -p) steers it: "slow task" waits 30 s (for the stop button), "fake-fail" exits with an error,
-# "edit-ui" edits the app sources (src/Toolbar.tsx; "edit-sidebar": src/Sidebar.tsx), "markdown-demo" answers with
-# every kind of Markdown the chat draws,
+# "edit-ui" edits the app sources (src/Toolbar.tsx; "edit-sidebar": src/Sidebar.tsx; "edit-engine": server/src/engine.ts),
+# "markdown-demo" answers with every kind of Markdown the chat draws,
 # "retarget-app" answers the marker that sends a request to Prong's sources (unless it already runs there).
 # With PRONG_FAKE_AGENT_LOG set, the prompt, the working folder and the options it got are appended there.
 if [ "$1" = "--version" ]; then echo "9.9.9 (Claude Code)"; exit 0; fi
@@ -11,16 +11,21 @@ resume=""
 system=""
 model=""
 apply="no"
+full="no"
+adddir=""
 while [ $# -gt 0 ]; do
   if [ "$1" = "-p" ]; then prompt="$2"; shift; fi
   if [ "$1" = "--resume" ]; then resume="$2"; shift; fi
   if [ "$1" = "--append-system-prompt" ]; then system="$2"; shift; fi
   if [ "$1" = "--model" ]; then model="$2"; shift; fi
+  if [ "$1" = "--add-dir" ]; then adddir="$2"; shift; fi
   if [ "$1" = "--permission-mode" ]; then [ "$2" = "acceptEdits" ] && apply="yes"; shift; fi
+  # full access: nothing is asked, edits included
+  if [ "$1" = "--dangerously-skip-permissions" ]; then apply="yes"; full="yes"; fi
   shift
 done
 if [ -n "$PRONG_FAKE_AGENT_LOG" ]; then
-  printf 'cwd: %s\nresume: %s\napply: %s\nmodel: %s\nssh: %s\nsystem: %s\n%s\n---\n' "$(pwd)" "$resume" "$apply" "$model" "$GIT_SSH_COMMAND" "$system" "$prompt" >> "$PRONG_FAKE_AGENT_LOG"
+  printf 'cwd: %s\nresume: %s\napply: %s\nfull: %s\nadddir: %s\nmodel: %s\nssh: %s\nsystem: %s\n%s\n---\n' "$(pwd)" "$resume" "$apply" "$full" "$adddir" "$model" "$GIT_SSH_COMMAND" "$system" "$prompt" >> "$PRONG_FAKE_AGENT_LOG"
 fi
 echo '{"type":"system","subtype":"init","session_id":"fake-session","model":"fake-model"}'
 sleep 0.3
@@ -53,6 +58,11 @@ case "$prompt" in
     # an interface change in the app sources (the working directory)
     echo '{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Edit","input":{"file_path":"src/Toolbar.tsx"}}]}}'
     echo "// edited by fake agent: $(echo "$prompt" | head -1)" >> src/Toolbar.tsx ;;
+  *edit-engine*)
+    # a change to the git engine (server/): Prong builds the whole app and restarts into it
+    echo '{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Edit","input":{"file_path":"server/src/engine.ts"}}]}}'
+    mkdir -p server/src
+    echo "// engine edited by fake agent: $(echo "$prompt" | head -1)" >> server/src/engine.ts ;;
   *edit-sidebar*)
     echo '{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Edit","input":{"file_path":"src/Sidebar.tsx"}}]}}'
     echo "// edited by fake agent: $(echo "$prompt" | head -1)" >> src/Sidebar.tsx ;;

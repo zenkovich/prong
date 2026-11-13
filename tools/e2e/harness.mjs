@@ -265,7 +265,7 @@ let port = 0;
 const agentLog = path.join(tmp, 'agent-prompts.log');
 async function spawnEngine(p) {
   const child = spawn(process.execPath, [ENGINE], {
-    env: { ...process.env, PRONG_TEST_MODE: '1', PRONG_FAKE_AGENT_LOG: agentLog, PRONG_PORT: String(p), PRONG_STATE_DIR: state, PRONG_SSH_DIR: sshKeys, GIT_CONFIG_GLOBAL: gitGlobal, PRONG_WEB_DIR: WEB, PRONG_SOURCES_DEFAULT: '', PRONG_UI_BUILD_CMD: `sh ${JSON.stringify(path.join(ROOT, 'tools/fake-ui-build.sh'))} {out}` },
+    env: { ...process.env, PRONG_TEST_MODE: '1', PRONG_FAKE_AGENT_LOG: agentLog, PRONG_PORT: String(p), PRONG_STATE_DIR: state, PRONG_SSH_DIR: sshKeys, GIT_CONFIG_GLOBAL: gitGlobal, PRONG_WEB_DIR: WEB, PRONG_SOURCES_DEFAULT: '', PRONG_UI_BUILD_CMD: `sh ${JSON.stringify(path.join(ROOT, 'tools/fake-ui-build.sh'))} {out}`, PRONG_APP_BUILD_CMD: `sh ${JSON.stringify(path.join(ROOT, 'tools/fake-app-build.sh'))}` },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   const ok = await new Promise((resolve) => {

@@ -25,7 +25,7 @@ export const client = new HttpGitClient();
  * compiled into Prong.app. A change under server/ (discard, status, push…) therefore does nothing until the app is
  * built again — said in these words wherever it matters, so a working fix never looks ignored.
  */
-export const ENGINE_REBUILD = 'Prong rebuilds its interface itself, but the git engine is the copy compiled into the app: run macos/build.sh in the sources and start Prong again for changes under server/ to take effect.';
+export const ENGINE_REBUILD = 'The git engine is the copy compiled into Prong.app: a change under server/ runs once the app is rebuilt and restarted. After the agent’s own changes Prong does that by itself; otherwise press Rebuild and restart in Settings → Agent.';
 
 let unsubscribe: (() => void) | null = null;
 const opLog = new Map<string, string[]>();
@@ -33,9 +33,16 @@ const opLog = new Map<string, string[]>();
 export async function bootstrap() {
   try {
     const h = await client.health();
-    setState({ engine: { online: !!h.ok, git: h.git ?? '', version: h.version ?? '', ui: h.ui, uiBuild: h.uiBuild, stale: h.engineStale } });
+    setState({ engine: { online: !!h.ok, git: h.git ?? '', version: h.version ?? '', ui: h.ui, uiBuild: h.uiBuild, stale: h.engineStale, canRestart: !!h.canRestart } });
     // the engine inside the app is older than the sources: the agent's fixes to git's side are not running yet
     if (h.engineStale) toast('The engine is older than the sources', 'info', ENGINE_REBUILD);
+    // Prong has just restarted into a new build of itself: the chat the instance before handed over comes back
+    // (said last: the status line shows the newest toast)
+    const handed = await client.appHandoff().catch(() => null);
+    if (handed?.agent) {
+      applyAgentSession(handed);
+      if (handed.restarted) toast('Prong restarted', 'info', 'Running the new build: the git engine, the window and the interface.');
+    }
     const known = await client.listRepos();
     setState((s) => {
       const existing = new Set(s.repos.map((r) => r.path));
@@ -87,6 +94,8 @@ export const handleEventForTest = (e: OpEvent) => onEvent(e);
 
 function onEvent(e: OpEvent) {
   if (e.event === 'ui-updated') return onUiUpdated();
+  if (e.event === 'app-restarting') return;
+  if (appBuildOp && e.opId === appBuildOp.opId) return onAppBuildEvent(e);
   if (e.event === 'queue') return onQueue(e.repo, e.items ?? []);
   if (rebuildOp && e.opId === rebuildOp.opId) return onRebuildEvent(e);
   if (handleExplainEvent(e)) return;
@@ -2754,7 +2763,15 @@ async function applyAppChange(msgId: number, prompt: string, cwd: string, before
     finishAgentRun(msgId, { ok: false, error: `Could not record the version: ${msg}` });
     return;
   }
+  // the desktop app builds itself: what it says now (the agent may have run macos/build.sh, an engine may be stale)
+  const canRestart = getState().engine.ui === 'static' && !!getState().engine.canRestart;
+  const health = canRestart ? await client.health().catch(() => null) : null;
   if (!v) {
+    // asked to rebuild or restart Prong, the agent built it without editing anything: the restart is what is left
+    if (health?.newerBuild) {
+      await rebuildApp(msgId, null);
+      return;
+    }
     patchAgentMessage(msgId, (m) => ({ ...m, actions: [...(m.actions ?? []), 'no source changes'] }));
     finishAgentRun(msgId, { ok: true, noChanges: true });
     return;
@@ -2762,6 +2779,13 @@ async function applyAppChange(msgId: number, prompt: string, cwd: string, before
   await loadAppVersions();
   const version = getState().agent.versions.find((x) => x.sha === v!.sha);
   patchAgentMessage(msgId, (m) => ({ ...m, versionId: version?.id, actions: [...(m.actions ?? []), `version v${version?.n ?? '?'} · ${v!.files.join(', ')}`] }));
+  // the engine or the window changed (now or before, unbuilt), or the agent built the app: the whole app is built
+  // (unless the agent's build is newer than the sources) and Prong restarts into it, the chat kept
+  const appChange = v.files.some((f) => /^(server|macos)\//.test(f));
+  if (canRestart && (appChange || health?.newerBuild || health?.engineStale)) {
+    await rebuildApp(msgId, v.sha);
+    return;
+  }
   // a change to the engine: the rebuild below only makes the interface, so the app has to be built again for it
   if (v.files.some((f) => f.startsWith('server/')) && getState().engine.ui === 'static') {
     patchAgentMessage(msgId, (m) => ({ ...m, actions: [...(m.actions ?? []), '⚠ engine change: rebuild the app to run it'] }));
@@ -2825,6 +2849,88 @@ function onUiUpdated() {
   if (Platform.OS === 'web' && typeof location !== 'undefined') setTimeout(() => location.reload(), 150);
 }
 
+/** the build of the whole app after a change to the engine or the window; Prong restarts into it once it is done */
+let appBuildOp: { opId: string; msgId: number | null; versionSha: string | null; cwd: string } | null = null;
+
+/**
+ * Prong builds itself (macos/build.sh in the sources: the engine, the window and the interface) and restarts into
+ * the build, the agent chat handed over. After an agent run its message shows the build's steps and ends the run;
+ * from Settings (msgId null) the operation panel does. A build already newer than the sources is not made again.
+ */
+export async function rebuildApp(msgId: number | null = null, versionSha: string | null = null) {
+  const cwd = getState().agent.settings.sourcesPath;
+  if (!cwd || !engineOnline() || appBuildOp) {
+    // a build already under way (from Settings) restarts Prong anyway: the run itself is over
+    if (msgId) finishAgentRun(msgId, { ok: true });
+    return;
+  }
+  setState((s) => ({ engine: { ...s.engine, rebuilding: true } }));
+  if (msgId) updateAgent({ status: 'Building Prong.app…' });
+  const op = await client.appBuild(cwd, true).catch((e) => ({ opId: null as string | null, skipped: undefined as string | undefined, error: String(e?.message ?? e) }));
+  if ('error' in op && op.error) return appBuildFailed(msgId, versionSha, cwd, op.error);
+  // the agent built it itself: only the restart is left
+  if (!op.opId) return restartApp(msgId, false);
+  appBuildOp = { opId: op.opId, msgId, versionSha, cwd };
+  if (!msgId) setState({ operation: { label: 'Building Prong', progress: 0, log: [] } });
+}
+
+/** the build's steps ("▸ web build") in the run's status or the operation panel; then the restart or the failure */
+function onAppBuildEvent(e: OpEvent) {
+  const b = appBuildOp!;
+  if (e.line) {
+    const step = /^▸\s*(.+)/.exec(e.line)?.[1];
+    if (b.msgId && step) updateAgent({ status: `Building Prong.app: ${step}` });
+    if (!b.msgId) setState((s) => (s.operation ? { operation: { ...s.operation, log: [...s.operation.log, e.line!].slice(-200) } } : {}));
+  }
+  if (!e.done) return;
+  appBuildOp = null;
+  if (!b.msgId) setState({ operation: null });
+  if (e.error) void appBuildFailed(b.msgId, b.versionSha, b.cwd, e.error);
+  else void restartApp(b.msgId, true);
+}
+
+/** a build that failed leaves the running Prong as it was; the change that broke it is rolled back if so set */
+async function appBuildFailed(msgId: number | null, versionSha: string | null, cwd: string, error: string) {
+  setState((s) => ({ engine: { ...s.engine, rebuilding: false } }));
+  const stopped = error === 'Stopped';
+  let text = stopped ? 'Prong.app build stopped' : `⚠ Prong.app build failed: ${error.replace(/^Prong\.app build failed:\s*/, '').split('\n').filter((l) => l.trim() && !/^▸/.test(l)).slice(-2).join(' · ')}`;
+  if (!stopped && getState().agent.settings.autoRollbackOnBuildError && versionSha) {
+    const back = await client.appRevert(cwd, versionSha).catch(() => null);
+    await loadAppVersions();
+    if (back) text += ' · the change was rolled back';
+  }
+  if (msgId) {
+    patchAgentMessage(msgId, (m) => ({ ...m, actions: [...(m.actions ?? []), text] }));
+    finishAgentRun(msgId, { ok: false, error: stopped ? 'Stopped' : 'Prong.app build failed' });
+  } else if (!stopped) toast('Prong.app build failed', 'error', error);
+}
+
+/** Prong quits and opens the new build (the engine does both); the chat goes over to the next instance */
+export async function restartApp(msgId: number | null = null, built = true) {
+  const cwd = getState().agent.settings.sourcesPath;
+  if (msgId) {
+    patchAgentMessage(msgId, (m) => ({ ...m, actions: [...(m.actions ?? []), built ? 'Prong.app rebuilt · restarting into it' : 'Prong.app built by the agent · restarting into it'] }));
+    finishAgentRun(msgId, { ok: true, title: 'Prong rebuilt' });
+  }
+  const data = { ...sessionData(), restarted: true };
+  persistSession();
+  // the panel of a pull or a download that is still running stays: the restart waits for it
+  if (!runningOpId) setState({ operation: { label: 'Restarting Prong', progress: 1, log: [] } });
+  try {
+    const r = await client.appRestart(cwd, data);
+    if (r.restarting) {
+      if (r.waiting) toast('Prong restarts when the work in progress is done', 'info', r.waitingFor?.length ? `Waiting for: ${r.waitingFor.join(', ')}` : `${r.waiting} operation(s) still running`);
+      return;
+    }
+    // a dev run: no app to quit; the next start (or a reload) brings the chat back
+    setState((s) => ({ operation: null, engine: { ...s.engine, rebuilding: false } }));
+    toast('Prong.app built', 'info', 'This Prong is not the app itself (a dev run): start it again to run the new build.');
+  } catch (e: any) {
+    setState((s) => ({ operation: null, engine: { ...s.engine, rebuilding: false } }));
+    toast('Could not restart Prong', 'error', String(e?.message ?? e));
+  }
+}
+
 /** Agent versions come from the sources' log in the engine (they survive reloads and restarts). */
 export async function loadAppVersions() {
   const src = getState().agent.settings.sourcesPath;
@@ -2871,14 +2977,18 @@ const SESSION_FRESH_MS = 60_000;
 let savedSession: SavedSession | null = null;
 
 /** Before an interface reload: the agent chat (local) and the durable session (engine), at once. */
+/** the agent chat as it goes over a reload or a restart */
+function sessionData() {
+  const s = getState();
+  return {
+    at: Date.now(),
+    // the panel comes back as it was: open, on the same tab (a revert from Changes reloads the window), as wide
+    agent: { messages: s.agent.messages.slice(-200), notices: s.agent.notices, target: s.agent.target, open: s.agent.open, session: s.agent.session, tab: s.agent.tab, width: s.agent.width },
+  };
+}
 export function persistSession() {
   try {
-    const s = getState();
-    const data = {
-      at: Date.now(),
-      // the panel comes back as it was: open, on the same tab (a revert from Changes reloads the window), as wide
-      agent: { messages: s.agent.messages.slice(-200), notices: s.agent.notices, target: s.agent.target, open: s.agent.open, session: s.agent.session, tab: s.agent.tab, width: s.agent.width },
-    };
+    const data = sessionData();
     if (typeof localStorage !== 'undefined') localStorage.setItem(SESSION_KEY, JSON.stringify(data));
   } catch {
     /* storage unavailable */
@@ -2897,7 +3007,9 @@ function readSession(): any | null {
 /** At startup, before the engine answers: the agent chat and its notices come back right away. */
 export function restoreAgentSession() {
   const data = readSession();
-  if (!data?.agent) return;
+  if (data?.agent) applyAgentSession(data);
+}
+function applyAgentSession(data: any) {
   const messages: AgentMessage[] = data.agent.messages ?? [];
   agentMsgId = Math.max(agentMsgId, ...messages.map((m) => m.id - 100000).filter((n) => n > 0));
   const tab = ['chat', 'changes', 'settings'].includes(data.agent.tab) ? data.agent.tab : 'chat';

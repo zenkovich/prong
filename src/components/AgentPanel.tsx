@@ -206,7 +206,7 @@ export function Attachments({ items, onRemove, size = 56 }: { items: AgentAttach
 }
 
 /** a step of the run (a tool it used), as opposed to its outcome lines (cost, version, warnings) */
-const isStep = (a: string) => !/^(cost \$|done$|version v|no source changes|⚠|· )/.test(a);
+const isStep = (a: string) => !/^(cost \$|done$|version v|no source changes|Prong\.app |⚠|· )/.test(a);
 
 /**
  * One chat message: who and where, the text as Markdown, then what the agent did — the last steps live while it
@@ -543,6 +543,10 @@ function Settings() {
         <Button small label="Reveal folder" icon="folder" disabled={!engine.online || !s.sourcesPath} onPress={() => live.revealPath(s.sourcesPath)} testID="agent-sources-reveal" />
         <Button small label="Open as repository" icon="branch" disabled={!engine.online || !s.sourcesPath} onPress={() => void live.openPath(s.sourcesPath)} testID="agent-sources-open" />
         <Button small label="Open in editor" icon="edit" disabled={!engine.online || !s.sourcesPath} onPress={() => live.openInEditor(s.sourcesPath)} testID="agent-sources-editor" />
+        {/* the whole app from these sources (macos/build.sh), then Prong restarts into it: the chat stays */}
+        {engine.canRestart && (
+          <Button small label={engine.rebuilding ? 'Rebuilding…' : 'Rebuild and restart'} icon="refresh" disabled={!engine.online || !s.sourcesPath || !!engine.rebuilding} onPress={() => void live.rebuildApp()} testID="agent-rebuild-app" />
+        )}
       </View>
       {/* the interface is rebuilt after every version, the git engine is not: it is the copy compiled into the app */}
       {engine.stale && (

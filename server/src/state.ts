@@ -42,6 +42,8 @@ export interface Settings {
     sourcesPath: string;
     askBeforeApply: boolean;
     autoRollbackOnBuildError: boolean;
+    /** no limits: the agent runs any command without asking (tests, builds, installs); off: git and file tools only */
+    fullAccess: boolean;
   };
   githubClientId: string;
   /** the language the AI writes in for the user (error explanations): an English language name, or 'auto' (the system's) */
@@ -84,7 +86,7 @@ export const DEFAULT_SETTINGS: Settings = {
   pullMode: 'rebase',
   autoUpdateSubmodules: true,
   signCommits: false,
-  agent: { provider: 'anthropic-claude-code', model: '', cliPath: '', sourcesPath: '', askBeforeApply: false, autoRollbackOnBuildError: true },
+  agent: { provider: 'anthropic-claude-code', model: '', cliPath: '', sourcesPath: '', askBeforeApply: false, autoRollbackOnBuildError: true, fullAccess: true },
   githubClientId: '',
   language: 'auto',
   explainErrors: true,

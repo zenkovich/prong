@@ -1,5 +1,5 @@
 import React, { useEffect, useRef, useState } from 'react';
-import { Platform, ScrollView, StyleSheet, TextInput, View } from 'react-native';
+import { Image, Platform, ScrollView, StyleSheet, TextInput, View } from 'react-native';
 import { elapsed, summarize } from '../agent/status';
 import { AgentTarget } from '../agent/types';
 import { agentSend, agentStop, dismissAgentNotice, openAgentChat, setAgentTarget, setVersionStatus, toggleAgent, toggleAgentBar, useStore } from '../state/store';
@@ -7,6 +7,8 @@ import { FONT, TABS_H, useTheme } from '../theme';
 import { Icon } from '../ui/Icon';
 import { Glass, PressScale, Spinner, Txt } from '../ui/primitives';
 import { Markdown } from './Markdown';
+import * as live from '../state/live';
+import { useFileTarget } from '../ui/fileDrop';
 
 /**
  * The agent lives in the tab bar as one line:
@@ -42,11 +44,16 @@ export function AgentBar() {
       input.current?.focus();
     }, 30);
   }, [agent.bar, agent.busy]);
+  const ready = agent.attachments.some((x) => x.state === 'ready');
+  const uploading = agent.attachments.some((x) => x.state === 'uploading');
+  const canSend = (!!text.trim() || ready) && !uploading && !agent.busy;
   const send = () => {
-    if (!text.trim() || agent.busy) return;
+    if (!canSend) return;
     agentSend(text);
     setText('');
   };
+  // a picture pasted into the line or dropped on it goes with the message, as in the full chat
+  const { box: dropBox, over: dragging } = useFileTarget(live.attachAgentFiles, agent.bar && !agent.busy);
 
   if (agent.busy)
     return (
@@ -87,7 +94,7 @@ export function AgentBar() {
     );
 
   return (
-    <View testID="agent-bar" style={[styles.line, { borderColor: t.accent, backgroundColor: t.bg, width: 460 }]}>
+    <View ref={dropBox} testID="agent-bar" style={[styles.line, { borderColor: t.accent, backgroundColor: dragging ? t.accentSoft : t.bg, width: 460 }]}>
       <Icon name="agent" size={13} color={t.accent} />
       <PressScale onPress={() => setAgentTarget(NEXT[agent.target])} scaleTo={0.95} style={[styles.target, { borderColor: t.borderStrong }]} hoverStyle={{ borderColor: t.accent }} label="Where the request runs: auto, repository or Prong's own interface (click to change)" testID="agent-target">
         <Txt label size={9.5} color={agent.target === 'auto' ? t.textMuted : t.accent}>
@@ -105,8 +112,29 @@ export function AgentBar() {
         testID="agent-input"
         style={{ flex: 1, minWidth: 0, color: t.text, fontFamily: t.fontFor('400'), fontSize: FONT.sm, paddingVertical: 0, ...({ outlineStyle: 'none' } as any) }}
       />
-      <PressScale onPress={send} disabled={!text.trim()} scaleTo={0.9} style={styles.icon} hoverStyle={{ backgroundColor: t.hover }} label="Send (↵)" testID="agent-send">
-        <Icon name="send" size={12} color={text.trim() ? t.accent : t.textFaint} />
+      {/* what goes with the message: small pictures (a click opens the chat, where they can be taken off) */}
+      {agent.attachments.length > 0 && (
+        <PressScale onPress={() => toggleAgent(true)} scaleTo={0.95} style={{ flexDirection: 'row', alignItems: 'center', marginRight: 4 }} label={`${agent.attachments.length} attached: open the chat to see them`} testID="agent-bar-attachments">
+          {agent.attachments.slice(0, 3).map((a) =>
+            a.mime.startsWith('image/') && a.url ? (
+              <Image key={a.id} source={{ uri: a.url }} style={{ width: 18, height: 18, marginLeft: 2, opacity: a.state === 'ready' ? 1 : 0.5, borderWidth: 1, borderColor: a.state === 'failed' ? t.del : t.borderStrong }} />
+            ) : (
+              <View key={a.id} style={{ width: 18, height: 18, marginLeft: 2, borderWidth: 1, borderColor: a.state === 'failed' ? t.del : t.borderStrong, alignItems: 'center', justifyContent: 'center' }}>
+                <Txt size={8} faint>
+                  {(a.name.split('.').pop() ?? '').slice(0, 3)}
+                </Txt>
+              </View>
+            ),
+          )}
+          {agent.attachments.length > 3 && (
+            <Txt size={FONT.xs} faint style={{ marginLeft: 3 }}>
+              +{agent.attachments.length - 3}
+            </Txt>
+          )}
+        </PressScale>
+      )}
+      <PressScale onPress={send} disabled={!canSend} scaleTo={0.9} style={styles.icon} hoverStyle={{ backgroundColor: t.hover }} label="Send (↵)" testID="agent-send">
+        <Icon name="send" size={12} color={canSend ? t.accent : t.textFaint} />
       </PressScale>
       <PressScale onPress={() => toggleAgent(true)} scaleTo={0.9} style={styles.icon} hoverStyle={{ backgroundColor: t.hover }} label="Open the full agent window (⌘⇧J)" testID="agent-expand">
         <Icon name="expand" size={12} />

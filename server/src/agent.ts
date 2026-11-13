@@ -14,12 +14,19 @@ export interface AgentRunOptions {
   cliPath?: string;
   /** edits are auto-accepted inside cwd; when false the agent only plans */
   apply?: boolean;
+  /**
+   * no limits: any command, any tool, nothing asked (Claude Code's --dangerously-skip-permissions), so the agent
+   * runs the tests, builds and installs a task needs by itself. Off: git and the file tools only.
+   */
+  full?: boolean;
   /** a Claude Code session to continue (the previous answer in the same chat, same folder) */
   resume?: string;
   /** extra environment: the repository's connection (SSH key, account) for the git commands the agent runs */
   env?: Record<string, string>;
   /** that connection in words ("SSH key plrx"), for the agent to know what git signs in with */
   connection?: string;
+  /** a folder outside the working directory the agent may read (the message's attached files) */
+  addDir?: string;
   onEvent: (e: { type: 'text' | 'tool' | 'status'; text: string }) => void;
   /** aborting stops the Claude Code process */
   signal?: AbortSignal;
@@ -41,19 +48,29 @@ const FORMAT = `Format the reply as Markdown for a narrow chat panel: first one 
 const connectionNote = (describe: string) =>
   `Prong's connection for this repository (and its submodules): ${describe}. It is already in the environment of every git command you run (GIT_SSH_COMMAND for an SSH key, a credential helper for an account), so fetch, pull, push, ls-remote and submodule update sign in with it; do not pass other keys. Check the connection with \`git ls-remote <remote> HEAD\`: plain \`ssh\` does not use it.`;
 const SYSTEM_REPO = `You are the agent inside Prong, a git client. The working directory is the user's repository. Execute the user's request with git and shell commands; git's network commands already use the connection (SSH key or account) set for this repository in Prong. Prefer safe, reversible commands; never force-push or rewrite shared history unless explicitly asked. Reply in the user's language with what you did (commands run, resulting branch/commit). ${FORMAT} ${TO_APP}`;
-const SYSTEM_APP = `You are the agent inside Prong, a git client that ships its own sources. The working directory is the app's source tree (Expo / React Native, TypeScript): src/components (Toolbar with the tab bar and its global buttons, Sidebar, CommitList, DiffView, dialogs), src/screens (Welcome = the home screen, Repository), src/state/store.ts (state and defaults), src/theme (visual system). Implement the user's request by editing the sources; keep the existing visual system and conventions. After editing, run "npx tsc --noEmit" and fix type errors. Prong commits your edits as a version and rebuilds its interface itself: do not commit, build or start anything. Reply in the user's language: which files changed and what to expect in the UI. ${FORMAT} ${TO_REPO}`;
+/** with full access the agent checks its own work: nothing is left for the user to run */
+const SELF_CHECK_REPO = `You have full access: run whatever the task needs (builds, tests, package installs, scripts) yourself instead of handing commands to the user; only ask when a decision is the user's.`;
+const SYSTEM_APP = `You are the agent inside Prong, a git client that ships its own sources. The working directory is the app's source tree (Expo / React Native, TypeScript): src/components (Toolbar with the tab bar and its global buttons, Sidebar, CommitList, DiffView, dialogs), src/screens (Welcome = the home screen, Repository), src/state/store.ts (state and defaults), src/theme (visual system), server/src (the git engine). Implement the user's request by editing the sources; keep the existing visual system and conventions. After editing, run "npx tsc --noEmit" and fix type errors. Prong commits your edits as a version and rebuilds itself after your answer: the interface after any change; after a change under server/ (the git engine) or macos/ (the window) the whole app, with macos/build.sh, and it restarts into the new build, this chat kept. So do not commit, do not quit or start Prong, and never ask the user to rebuild or restart it. Reply in the user's language: which files changed and what to expect in the UI. ${FORMAT} ${TO_REPO}`;
+const SELF_CHECK_APP = `You have full access: check your work yourself, do not leave commands for the user. Typecheck the app and the engine ("npx tsc --noEmit" here and in server/), run the tests your change touches ("npm run test:affected", or the unit tests, "npm run server:test" for the engine, and the e2e suites of the area) and fix what fails before you answer. You may run macos/build.sh to check that the whole app builds: it swaps the bundle only at its end and leaves the running Prong alone, which restarts into that build after your answer (asked to rebuild or restart Prong, run it and say so). Still do not commit and do not quit, kill or open Prong yourself: it records your edits as a version and restarts itself afterwards.`;
 
 export async function runAgent(o: AgentRunOptions): Promise<{ ok: boolean; text: string; costUsd?: number; sessionId?: string }> {
   const check = await checkClaude(o.cliPath);
   if (!check.ok || !check.path) throw new Error('Claude Code CLI not found. Install it or set the path in Agent → Settings.');
-  const system = o.mode === 'app' ? SYSTEM_APP : o.connection ? `${SYSTEM_REPO} ${connectionNote(o.connection)}` : SYSTEM_REPO;
+  // full access (and not "plan only"): no limits at all, the agent runs what the task needs
+  const full = !!o.full && o.apply !== false;
+  const base = o.mode === 'app' ? (full ? `${SYSTEM_APP} ${SELF_CHECK_APP}` : SYSTEM_APP) : full ? `${SYSTEM_REPO} ${SELF_CHECK_REPO}` : SYSTEM_REPO;
+  const system = o.mode !== 'app' && o.connection ? `${base} ${connectionNote(o.connection)}` : base;
   const args = ['-p', o.prompt, '--output-format', 'stream-json', '--verbose', '--append-system-prompt', system];
   if (o.resume && /^[\w-]{8,64}$/.test(o.resume)) args.push('--resume', o.resume);
   if (o.model) args.push('--model', o.model);
-  if (o.apply !== false) args.push('--permission-mode', 'acceptEdits');
-  // tools: git, the usual file tools and a few read-only looks (folders, whether SSH gets in); everything else
-  // needs the user's terminal
-  args.push('--allowedTools', o.mode === 'app' ? 'Bash(npx tsc *),Bash(npm test*),Bash(git *),Read,Edit,Write,Glob,Grep' : 'Bash(git *),Bash(ls *),Bash(ssh-add -l*),Read,Glob,Grep');
+  if (o.addDir) args.push('--add-dir', o.addDir);
+  if (full) args.push('--dangerously-skip-permissions');
+  else {
+    if (o.apply !== false) args.push('--permission-mode', 'acceptEdits');
+    // limited: git, the usual file tools and a few read-only looks (folders, whether SSH gets in); everything else
+    // needs the user's terminal
+    args.push('--allowedTools', o.mode === 'app' ? 'Bash(npx tsc *),Bash(npm test*),Bash(git *),Read,Edit,Write,Glob,Grep' : 'Bash(git *),Bash(ls *),Bash(ssh-add -l*),Read,Glob,Grep');
+  }
   return streamClaude(check.path, args, o);
 }
 

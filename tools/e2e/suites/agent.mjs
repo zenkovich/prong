@@ -13,7 +13,7 @@
  */
 import path from 'node:path';
 import { existsSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
-import { ROOT, base, page, check, expect, waitText, until, git, root, tmp, appSources, agentLog, freshRepo, finish, pageErrors, statusHas } from '../harness.mjs';
+import { ROOT, base, page, check, expect, waitText, until, git, root, tmp, state, appSources, agentLog, freshRepo, finish, pageErrors, statusHas, post } from '../harness.mjs';
 
 const SHOTS = path.join(ROOT, '..', 'shots');
 mkdirSync(SHOTS, { recursive: true });
@@ -66,7 +66,7 @@ const entries = () =>
       const lines = e.split('\n');
       const field = (k) => lines.find((l) => l.startsWith(`${k}: `))?.slice(k.length + 2) ?? (lines.includes(`${k}:`) ? '' : '');
       const sys = lines.findIndex((l) => l.startsWith('system: '));
-      return { cwd: field('cwd'), resume: field('resume'), apply: field('apply'), model: field('model'), prompt: lines.slice(sys + 1).join('\n'), raw: e };
+      return { cwd: field('cwd'), resume: field('resume'), apply: field('apply'), full: field('full'), addDir: field('adddir'), model: field('model'), prompt: lines.slice(sys + 1).join('\n'), raw: e };
     });
 const clearLog = () => rmSync(agentLog, { force: true });
 const waitEntries = async (n, ms = 15000) => {
@@ -148,7 +148,7 @@ const barTarget = async () => (await tid('agent-target').innerText()).trim().toL
 /** the chat's target switch */
 const pickTarget = (v) => tid('agent-panel').getByLabel(v, { exact: true }).click();
 /** the chat's target, as its composer says it */
-const chatTarget = async () => ({ 'команда для репозитория или интерфейса': 'auto', 'что сделать в репозитории': 'repo', 'что изменить в интерфейсе': 'app' })[await composer().getAttribute('placeholder')] ?? null;
+const chatTarget = async () => ({ 'команда для репозитория или интерфейса': 'auto', 'что сделать в репозитории': 'repo', 'что изменить в интерфейсе': 'app' })[((await composer().getAttribute('placeholder')) ?? '').split(' · ')[0]] ?? null;
 /** opens a repository of this suite */
 async function openRepoTab(name) {
   if (await has(`tab-${name}`)) await tid(`tab-${name}`).click();
@@ -578,20 +578,75 @@ await step('chat: a link opens in a browser tab once, and Prong stays in its win
   expect(page.url().startsWith(base), 'still in Prong');
 });
 
-await step('chat: a suggestion fills the composer; the target switch shows the suggestions of that target', async () => {
+/** a file handed to the page as the user would: pasted into a field, or dropped on a box */
+const PNG_1PX = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==';
+async function pasteFile(testID, name, type, base64) {
+  await page.evaluate(([id, n, ty, b64]) => {
+    const el = document.querySelector(`[data-testid="${id}"]`);
+    el.focus();
+    const dt = new DataTransfer();
+    dt.items.add(new File([Uint8Array.from(atob(b64), (c) => c.charCodeAt(0))], n, { type: ty }));
+    el.dispatchEvent(new ClipboardEvent('paste', { clipboardData: dt, bubbles: true, cancelable: true }));
+  }, [testID, name, type, base64]);
+}
+async function dragFile(testID, name, type, text, events = ['dragenter', 'dragover', 'drop']) {
+  await page.evaluate(([id, n, ty, txt, evs]) => {
+    const el = document.querySelector(`[data-testid="${id}"]`);
+    const dt = new DataTransfer();
+    dt.items.add(new File([txt], n, { type: ty }));
+    for (const ev of evs) el.dispatchEvent(new DragEvent(ev, { dataTransfer: dt, bubbles: true, cancelable: true }));
+  }, [testID, name, type, text, events]);
+}
+const attachments = (scope = 'agent-chat') => page.locator(`[data-testid="${scope}"] [data-testid="agent-attachments"]`).last().locator('[data-testid="agent-attachment"]');
+
+await step('chat: no prompt suggestions; a tall input; a pasted screenshot and a dropped file are attached (no button for it), shown, taken off with ×, and go to the agent by path', async () => {
+  clearLog();
+  await openRepoTab('agent-work');
   await openPanel();
   await pickTarget('repo');
-  const repoChips = await page.evaluate(() => [...document.querySelectorAll('[data-testid="agent-suggestion"]')].map((e) => e.innerText));
-  expect(repoChips.length > 0 && repoChips.includes('создай ветку feature/agent-panel') && !repoChips.includes('скрой колонку автора'), 'repo suggestions: ' + repoChips.join(' | '));
-  await pickTarget('app');
-  const appChips = await page.evaluate(() => [...document.querySelectorAll('[data-testid="agent-suggestion"]')].map((e) => e.innerText));
-  expect(appChips.includes('скрой колонку автора') && !appChips.includes('создай ветку feature/agent-panel'), 'app suggestions: ' + appChips.join(' | '));
-  expect((await composer().getAttribute('placeholder')) === 'что изменить в интерфейсе', 'the composer says what it is for');
-  await tid('agent-suggestion').filter({ hasText: 'скрой колонку автора' }).click();
-  expect((await composer().inputValue()) === 'скрой колонку автора', 'the composer has it');
-  await composer().fill('');
-  await pickTarget('auto');
-  expect((await page.evaluate(() => document.querySelectorAll('[data-testid="agent-suggestion"]').length)) === repoChips.length + appChips.length, 'auto shows all');
+  expect(!(await has('agent-suggestion')), 'no suggestion chips');
+  expect((await composer().boundingBox()).height >= 100, 'the input shows several lines: ' + (await composer().boundingBox()).height);
+  expect(/вставить или перетащить/.test((await composer().getAttribute('placeholder')) ?? ''), 'it says files can be pasted or dropped');
+  // a screenshot pasted into the field
+  await pasteFile('agent-chat-input', 'shot.png', 'image/png', PNG_1PX);
+  await until(async () => (await attachments('agent-panel').count()) === 1, 'the picture is attached');
+  await page.waitForFunction(() => [...document.querySelectorAll('[data-testid="agent-attachment"] img')].some((i) => i.complete && i.naturalWidth > 0 && i.src.includes('/api/agent/attachment')), null, { timeout: 8000 });
+  // a file dragged over the chat: where it goes is shown; dropped, it is attached
+  await dragFile('agent-chat', 'notes.txt', 'text/plain', 'the notes', ['dragenter', 'dragover']);
+  await tid('agent-drop-zone').waitFor({ timeout: 3000 });
+  await dragFile('agent-chat', 'notes.txt', 'text/plain', 'the notes', ['drop']);
+  await waitGone('agent-drop-zone', 3000);
+  await until(async () => (await attachments('agent-panel').count()) === 2, 'the dropped file too');
+  // a third, taken off again
+  await pasteFile('agent-chat-input', 'extra.png', 'image/png', PNG_1PX);
+  await until(async () => (await attachments('agent-panel').count()) === 3, 'a third');
+  await tid('agent-attachment-remove').last().click();
+  await until(async () => (await attachments('agent-panel').count()) === 2, 'taken off with ×');
+  expect(!(await page.getByTestId('error-dialog').count()), 'the drop did not open the file as a repository');
+  // sent: the message shows them; the agent gets their paths, may read their folder, is told to open them
+  await composer().fill('что на скриншоте');
+  await page.waitForTimeout(300);
+  await composer().press('Enter');
+  await waitIdle();
+  const msg = page.locator('[data-testid="agent-msg-user"]').last();
+  expect((await msg.locator('[data-testid="agent-attachment"]').count()) === 2, 'the message carries both');
+  expect(!(await has('agent-attachment-remove')), 'the input is empty of them again (only drafts can be taken off)');
+  const [e] = await waitEntries(1);
+  const paths = [...e.prompt.matchAll(/^- (.+)$/gm)].map((m) => m[1]);
+  expect(e.prompt.startsWith('что на скриншоте') && /attached 2 files/.test(e.prompt) && /Read tool/.test(e.prompt), 'told to open them: ' + e.prompt.slice(0, 300));
+  expect(paths.length === 2 && paths.every((p) => p.startsWith(e.addDir) && existsSync(p)) && /agent-attachments$/.test(e.addDir), 'by path, in a folder it may read: ' + JSON.stringify({ paths, addDir: e.addDir }));
+  expect(readFileSync(paths.find((p) => p.endsWith('notes.txt')), 'utf8') === 'the notes', 'the dropped file as it was');
+  // the command line in the tab bar takes a pasted picture too
+  clearLog();
+  await openBar();
+  await pasteFile('agent-input', 'bar.png', 'image/png', PNG_1PX);
+  await tid('agent-bar-attachments').waitFor({ timeout: 5000 });
+  await page.waitForTimeout(500);
+  await tid('agent-input').fill('и это');
+  await tid('agent-input').press('Enter');
+  await waitIdle();
+  const [b] = await waitEntries(1);
+  expect(/attached a file/.test(b.prompt) && b.addDir.endsWith('agent-attachments'), 'from the bar too: ' + b.prompt.slice(0, 200));
 });
 
 await step('chat: Clear chat leaves the introduction and starts a new conversation; it waits while the agent works', async () => {
@@ -723,8 +778,30 @@ await step('settings: the model reaches Claude Code and Plan only keeps it from 
   await until(async () => (await settings()).agent.model === '' && (await settings()).agent.askBeforeApply === false, 'back to the default model, edits allowed');
   await runFromChat('git log with the default');
   const [a, b] = await waitEntries(2);
-  expect(a.model === 'opus' && a.apply === 'no', 'the model and plan-only reached Claude Code: ' + JSON.stringify({ model: a.model, apply: a.apply }));
+  expect(a.model === 'opus' && a.apply === 'no' && a.full === 'no', 'the model and plan-only reached Claude Code (plan only is never full access): ' + JSON.stringify({ model: a.model, apply: a.apply, full: a.full }));
   expect(b.model === '' && b.apply === 'yes', 'no --model, edits accepted: ' + JSON.stringify({ model: b.model, apply: b.apply }));
+});
+
+await step('settings: full access (on by default) lets the agent run anything without asking and tells it to check its own work; off, it is back to git and the file tools', async () => {
+  clearLog();
+  await openRepoTab('agent-work');
+  await openPanel();
+  await tab('settings');
+  await tid('agent-full-access').waitFor({ timeout: 3000 });
+  expect((await settings()).agent.fullAccess === true, 'on by default');
+  await runFromChat('git status with full access');
+  const [a] = await waitEntries(1);
+  expect(a.full === 'yes' && a.apply === 'yes' && /You have full access/.test(a.raw), 'no limits, and told to run what the task needs: ' + JSON.stringify({ full: a.full, apply: a.apply }));
+  await tab('settings');
+  await tid('agent-full-access').click();
+  await until(async () => (await settings()).agent.fullAccess === false, 'off saved');
+  clearLog();
+  await runFromChat('git status limited');
+  const [b] = await waitEntries(1);
+  expect(b.full === 'no' && b.apply === 'yes' && !/You have full access/.test(b.raw), 'limited again, edits still accepted: ' + JSON.stringify({ full: b.full, apply: b.apply }));
+  await tab('settings');
+  await tid('agent-full-access').click();
+  await until(async () => (await settings()).agent.fullAccess === true, 'on again');
 });
 
 await step('settings: a wrong binary: check says Claude Code is not found, the header says not connected, a request says so instead of running a demo agent; fixed and checked, requests go to Claude Code again', async () => {
@@ -1047,6 +1124,93 @@ await step('versions: with the rollback box off, a change that does not build st
     await tab('settings');
     await tid('agent-auto-rollback').click();
     await until(async () => (await settings()).agent.autoRollbackOnBuildError === true, 'the box back on');
+  }
+});
+
+// ---------- Prong rebuilding itself ----------
+
+await step('rebuild: an engine change builds Prong.app (its steps in the run’s status) and restarts into it with the chat handed over; a build that fails is rolled back and nothing restarts; Settings has Rebuild and restart', async () => {
+  const buildLog = path.join(state, 'app-builds.log');
+  const built = () => (existsSync(buildLog) ? readFileSync(buildLog, 'utf8').split('\n').filter(Boolean).length : 0);
+  /** what the page asked to restart with (the engine of the tests quits nothing) */
+  const restarts = [];
+  await page.route('**/api/app/restart', async (route) => {
+    restarts.push(route.request().postDataJSON());
+    await route.continue();
+  });
+  const bodyHas = (re) => page.evaluate((src) => new RegExp(src).test(document.body.innerText), re.source);
+  /** the status line shows `re` (it shows the newest toast); a timeout says what it showed instead */
+  const statusShows = async (re, ms = 15000) => {
+    try {
+      await page.waitForFunction((src) => {
+        const t = document.querySelector('[data-testid="status-bar"]')?.textContent ?? '';
+        (window.__statusSeen ??= new Set()).add(t);
+        return new RegExp(src).test(t);
+      }, re.source, { timeout: ms });
+    } catch {
+      throw new Error(`the status line never showed ${re}: ${JSON.stringify(await page.evaluate(() => [...(window.__statusSeen ?? [])]))}`);
+    }
+  };
+  try {
+    clearLog();
+    const count = (await versionsNow()).length;
+    const n0 = built();
+    await openPanel();
+    if ((await activeTab()) !== 'chat') await tab('chat');
+    await pickTarget('app');
+    // a change to the engine that does not build: the running Prong stays as it is, the change is taken back
+    await runFromChat('почини discard в движке edit-engine BREAK');
+    await until(async () => /Prong\.app build failed/.test(await lastAgent()), 'the failed build in the chat', 15000);
+    expect((await lastAgent()).includes('rolled back'), 'rolled back: ' + (await lastAgent()));
+    let v = await versionsNow();
+    expect(v.length === count + 1 && v[count].status === 'reverted', 'the version reverted: ' + JSON.stringify(v.map((x) => x.status)));
+    expect(restarts.length === 0 && built() === n0, 'no build made, no restart');
+    // the agent is told Prong rebuilds and restarts itself (it used to ask the user to run macos/build.sh)
+    const [e] = entries();
+    expect(/restarts into the new build/.test(e.raw) && /never ask the user to rebuild or restart it/.test(e.raw), 'the system prompt: ' + e.raw.slice(0, 400));
+    // one that builds: the build's steps in the status, then the restart, the chat handed over
+    await openPanel();
+    if ((await activeTab()) !== 'chat') await tab('chat');
+    await composer().fill('почини discard в движке edit-engine');
+    await composer().press('Enter');
+    await until(() => bodyHas(/Building Prong\.app/), 'the build in the status', 10000);
+    await until(async () => restarts.length === 1, 'the restart asked for', 15000);
+    expect(built() === n0 + 1, 'one build: ' + built());
+    const h = restarts[0].handoff;
+    expect(h?.restarted === true && h.agent?.messages?.some((m) => m.role === 'user' && m.text.includes('edit-engine')), 'the chat goes over: ' + JSON.stringify(h)?.slice(0, 200));
+    v = await versionsNow();
+    expect(v.length === count + 2 && v[count + 1].status === 'applied' && v[count + 1].files.some((f) => f.path === 'server/src/engine.ts'), 'the version recorded: ' + JSON.stringify(v.slice(-1)));
+    // the new instance: a page with nothing of its own kept, the chat comes from the engine
+    await page.evaluate(() => localStorage.removeItem('prong.session'));
+    expect(existsSync(path.join(state, 'handoff.json')), 'the engine keeps the chat for the next start');
+    await page.reload({ waitUntil: 'load' });
+    await statusShows(/Prong restarted · Running the new build/);
+    expect(!existsSync(path.join(state, 'handoff.json')), 'taken once');
+    await openPanel();
+    if ((await activeTab()) !== 'chat') await tab('chat');
+    const last = await lastAgent();
+    expect(/Prong\.app rebuilt · restarting into it/.test(last) && /version v\d+/.test(last), 'the run came back with its version: ' + last);
+    expect((await userMsgs()).some((m) => m.includes('edit-engine')), 'the request came back');
+    await shot('rebuild-restarted');
+    // by hand, from Settings: the same build and restart (here a dev run: it says so)
+    await tab('settings');
+    await tid('agent-rebuild-app').click();
+    await until(async () => restarts.length === 2, 'the second restart asked for', 15000);
+    expect(built() === n0 + 2, 'built again: ' + built());
+    await statusShows(/not the app itself/);
+  } finally {
+    await page.unroute('**/api/app/restart');
+    // the engine change taken back: the checks after this one see the engine as current
+    const v = await versionsNow();
+    const last = v[v.length - 1];
+    if (last?.status === 'applied' && last.files.some((f) => f.path.startsWith('server/'))) await post('/api/app/revert', { sources: appSources, sha: last.sha });
+    await until(async () => !(await (await fetch(base + '/api/health')).json()).engineStale, 'the engine is current again', 20000);
+    // the chat of the last restart comes back with this load (its target too): the target goes back to auto
+    await page.reload({ waitUntil: 'load' });
+    await page.waitForTimeout(1200);
+    await openPanel();
+    await tab('chat');
+    await pickTarget('auto');
   }
 });
 

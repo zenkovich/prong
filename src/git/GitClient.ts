@@ -23,7 +23,7 @@ export interface OpEvent {
   label: string;
   /** broadcast by the engine: `ui-updated` the interface build changed, windows reload; `queue` a repository's
    * action queue changed (`repo`, `items`) */
-  event?: 'ui-updated' | 'queue';
+  event?: 'ui-updated' | 'queue' | 'app-restarting';
   repo?: string;
   items?: QueueItem[];
   line?: string;
@@ -107,6 +107,10 @@ export interface EngineHealth {
   uiBuild?: 'factory' | 'agent';
   /** the sources' server/ is newer than the engine running now: it takes a rebuild of the app to run it */
   engineStale?: boolean;
+  /** the desktop app: it can build itself (macos/build.sh) and restart into the build */
+  canRestart?: boolean;
+  /** a build of the sources newer than this run is on disk (macos/build.sh ran since): a restart runs it */
+  newerBuild?: boolean;
 }
 export interface AppVersionInfo {
   sha: string;
@@ -210,6 +214,11 @@ export interface GitClient {
   /** the patch of one version */
   appDiff(sources: string, sha: string): Promise<{ diff: string }>;
   appRebuild(sources: string): Promise<{ opId: string | null; skipped?: string }>;
+  /** macos/build.sh in the sources (ifNeeded: not when the build is newer than the sources) */
+  appBuild(sources: string, ifNeeded?: boolean): Promise<{ opId: string | null; skipped?: string }>;
+  /** Prong quits and opens the new build; `handoff` comes back to the next instance (appHandoff) */
+  appRestart(sources: string, handoff: unknown): Promise<{ ok: boolean; restarting: boolean; waiting?: number; waitingFor?: string[] }>;
+  appHandoff(): Promise<any>;
   appFactory(): Promise<void>;
   listRepos(): Promise<KnownRepo[]>;
   openRepo(path: string, workspace: string): Promise<KnownRepo>;
@@ -462,6 +471,15 @@ export class HttpGitClient implements GitClient {
   }
   appRebuild(sources: string) {
     return this.post<{ opId: string | null; skipped?: string }>('/api/app/rebuild', { sources });
+  }
+  appBuild(sources: string, ifNeeded = false) {
+    return this.post<{ opId: string | null; skipped?: string }>('/api/app/build', { sources, ifNeeded });
+  }
+  appRestart(sources: string, handoff: unknown) {
+    return this.post<{ ok: boolean; restarting: boolean; waiting?: number; waitingFor?: string[] }>('/api/app/restart', { sources, handoff });
+  }
+  appHandoff() {
+    return this.get<any>('/api/app/handoff');
   }
   async appFactory() {
     await this.post('/api/app/factory', {});

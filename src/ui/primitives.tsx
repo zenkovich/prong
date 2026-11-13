@@ -418,9 +418,11 @@ export function Row({ children, selected, onPress, onDoublePress, onContextMenu,
 
 // ---------- inputs ----------
 
-export function Input({ value, onChange, placeholder, mono, multiline, style, autoFocus, onSubmit, icon, small, secure, slash, fill, testID, enterSends }: {
+export function Input({ value, onChange, placeholder, mono, multiline, style, autoFocus, onSubmit, icon, small, secure, slash, fill, testID, enterSends, inputMinHeight }: {
   /** a multiline field that takes the whole height of its box */
   fill?: boolean;
+  /** the text area's own height, for a field that should show several lines at once (the agent's) */
+  inputMinHeight?: number;
   /**
    * a chat composer: several lines, Enter runs `onSubmit` and the cursor stays in the field, Shift+Enter breaks the
    * line (a one-line field drops the line breaks of pasted text and loses the cursor after Enter)
@@ -484,7 +486,7 @@ export function Input({ value, onChange, placeholder, mono, multiline, style, au
         testID={testID}
         style={[
           // minWidth 0: an <input> is ~150px wide by itself and would stick out of a narrow box (the sidebar's filter)
-          { flex: 1, minWidth: 0, color: t.text, fontFamily: t.fontFor('400'), fontSize: small ? FONT.sm : FONT.md, paddingVertical: multiline || enterSends ? 4 : 0, minHeight: enterSends ? 40 : multiline ? (fill ? 24 : 64) : undefined },
+          { flex: 1, minWidth: 0, color: t.text, fontFamily: t.fontFor('400'), fontSize: small ? FONT.sm : FONT.md, paddingVertical: multiline || enterSends ? 4 : 0, minHeight: inputMinHeight ?? (enterSends ? 40 : multiline ? (fill ? 24 : 64) : undefined) },
           fill && { alignSelf: 'stretch' },
           Platform.OS === 'web' && ({ outlineStyle: 'none' } as any),
         ]}

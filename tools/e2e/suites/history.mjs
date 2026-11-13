@@ -322,6 +322,50 @@ await check('history: a click on a branch or tag label in a row selects that com
   await waitSelected('Edit notes', 3000);
 });
 
+await check('history: a right-click on a branch, remote or tag label opens that ref’s own menu, item for item the one of its row in the branch list — not the commit’s', async () => {
+  await ensureHist();
+  const items = () => page.locator('[data-testid="menu-item"]').allInnerTexts();
+  const open = async (loc) => {
+    await loc.scrollIntoViewIfNeeded();
+    await loc.click({ button: 'right' });
+    await page.locator('[data-testid="menu-item"]').first().waitFor({ timeout: 3000 });
+    return items();
+  };
+  const close = async () => {
+    await page.keyboard.press('Escape');
+    await page.waitForFunction(() => !document.querySelector('[data-testid="menu-item"]'), null, { timeout: 3000 });
+  };
+  // a local branch, a branch only on the remote (the pinned origin/main row on the left), a tag
+  for (const [subject, ref, listRow] of [
+    ['Topic two', 'topic', 'branch-topic'],
+    ['Remove main.txt', 'origin/main', 'main-branch-origin/main'],
+    ['Edit notes', 'v0.1', 'tag-v0.1'],
+  ]) {
+    await page.waitForTimeout(600);
+    const fromLabel = await open(rowOf(subject).getByTestId(`ref-${ref}`));
+    expect(!fromLabel.some((l) => /Cherry-pick|Copy SHA/.test(l)), `${ref}: not the commit's menu: ${fromLabel.join(' | ')}`);
+    await close();
+    // the right-clicked label's commit is the selected one, as with a right-click on the row
+    await waitSelected(subject, 3000);
+    // the Tags group starts folded: unfolded to reach the tag's row
+    if (!(await page.getByTestId(listRow).count())) await page.getByTestId('group-header-tags').click();
+    const fromList = await open(page.getByTestId(listRow).first());
+    await close();
+    expect(JSON.stringify(fromLabel) === JSON.stringify(fromList), `${ref}: the same menu\n  label: ${fromLabel.join(' | ')}\n  list:  ${fromList.join(' | ')}`);
+  }
+  // an item does what it says there: Copy branch name
+  await spyClipboard();
+  await page.waitForTimeout(600);
+  await open(rowOf('Topic two').getByTestId('ref-topic'));
+  await menuItem('Copy branch name').click();
+  await until(async () => (await page.evaluate(() => window.__copied)).includes('topic'), 'the name copied');
+  // a right-click on the row itself is still the commit's menu
+  await page.waitForTimeout(600);
+  const row = await open(rowOf('Topic two').locator(SUBJ).first());
+  expect(row.some((l) => /Cherry-pick/.test(l)), 'the row: the commit menu');
+  await close();
+});
+
 // ---------- search ----------
 
 const ALL = 13;

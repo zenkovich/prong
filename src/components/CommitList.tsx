@@ -29,11 +29,12 @@ import {
 } from '../state/store';
 import { badgeFill, FONT, inkOn, rgba, ROW, useSelected, useTheme } from '../theme';
 import { Icon } from '../ui/Icon';
-import { Avatar, Button, Checkbox, Glass, IconButton, Input, PressScale, ResizeGrip, Row, Segmented, Txt, useKeyboard, useViewport } from '../ui/primitives';
+import { Avatar, Button, Checkbox, Glass, IconButton, Input, PressScale, ResizeGrip, Row, Segmented, toLayout, Txt, useKeyboard, useViewport } from '../ui/primitives';
 import { applyCollapse, filterByRefs, GraphLayout, GraphRow, layoutGraph, reachableFrom } from './graphLayout';
 import { RefLabel, refLabels } from './commitRefs';
 import { filterChips } from './branchFilter';
 import { rowCheckoutChoices } from './checkoutPlan';
+import { refMenu } from './refMenus';
 import * as live from '../state/live';
 import { rowTop, useVirtualWindow } from '../ui/virtual';
 
@@ -545,7 +546,21 @@ const CommitRow = memo(function CommitRow({ commit, row, graphW, refs, selected,
       )}
       <View style={{ flex: 2, minWidth: 120, flexDirection: 'row', alignItems: 'center', overflow: 'hidden' }}>
         {/* each badge in its line's colour */}
-        {refs && refLabels(refs).map((l) => <RefChip key={l.ref.name} r={l.ref} label={l} color={row ? t.lanes[row.color % t.lanes.length] : undefined} />)}
+        {refs &&
+          refLabels(refs).map((l) => (
+            <RefChip
+              key={l.ref.name}
+              r={l.ref}
+              label={l}
+              color={row ? t.lanes[row.color % t.lanes.length] : undefined}
+              // the branch's (or tag's) own menu, the one it has in the branch list; the commit is selected, as a
+              // right-click on the row selects it
+              onContextMenu={(x, y) => {
+                if (!selected) selectCommit(commit.sha);
+                showContextMenu(x, y, refMenu(l.ref));
+              }}
+            />
+          ))}
         {isWip ? (
           <Txt size={FONT.md} color={t.textMuted} style={{ fontStyle: 'italic' }} numberOfLines={1}>
             Uncommitted changes ({changes})
@@ -679,7 +694,7 @@ function copy(text: string) {
  * it is on the remote. A tag is outlined in the tag colour. The current branch carries a check. On a selected
  * (inverted) row the badges keep their colours, edged so they stand off the selection.
  */
-export function RefChip({ r, onPress, compact, label, color }: { r: Ref; onPress?: () => void; compact?: boolean; label?: RefLabel; color?: string }) {
+export function RefChip({ r, onPress, compact, label, color, onContextMenu }: { r: Ref; onPress?: () => void; compact?: boolean; label?: RefLabel; color?: string; onContextMenu?: (x: number, y: number) => void }) {
   const t = useTheme();
   const inverted = useSelected();
   const isCurrent = !!r.current;
@@ -730,7 +745,23 @@ export function RefChip({ r, onPress, compact, label, color }: { r: Ref; onPress
       {inner}
     </PressScale>
   ) : (
-    <View style={chipStyle} testID={`ref-${name}`} accessibilityLabel={a11y}>
+    <View
+      style={chipStyle}
+      testID={`ref-${name}`}
+      accessibilityLabel={a11y}
+      // a right-click on the label is the label's, not the row's (the row's menu is the commit's); a left click
+      // still goes to the row and selects the commit
+      {...(onContextMenu
+        ? {
+            onPointerDown: (e: any) => {
+              if (e?.nativeEvent?.button !== 2) return;
+              e.preventDefault?.();
+              e.stopPropagation?.();
+              onContextMenu(toLayout(e.nativeEvent.pageX), toLayout(e.nativeEvent.pageY));
+            },
+          }
+        : {})}
+    >
       {inner}
     </View>
   );

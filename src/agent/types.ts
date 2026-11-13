@@ -8,11 +8,28 @@
 
 export type AgentTarget = 'auto' | 'repo' | 'app';
 
+/**
+ * A file attached to an agent message (pasted or dropped: a screenshot above all). The engine keeps it (`file`,
+ * its stored name) and gives the agent its path; `url` shows it back in the chat.
+ */
+export interface AgentAttachment {
+  id: string;
+  name: string;
+  mime: string;
+  size: number;
+  state: 'uploading' | 'ready' | 'failed';
+  file?: string;
+  url?: string;
+  error?: string;
+}
+
 export interface AgentMessage {
   id: number;
   role: 'user' | 'agent' | 'system';
   text: string;
   time: number;
+  /** what the user attached to the message */
+  attachments?: AgentAttachment[];
   /** actions the agent performed (repo commands, file edits) */
   actions?: string[];
   /** version created by this message (app changes) */
@@ -70,6 +87,8 @@ export interface AgentSettings {
   sourcesPath: string;
   askBeforeApply: boolean;
   autoRollbackOnBuildError: boolean;
+  /** no limits: the agent runs any command without asking (tests, builds, installs); off: git and file tools only */
+  fullAccess: boolean;
   connected: boolean;
   cliVersion: string;
 }

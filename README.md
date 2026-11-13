@@ -42,6 +42,7 @@ Prong is an experiment. It runs on macOS, the app is signed ad hoc (you build it
 - **Workspaces.** Separate sets of repositories (for example `@work` and `@home`), each with its own tabs, filled by scanning a root folder.
 - **Agent.**
   - ⌘J opens the agent bar. The full panel has a Markdown chat, the version log and the settings.
+  - Paste or drop a screenshot or a file on the chat to attach it: the agent sees images and PDFs.
   - An error window explains the error at once in a few plain words, in the language picked in Preferences (a fast model that only looks). **Ask AI** sends the error and git's output to the agent to fix it.
 - **Look.**
   - A monospace terminal style in five colour schemes, light and dark.
@@ -99,7 +100,11 @@ Prong.app ── Swift shell (AppKit + WKWebView)
    - The engine runs `expo export` on the sources into `~/.prong/ui/builds/<stamp>`.
    - It points `~/.prong/ui/current` at the new build and serves it instead of the factory build.
    - It sends `ui-updated`, and every window reloads with its tabs, chat and notices kept.
-5. **Safety.**
+5. **A new app, when the engine or the window changed.**
+   - If a version touches `server/` or `macos/`, the interface build is not enough: the engine runs `macos/build.sh`, which swaps the bundle only at its end, so the running app keeps working.
+   - Then Prong restarts into the new build. The chat goes over to the new instance, and the next request continues the same Claude session.
+   - **Rebuild and restart** in Settings → Agent does the same by hand.
+6. **Safety.**
    - A build that fails is never served. With the setting on, its change is rolled back.
    - **Revert** and **Re-apply** run `git revert` on one version.
    - **Roll back here** and **Reset to factory** revert every later version. The log is kept, so any version can be applied again.
